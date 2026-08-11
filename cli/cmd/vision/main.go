@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"vision/internal/base"
 	"vision/internal/capture"
 	"vision/internal/server"
 	"vision/internal/store"
@@ -35,13 +36,15 @@ func run(args []string) error {
 	if len(args) == 0 {
 		return usage()
 	}
-	switch args[0] {
-	case "-h", "--help", "help":
+	switch base.Command(args) {
+	case "help":
 		fmt.Println(usageText)
 		return nil
-	case "-v", "--version", "version":
+	case "version":
 		fmt.Println(version.Version)
 		return nil
+	}
+	switch args[0] {
 	case "snap":
 		return snap(args[1:])
 	case "notes":
