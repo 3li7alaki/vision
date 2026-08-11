@@ -1,0 +1,686 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vision</title>
+<style>
+  :root {
+    --bg:        #0a0a0b;
+    --bg-raised: #141416;
+    --line:      #26262b;
+    --text:      #e8e8ea;
+    --muted:     #7a7a85;
+    --faint:     #4a4a53;
+    --ok:        #34d399;
+    --flag:      #fb923c;
+    --warn:      #fbbf24;
+    --new:       #60a5fa;
+    --shadow:    0 24px 60px -12px rgba(0,0,0,.9);
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body { height: 100%; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 400 14px/1.5 var(--sans);
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+
+  /* ---------- shell ---------- */
+
+  #app {
+    height: 100dvh;
+    display: grid;
+    /* minmax(0,1fr), never 1fr: a plain 1fr refuses to shrink below the image's intrinsic
+       height, which pushes the bottom of a tall phone screenshot off screen. */
+    grid-template-rows: auto minmax(0, 1fr) auto auto;
+  }
+
+  header, footer {
+    padding: 14px 20px;
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 14px;
+    min-height: 52px;
+  }
+
+  header { border-bottom: 1px solid transparent; }
+
+  /* Half-screen is a first-class width. Everything in these bars shrinks or truncates
+     rather than wrapping, and the key and the counter are the last things to go. */
+  .crumb {
+    font: 500 13px/1 var(--mono);
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+    flex: 1 1 auto;
+    white-space: nowrap;
+  }
+  .crumb .ctx     { color: var(--faint); flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
+  .crumb .key     { color: var(--text);  flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
+  .crumb .variant { color: var(--muted); flex: 0 0 auto; }
+
+  .spacer { flex: 1 1 auto; min-width: 0; }
+
+  .count {
+    font: 500 12px/1 var(--mono);
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    flex: 0 0 auto;
+  }
+
+  /* ---------- stage ---------- */
+
+  #stage {
+    position: relative;
+    display: grid;
+    place-items: center;
+    padding: 4px 24px 12px;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  #shot {
+    width: auto;
+    height: auto;
+    max-width: 100%;
+    max-height: 100%;
+    /* contain, never fill: a screenshot shown at the wrong aspect ratio is a lie about
+       the thing being reviewed. No background either, so if the element box ever ends up
+       a different shape than the image, you see nothing rather than false letterboxing. */
+    object-fit: contain;
+    border-radius: 4px;
+    box-shadow: var(--shadow);
+    transition: opacity .08s linear;
+  }
+  #shot.swap { opacity: .55; }
+
+  /* layer badge, sits on the image corner */
+  #layer {
+    position: absolute;
+    top: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    font: 600 10px/1 var(--mono);
+    letter-spacing: .1em;
+    padding: 6px 10px;
+    border-radius: 3px;
+    background: rgba(10,10,11,.82);
+    border: 1px solid var(--line);
+    color: var(--muted);
+    backdrop-filter: blur(8px);
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity .12s ease;
+  }
+  #layer.show { opacity: 1; }
+  #layer[data-layer="BASELINE"] { color: var(--warn); }
+  #layer[data-layer="DIFF"]     { color: var(--flag); }
+
+  /* ---------- filmstrip ---------- */
+
+  #strip {
+    display: none;
+    gap: 6px;
+    padding: 0 20px 4px;
+    justify-content: center;
+  }
+  #strip.show { display: flex; }
+  #strip button {
+    width: 46px; height: 34px;
+    padding: 0;
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    background: var(--bg-raised) center/cover no-repeat;
+    font: 600 10px/1 var(--mono);
+    color: var(--faint);
+    cursor: pointer;
+    opacity: .5;
+    transition: opacity .12s, border-color .12s;
+  }
+  #strip button:hover { opacity: .8; }
+  #strip button.on { opacity: 1; border-color: var(--muted); }
+
+  /* ---------- footer ---------- */
+
+  .stat {
+    font: 500 12px/1 var(--mono);
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .stat.new  { color: var(--new); }
+  .stat.warn { color: var(--warn); }
+
+  .keys { display: flex; align-items: center; gap: 6px; }
+  .keys + .keys { margin-left: 14px; }
+  .keys .label { font: 500 12px/1 var(--sans); color: var(--muted); }
+
+  kbd {
+    font: 600 11px/1 var(--mono);
+    min-width: 20px;
+    padding: 5px 6px;
+    text-align: center;
+    color: var(--text);
+    background: var(--bg-raised);
+    border: 1px solid var(--line);
+    border-bottom-width: 2px;
+    border-radius: 4px;
+  }
+  kbd.ok   { color: var(--ok);   border-color: color-mix(in srgb, var(--ok) 30%, var(--line)); }
+  kbd.flag { color: var(--flag); border-color: color-mix(in srgb, var(--flag) 30%, var(--line)); }
+
+  /* ---------- note bar ---------- */
+
+  #note {
+    position: fixed;
+    inset: auto 0 0 0;
+    display: none;
+    align-items: center;
+    gap: 12px;
+    padding: 16px 20px;
+    background: var(--bg-raised);
+    border-top: 1px solid var(--line);
+  }
+  #note.show { display: flex; }
+  #note .tag {
+    font: 600 10px/1 var(--mono);
+    letter-spacing: .1em;
+    padding: 6px 8px;
+    border-radius: 3px;
+    white-space: nowrap;
+  }
+  #note .tag.flag { color: var(--flag); background: color-mix(in srgb, var(--flag) 14%, transparent); }
+  #note .tag.ok   { color: var(--ok);   background: color-mix(in srgb, var(--ok) 14%, transparent); }
+  #note input {
+    flex: 1;
+    background: none;
+    border: none;
+    outline: none;
+    color: var(--text);
+    font: 400 15px/1.4 var(--sans);
+  }
+  #note input::placeholder { color: var(--faint); }
+  #note .hint { font: 500 11px/1 var(--mono); color: var(--faint); white-space: nowrap; }
+
+  /* ---------- undo toast ---------- */
+
+  #toast {
+    position: fixed;
+    left: 50%; bottom: 74px;
+    transform: translateX(-50%) translateY(8px);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+    border-radius: 6px;
+    background: var(--bg-raised);
+    border: 1px solid var(--line);
+    box-shadow: var(--shadow);
+    font: 500 12px/1 var(--mono);
+    color: var(--muted);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .14s ease, transform .14s ease;
+  }
+  #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  #toast .what { color: var(--text); }
+  #toast .bar {
+    width: 34px; height: 2px;
+    background: var(--line);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  #toast .bar i {
+    display: block; height: 100%; width: 100%;
+    background: var(--muted);
+    transform-origin: left;
+    animation: drain var(--undo-ms, 4000ms) linear forwards;
+  }
+  @keyframes drain { to { transform: scaleX(0); } }
+
+  /* ---------- empty ---------- */
+
+  #empty {
+    display: none;
+    place-items: center;
+    text-align: center;
+    gap: 10px;
+    align-content: center;
+  }
+  #empty.show { display: grid; }
+  #empty .big { font: 400 17px/1.4 var(--sans); color: var(--muted); }
+  #empty .sub { font: 500 12px/1 var(--mono); color: var(--faint); }
+
+  /* ---------- help ---------- */
+
+  #help {
+    position: fixed;
+    inset: 0;
+    display: none;
+    place-items: center;
+    background: rgba(10,10,11,.86);
+    backdrop-filter: blur(10px);
+    z-index: 10;
+  }
+  #help.show { display: grid; }
+  #help .panel {
+    width: min(560px, calc(100vw - 40px));
+    padding: 26px 28px;
+    background: var(--bg-raised);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    box-shadow: var(--shadow);
+  }
+  #help h2 {
+    font: 600 11px/1 var(--mono);
+    letter-spacing: .12em;
+    color: var(--faint);
+    margin-bottom: 18px;
+  }
+  #help dl { display: grid; grid-template-columns: 84px 1fr; gap: 11px 16px; align-items: center; }
+  #help dt { display: flex; gap: 4px; justify-content: flex-end; }
+  #help dd { font: 400 13px/1 var(--sans); color: var(--muted); }
+
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+
+  @media (max-width: 700px) {
+    header, footer { padding: 12px 14px; gap: 10px; }
+    .keys .label { display: none; }
+    .keys + .keys { margin-left: 8px; }
+    #stage { padding: 4px 12px 10px; }
+  }
+  @media (max-width: 520px) {
+    .crumb .ctx { display: none; }     /* project and branch go first, the key never does */
+    .stat { font-size: 11px; }
+    header, footer { gap: 8px; }
+  }
+</style>
+
+<div id="app">
+  <header>
+    <div class="crumb">
+      <span class="ctx" id="ctx"></span>
+      <span class="key" id="key"></span>
+      <span class="variant" id="variant"></span>
+    </div>
+    <div class="spacer"></div>
+    <div class="count" id="count"></div>
+  </header>
+
+  <div id="stage">
+    <img id="shot" alt="">
+    <div id="layer"></div>
+    <div id="empty">
+      <div class="big">Nothing waiting.</div>
+      <div class="sub" id="emptySub"></div>
+    </div>
+  </div>
+
+  <div id="strip"></div>
+
+  <footer>
+    <div class="stat" id="stat"></div>
+    <div class="spacer"></div>
+    <div class="keys"><kbd class="ok">o</kbd><span class="label">ok</span></div>
+    <div class="keys"><kbd class="flag">f</kbd><span class="label">flag</span></div>
+    <div class="keys"><kbd>space</kbd><span class="label">compare</span></div>
+    <div class="keys"><kbd>?</kbd></div>
+  </footer>
+</div>
+
+<div id="note">
+  <span class="tag" id="noteTag"></span>
+  <input id="noteInput" autocomplete="off" spellcheck="true">
+  <span class="hint"><kbd>enter</kbd> save &nbsp; <kbd>esc</kbd> cancel</span>
+</div>
+
+<div id="toast">
+  <span class="what" id="toastWhat"></span>
+  <span class="bar"><i></i></span>
+  <span><kbd>u</kbd> undo</span>
+</div>
+
+<div id="help">
+  <div class="panel">
+    <h2>KEYS</h2>
+    <dl>
+      <dt><kbd>j</kbd><kbd>k</kbd></dt>       <dd>next / previous card</dd>
+      <dt><kbd>space</kbd></dt>                <dd>cycle new, baseline, diff</dd>
+      <dt><kbd>b</kbd></dt>                    <dd>hold to peek the baseline</dd>
+      <dt><kbd>o</kbd></dt>                    <dd>ok, and this becomes the baseline</dd>
+      <dt><kbd>O</kbd></dt>                    <dd>ok with a note</dd>
+      <dt><kbd>f</kbd></dt>                    <dd>flag, note required</dd>
+      <dt><kbd>u</kbd></dt>                    <dd>undo, while the toast is up</dd>
+      <dt><kbd>1</kbd>..<kbd>9</kbd></dt>      <dd>jump to a flow step</dd>
+      <dt><kbd>g</kbd><kbd>G</kbd></dt>        <dd>first / last card</dd>
+      <dt><kbd>esc</kbd></dt>                  <dd>close</dd>
+    </dl>
+  </div>
+</div>
+
+<script>
+(() => {
+  const $ = s => document.querySelector(s);
+  const el = {
+    ctx: $('#ctx'), key: $('#key'), variant: $('#variant'), count: $('#count'),
+    shot: $('#shot'), layer: $('#layer'), stat: $('#stat'), strip: $('#strip'),
+    empty: $('#empty'), emptySub: $('#emptySub'),
+    note: $('#note'), noteTag: $('#noteTag'), noteInput: $('#noteInput'),
+    toast: $('#toast'), toastWhat: $('#toastWhat'), help: $('#help'),
+  };
+
+  const UNDO_MS = 4000;
+  const LAYERS = ['NEW', 'BASELINE', 'DIFF'];
+
+  let queue = [];          // pending items, newest first
+  let at = 0;              // cursor into queue
+  let layer = 0;           // index into LAYERS
+  let peeking = false;     // `b` held
+  let pendingVerdict = null; // {timer, item, verdict, note}
+  let doneCount = 0;
+
+  // Opened straight off disk there is no daemon to talk to, so fall back to sample cards.
+  const mock = new URLSearchParams(location.search).has('mock') || location.protocol === 'file:';
+
+  /* ---------- data ---------- */
+
+  async function load() {
+    if (mock) { queue = mockQueue(); return render(); }
+    try {
+      const r = await fetch('/api/queue');
+      queue = await r.json();
+    } catch { queue = []; }
+    if (at >= queue.length) at = Math.max(0, queue.length - 1);
+    render();
+  }
+
+  function stream() {
+    if (mock) return;
+    const es = new EventSource('/events');
+    es.onmessage = e => {
+      let item; try { item = JSON.parse(e.data); } catch { return; }
+      // A burst is still landing. Append, never reorder under the reviewer's cursor.
+      if (!queue.some(q => q.digest === item.digest)) queue.push(item);
+      render();
+    };
+    es.onerror = () => {};   // EventSource retries on its own
+  }
+
+  /* ---------- render ---------- */
+
+  const current = () => queue[at];
+
+  function render() {
+    const it = current();
+    const has = Boolean(it);
+
+    el.empty.classList.toggle('show', !has);
+    el.shot.style.display = has ? '' : 'none';
+    if (!has) {
+      el.ctx.textContent = el.key.textContent = el.variant.textContent = '';
+      el.count.textContent = '';
+      el.stat.textContent = '';
+      el.strip.classList.remove('show');
+      el.emptySub.textContent = doneCount
+        ? `${doneCount} reviewed this session`
+        : 'shots land here as your agent takes them';
+      return;
+    }
+
+    el.ctx.textContent = `${it.project} · ${it.branch || 'detached'} ·`;
+    el.key.textContent = it.key;
+    el.variant.textContent = `@${it.variant}`;
+    el.count.textContent = `${at + 1} / ${queue.length}`;
+
+    // A resize makes a pixel diff meaningless, so the tool refuses to compute one.
+    // Say that plainly instead of showing a screen of red.
+    if (it.incomparable) {
+      el.stat.className = 'stat warn';
+      el.stat.textContent = it.incomparable;
+    } else if (it.status === 'new') {
+      el.stat.className = 'stat new';
+      el.stat.textContent = 'new, no baseline yet';
+    } else {
+      el.stat.className = 'stat';
+      el.stat.textContent = `${fmtPct(it.changedFraction)} changed`;
+    }
+
+    paint();
+    filmstrip(it);
+  }
+
+  function paint() {
+    const it = current();
+    if (!it) return;
+    const name = peeking ? 'BASELINE' : LAYERS[layer];
+    const src = name === 'BASELINE' ? it.baselineUrl
+              : name === 'DIFF'     ? it.diffUrl
+              : it.shotUrl;
+
+    // Fall back to the shot when a layer does not exist for this item.
+    el.shot.src = src || it.shotUrl;
+    el.shot.alt = `${it.key} at ${it.variant}, ${name.toLowerCase()}`;
+    el.layer.dataset.layer = name;
+    el.layer.textContent = name;
+    el.layer.classList.toggle('show', name !== 'NEW');
+  }
+
+  function filmstrip(it) {
+    const sibs = it.steps || [];
+    el.strip.classList.toggle('show', sibs.length > 1);
+    if (sibs.length < 2) return;
+    el.strip.innerHTML = '';
+    sibs.forEach((s, i) => {
+      const b = document.createElement('button');
+      b.textContent = i + 1;
+      if (s.thumbUrl) b.style.backgroundImage = `url(${s.thumbUrl})`;
+      b.className = s.digest === it.digest ? 'on' : '';
+      b.onclick = () => { const j = queue.findIndex(q => q.digest === s.digest); if (j >= 0) go(j); };
+      el.strip.append(b);
+    });
+  }
+
+  const fmtPct = f => {
+    if (!f) return '0%';
+    if (f < 0.0001) return '<0.01%';
+    return `${(f * 100).toFixed(f < 0.01 ? 2 : 1)}%`;
+  };
+
+  /* ---------- movement ---------- */
+
+  function go(i) {
+    if (!queue.length) return;
+    at = Math.max(0, Math.min(queue.length - 1, i));
+    layer = 0;
+    render();
+  }
+
+  /* ---------- verdicts ---------- */
+
+  // The POST is delayed rather than sent immediately, so `o` on the wrong card is
+  // recoverable without inventing a delete path the store deliberately does not have.
+  function verdict(kind, note) {
+    const it = current();
+    if (!it) return;
+    if (kind === 'flag' && !note) return openNote('flag');
+    flushVerdict();
+
+    queue.splice(at, 1);
+    if (at >= queue.length) at = Math.max(0, queue.length - 1);
+    render();
+
+    el.toastWhat.textContent = `${kind === 'ok' ? 'ok' : 'flagged'} ${it.key}`;
+    el.toast.style.setProperty('--undo-ms', `${UNDO_MS}ms`);
+    el.toast.classList.remove('show');
+    void el.toast.offsetWidth;               // restart the drain animation
+    el.toast.classList.add('show');
+
+    pendingVerdict = {
+      item: it, verdict: kind, note: note || '',
+      index: at,
+      timer: setTimeout(flushVerdict, UNDO_MS),
+    };
+  }
+
+  function flushVerdict() {
+    const p = pendingVerdict;
+    if (!p) return;
+    pendingVerdict = null;
+    clearTimeout(p.timer);
+    el.toast.classList.remove('show');
+    doneCount++;
+    if (mock) return;
+    fetch('/api/verdict', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        project: p.item.project, key: p.item.key, variant: p.item.variant,
+        digest: p.item.digest, verdict: p.verdict, note: p.note,
+      }),
+    }).catch(() => {
+      // Never lose the reviewer's words: put the card back and say so.
+      queue.splice(p.index, 0, p.item);
+      render();
+      el.stat.className = 'stat warn';
+      el.stat.textContent = 'could not save that verdict, daemon unreachable';
+    });
+  }
+
+  function undo() {
+    const p = pendingVerdict;
+    if (!p) return;
+    clearTimeout(p.timer);
+    pendingVerdict = null;
+    el.toast.classList.remove('show');
+    queue.splice(p.index, 0, p.item);
+    go(p.index);
+  }
+
+  /* ---------- note bar ---------- */
+
+  let noteKind = null;
+
+  function openNote(kind) {
+    if (!current()) return;
+    noteKind = kind;
+    el.noteTag.className = `tag ${kind}`;
+    el.noteTag.textContent = kind === 'flag' ? 'FLAG' : 'OK';
+    el.noteInput.value = '';
+    el.noteInput.placeholder = kind === 'flag'
+      ? 'what is wrong with it'
+      : 'anything worth saying (optional)';
+    el.note.classList.add('show');
+    el.noteInput.focus();
+  }
+
+  function closeNote() { el.note.classList.remove('show'); el.noteInput.blur(); noteKind = null; }
+
+  el.noteInput.addEventListener('keydown', e => {
+    e.stopPropagation();
+    if (e.key === 'Escape') return closeNote();
+    if (e.key !== 'Enter') return;
+    const text = el.noteInput.value.trim();
+    if (noteKind === 'flag' && !text) return;   // a flag with no words is not a state
+    const kind = noteKind;
+    closeNote();
+    verdict(kind, text);
+  });
+
+  /* ---------- keys ---------- */
+
+  let gArmed = false;
+
+  addEventListener('keydown', e => {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (el.note.classList.contains('show')) return;
+
+    if (e.key === 'Escape') {
+      if (el.help.classList.contains('show')) return el.help.classList.remove('show');
+      return;
+    }
+    if (e.key === '?') { el.help.classList.toggle('show'); return e.preventDefault(); }
+    if (el.help.classList.contains('show')) return;
+
+    const k = e.key;
+
+    if (k === 'g') { gArmed = true; return; }
+    if (gArmed) { gArmed = false; if (k === 'g') return go(0); }
+
+    switch (k) {
+      case 'j': case 'ArrowDown': case 'ArrowRight': return go(at + 1);
+      case 'k': case 'ArrowUp':   case 'ArrowLeft':  return go(at - 1);
+      case 'G': return go(queue.length - 1);
+      case ' ': e.preventDefault(); layer = (layer + 1) % LAYERS.length; return paint();
+      case 'b': if (!peeking) { peeking = true; el.shot.classList.add('swap'); paint(); } return;
+      case 'o': return verdict('ok', '');
+      case 'O': return openNote('ok');
+      case 'f': case 'x': return openNote('flag');
+      case 'u': return undo();
+    }
+    if (/^[1-9]$/.test(k)) {
+      const it = current();
+      const s = it && it.steps && it.steps[Number(k) - 1];
+      if (s) { const j = queue.findIndex(q => q.digest === s.digest); if (j >= 0) go(j); }
+    }
+  });
+
+  addEventListener('keyup', e => {
+    if (e.key === 'b' && peeking) { peeking = false; el.shot.classList.remove('swap'); paint(); }
+  });
+
+  // Send anything still in flight before the tab dies.
+  addEventListener('pagehide', flushVerdict);
+
+  /* ---------- mock ---------- */
+
+  function mockQueue() {
+    const px = (w, h, bg, bar) =>
+      'data:image/svg+xml;utf8,' + encodeURIComponent(
+        // viewBox matters: without one an SVG has no intrinsic aspect ratio and the mock
+        // stops being a fair stand-in for a real PNG.
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><rect width="100%" height="100%" fill="${bg}"/>` +
+        `<rect x="24" y="${h - 120}" width="${w - 48}" height="52" rx="8" fill="${bar}"/>` +
+        `<rect x="24" y="60" width="${w * 0.6}" height="18" rx="4" fill="#d4d4d8"/>` +
+        `<rect x="24" y="94" width="${w * 0.4}" height="14" rx="4" fill="#e4e4e7"/></svg>`);
+    return [
+      { project: 'shop', branch: 'feat/checkout', key: 'checkout/empty-cart', variant: 'mobile-dark',
+        digest: 'a1', status: 'changed', changedFraction: 0.014,
+        shotUrl: px(375, 812, '#18181b', '#3f3f46'),
+        baselineUrl: px(375, 812, '#18181b', '#6366f1'),
+        diffUrl: px(375, 812, '#1c1917', '#f43f5e') },
+      { project: 'shop', branch: 'feat/checkout', key: 'settings/danger-zone', variant: 'desktop-light',
+        digest: 'b2', status: 'changed', changedFraction: 0.0007,
+        shotUrl: px(900, 560, '#fafafa', '#ef4444'),
+        baselineUrl: px(900, 560, '#fafafa', '#a1a1aa'),
+        diffUrl: px(900, 560, '#fafafa', '#f43f5e') },
+      { project: 'dashboard', branch: 'main', key: 'billing/plan-picker', variant: 'desktop-dark',
+        digest: 'c3', status: 'changed', incomparable: 'baseline 1440x900 @2x, this shot 1280x800 @2x. Not comparable.',
+        shotUrl: px(1280, 800, '#0c0a09', '#22c55e'),
+        baselineUrl: px(1440, 900, '#0c0a09', '#22c55e') },
+      { project: 'shop', branch: 'feat/checkout', key: 'checkout/happy-path#1', variant: 'desktop-light',
+        digest: 'd4', status: 'new',
+        shotUrl: px(900, 560, '#ffffff', '#0ea5e9'),
+        steps: [{ digest: 'd4' }, { digest: 'd5' }, { digest: 'd6' }] },
+      { project: 'shop', branch: 'feat/checkout', key: 'checkout/happy-path#2', variant: 'desktop-light',
+        digest: 'd5', status: 'new',
+        shotUrl: px(900, 560, '#ffffff', '#8b5cf6'),
+        steps: [{ digest: 'd4' }, { digest: 'd5' }, { digest: 'd6' }] },
+      { project: 'shop', branch: 'feat/checkout', key: 'checkout/happy-path#3', variant: 'desktop-light',
+        digest: 'd6', status: 'new',
+        shotUrl: px(900, 560, '#ffffff', '#22c55e'),
+        steps: [{ digest: 'd4' }, { digest: 'd5' }, { digest: 'd6' }] },
+    ];
+  }
+
+  load();
+  stream();
+})();
+</script>

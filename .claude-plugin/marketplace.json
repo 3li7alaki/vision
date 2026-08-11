@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "vision",
+  "description": "You drive the browser, vision takes the picture. Screenshots of every screen your agent ships, in one queue you actually open.",
+  "owner": {
+    "name": "3li7alaki",
+    "url": "https://github.com/3li7alaki"
+  },
+  "plugins": [
+    {
+      "name": "vision",
+      "description": "Photograph every screen your agent ships, and review them in one queue you actually open. Content-addressed shots, honest diffs, append-only verdicts.",
+      "source": "./",
+      "category": "workflow"
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+# compiled binary
+/vision
+cli/vision
+
+# personal harness config (not part of the tool)
+.claude/

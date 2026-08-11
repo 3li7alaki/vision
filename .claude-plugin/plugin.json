@@ -1,0 +1,12 @@
+{
+  "name": "vision",
+  "description": "Photograph every screen your agent ships, and review them in one queue you actually open. Content-addressed shots, honest diffs, append-only verdicts.",
+  "version": "0.1.0",
+  "author": {
+    "name": "3li7alaki",
+    "url": "https://github.com/3li7alaki"
+  },
+  "homepage": "https://github.com/3li7alaki/vision",
+  "license": "MIT",
+  "keywords": ["ui", "screenshots", "visual-review", "pinchtab", "browser"]
+}
