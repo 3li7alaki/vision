@@ -71,7 +71,7 @@ func New() *Server { return &Server{clients: make(map[chan Item]struct{})} }
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.gallery)
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, http.StatusOK, map[string]any{"ok": true}) })
+	mux.HandleFunc("GET /health", s.health)
 	mux.HandleFunc("GET /api/queue", s.queue)
 	mux.HandleFunc("POST /api/snap", s.snap)
 	mux.HandleFunc("POST /api/verdict", s.verdict)
@@ -159,6 +159,53 @@ func (s *Server) verdict(w http.ResponseWriter, r *http.Request) {
 	// never fail a verdict the human already gave.
 	_ = store.Prune(req.Project)
 	writeJSON(w, http.StatusCreated, note)
+}
+
+func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
+	pending, err := PendingCount()
+	if err != nil {
+		problem(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "pending": pending})
+}
+
+// PendingCount is the cheap half of Queue: it folds notes over the index and counts what
+// nobody has judged, without decoding a single PNG. Queue itself runs a full pixel diff per
+// item, which is far too expensive for something a status line polls on a timer.
+//
+// It agrees with Queue because shots are content-addressed. A re-snap that is identical to
+// an approved shot produces the same digest, and verdicts are recorded per digest, so it is
+// already decided and never counted here.
+func PendingCount() (int, error) {
+	ids, err := store.ProjectIDs()
+	if err != nil {
+		return 0, err
+	}
+	pending := 0
+	seen := make(map[string]bool)
+	for _, id := range ids {
+		snaps, err := store.Snaps(id)
+		if err != nil {
+			return 0, err
+		}
+		notes, err := store.Notes(id)
+		if err != nil {
+			return 0, err
+		}
+		decided := make(map[string]bool, len(notes))
+		for _, n := range notes {
+			decided[n.Digest] = true
+		}
+		for _, snap := range snaps {
+			if decided[snap.Digest] || seen[snap.Digest] {
+				continue
+			}
+			seen[snap.Digest] = true
+			pending++
+		}
+	}
+	return pending, nil
 }
 
 func (s *Server) queue(w http.ResponseWriter, _ *http.Request) {

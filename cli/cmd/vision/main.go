@@ -240,22 +240,32 @@ func status(args []string) error {
 	if err != nil {
 		return usage()
 	}
-	client := &http.Client{Timeout: time.Second}
+	// Short timeout because a status line polls this on a timer: a wedged daemon must cost
+	// the caller a blink, not a second.
+	client := &http.Client{Timeout: 300 * time.Millisecond}
 	resp, err := client.Get(endpoint + "/health")
 	if err != nil {
 		if asJSON {
-			_ = printJSON(map[string]any{"schemaVersion": 1, "running": false})
+			_ = printJSON(map[string]any{"schemaVersion": 1, "running": false, "pending": 0})
 			return errors.New("daemon unavailable, run `vision on`")
 		}
 		fmt.Println("vision off")
 		return errors.New("daemon unavailable, run `vision on`")
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("daemon unhealthy: %s", resp.Status)
 	}
+	var health struct {
+		Pending int `json:"pending"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&health)
 	if asJSON {
-		return printJSON(map[string]any{"schemaVersion": 1, "running": true, "url": "http://vision.test:4747"})
+		return printJSON(map[string]any{"schemaVersion": 1, "running": true, "pending": health.Pending, "url": "http://vision.test:4747"})
+	}
+	if health.Pending > 0 {
+		fmt.Printf("vision on at http://vision.test:4747, %d pending\n", health.Pending)
+		return nil
 	}
 	fmt.Println("vision on at http://vision.test:4747")
 	return nil
