@@ -21,3 +21,14 @@ jobs:
       - run: go vet ./...
       - run: go build ./...
       - run: go test ./... -count=1
+
+  dash:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: no em dashes or en dashes
+        run: |
+          if grep -rIn --exclude-dir=.git -P '\x{2014}|\x{2013}' . ; then
+            echo "found an em dash or an en dash. Use a comma, a colon, parentheses, or a full stop."
+            exit 1
+          fi

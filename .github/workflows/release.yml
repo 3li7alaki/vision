@@ -1,12 +1,12 @@
 name: Release
-# Rolling distribution: every push to main rebuilds the binaries and republishes the
-# single `latest` release. No version tags, no semver, and install.sh always fetches `latest`.
+# Rolling distribution: every push to main rebuilds binaries and republishes the
+# single `latest` release. No version tags, no semver. install.sh always fetches `latest`.
 on:
   push:
     branches: [main]
 
 permissions:
-  contents: write   # needed to update the release
+  contents: write
 
 jobs:
   build:

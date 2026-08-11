@@ -621,8 +621,11 @@
       case ' ': e.preventDefault(); layer = (layer + 1) % LAYERS.length; return paint();
       case 'b': if (!peeking) { peeking = true; el.shot.classList.add('swap'); paint(); } return;
       case 'o': return verdict('ok', '');
-      case 'O': return openNote('ok');
-      case 'f': case 'x': return openNote('flag');
+      // preventDefault because openNote focuses the input: without it the browser
+      // delivers this same keystroke to the field it just focused, so pressing f to
+      // flag leaves an "f" to delete before you can type.
+      case 'O': e.preventDefault(); return openNote('ok');
+      case 'f': case 'x': e.preventDefault(); return openNote('flag');
       case 'u': return undo();
     }
     if (/^[1-9]$/.test(k)) {

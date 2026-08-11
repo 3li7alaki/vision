@@ -19,6 +19,7 @@ import (
 	"vision/internal/capture"
 	"vision/internal/server"
 	"vision/internal/store"
+	"vision/internal/version"
 )
 
 const endpoint = "http://127.0.0.1:4747"
@@ -35,6 +36,12 @@ func run(args []string) error {
 		return usage()
 	}
 	switch args[0] {
+	case "-h", "--help", "help":
+		fmt.Println(usageText)
+		return nil
+	case "-v", "--version", "version":
+		fmt.Println(version.Version)
+		return nil
 	case "snap":
 		return snap(args[1:])
 	case "notes":
@@ -52,8 +59,10 @@ func run(args []string) error {
 	}
 }
 
+const usageText = "usage: vision snap <key> [--as <variant>] [--note <text>] [--json] | vision notes [--unread | --since <duration>] [--json] | vision on | off | status | vision --version"
+
 func usage() error {
-	return errors.New("usage: vision snap <key> [--as <variant>] [--note <text>] [--json] | vision notes [--unread | --since <duration>] [--json] | vision on | off | status")
+	return errors.New(usageText)
 }
 
 func snap(args []string) error {
