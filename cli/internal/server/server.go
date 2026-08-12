@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -20,6 +21,11 @@ import (
 )
 
 const Address = "127.0.0.1:4747"
+
+// projectIDPattern is the SHA-256 hex digest Identify emits, and the only value the
+// verdict handler may ever join onto a store path. The gallery sends the human-readable
+// name back as project, so without this guard a path-traversal body writes outside it.
+var projectIDPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 type SnapRequest struct {
 	Project store.Project    `json:"project"`
@@ -42,6 +48,7 @@ type VerdictRequest struct {
 
 type Item struct {
 	Project         string    `json:"project"`
+	ProjectID       string    `json:"projectId"`
 	Branch          string    `json:"branch"`
 	Key             string    `json:"key"`
 	Variant         string    `json:"variant"`
@@ -133,6 +140,10 @@ func (s *Server) verdict(w http.ResponseWriter, r *http.Request) {
 	var req VerdictRequest
 	if err := decode(r.Body, &req); err != nil {
 		problem(w, http.StatusBadRequest, err)
+		return
+	}
+	if !projectIDPattern.MatchString(req.Project) {
+		problem(w, http.StatusBadRequest, errors.New("invalid project id"))
 		return
 	}
 	if req.Verdict != "ok" && req.Verdict != "flag" {
@@ -261,7 +272,7 @@ func Queue() ([]Item, error) {
 }
 
 func makeItem(project, name string, snap store.Snap) (Item, bool, error) {
-	item := Item{Project: name, Branch: snap.Branch, Key: snap.Key, Variant: snap.Variant, Digest: snap.Digest, Status: "new", ShotURL: mediaURL("shot", project, snap.Digest), TS: snap.TS}
+	item := Item{Project: name, ProjectID: project, Branch: snap.Branch, Key: snap.Key, Variant: snap.Variant, Digest: snap.Digest, Status: "new", ShotURL: mediaURL("shot", project, snap.Digest), TS: snap.TS}
 	baseline, _ := store.BaselinePath(project, snap.Key, snap.Variant)
 	b, err := os.ReadFile(baseline)
 	if errors.Is(err, os.ErrNotExist) {

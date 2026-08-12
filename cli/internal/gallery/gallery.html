@@ -542,7 +542,7 @@
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        project: p.item.project, key: p.item.key, variant: p.item.variant,
+        project: p.item.projectId, key: p.item.key, variant: p.item.variant,
         digest: p.item.digest, verdict: p.verdict, note: p.note,
       }),
     }).catch(() => {
