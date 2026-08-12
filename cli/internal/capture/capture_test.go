@@ -5,6 +5,27 @@ import (
 	"testing"
 )
 
+// The --server flag has to come before the subcommand, because it is a global flag: put it
+// after and pinchtab rejects it, so a scoped snap fails instead of quietly capturing the
+// wrong instance. Unset must add nothing at all, or a box with one agent breaks.
+func TestPinchtabScopesToServer(t *testing.T) {
+	t.Setenv("PINCHTAB_SERVER", "")
+	if got := pinchtab("capture", "--json"); len(got) != 2 || got[0] != "capture" {
+		t.Fatalf("unset server changed the args: %v", got)
+	}
+	t.Setenv("PINCHTAB_SERVER", "http://127.0.0.1:9999")
+	got := pinchtab("capture", "--json")
+	want := []string{"--server", "http://127.0.0.1:9999", "capture", "--json"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+}
+
 // The shape here is a verbatim trim of a real pinchtab capture response, so this test
 // fails if pinchtab moves the fields or if someone reintroduces a guessed field name.
 // A conditions block that silently parses to zeroes turns the conditions guard into a

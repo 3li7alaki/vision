@@ -17,6 +17,22 @@ type Result struct {
 	Raw        map[string]any
 }
 
+// pinchtab prefixes an argument list with the server this process was told to talk to.
+//
+// PinchTab's unit of isolation is the browser instance, and the only way to name one is the
+// global --server flag: `capture` has no --tab, so it always acts on its server's current
+// tab. Without this, two agents working at once share one browser and one shot lands in the
+// other's page, which looks like a real regression rather than a mixup. PinchTab has no
+// environment variable of its own for this, so vision reads one and passes the flag.
+//
+// Unset means the default server, which is the right default for the only agent on a box.
+func pinchtab(args ...string) []string {
+	if server := os.Getenv("PINCHTAB_SERVER"); server != "" {
+		return append([]string{"--server", server}, args...)
+	}
+	return args
+}
+
 func Take(ctx context.Context) (Result, error) {
 	f, err := os.CreateTemp("", "vision-*.png")
 	if err != nil {
@@ -25,7 +41,7 @@ func Take(ctx context.Context) (Result, error) {
 	path := f.Name()
 	f.Close()
 	defer os.Remove(path)
-	cmd := exec.CommandContext(ctx, "pinchtab", "capture", "--json", "-o", path, "--format", "png")
+	cmd := exec.CommandContext(ctx, "pinchtab", pinchtab("capture", "--json", "-o", path, "--format", "png")...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return Result{}, fmt.Errorf("pinchtab capture: %w: %s", err, strings.TrimSpace(string(out)))
@@ -53,7 +69,7 @@ func Take(ctx context.Context) (Result, error) {
 // picture is worse than losing one condition. That degrades safely: an empty scheme differs
 // from a recorded one, so the guard refuses the diff instead of rendering a fake one.
 func scheme(ctx context.Context) string {
-	cmd := exec.CommandContext(ctx, "pinchtab", "eval", "matchMedia('(prefers-color-scheme: dark)').matches", "--json")
+	cmd := exec.CommandContext(ctx, "pinchtab", pinchtab("eval", "matchMedia('(prefers-color-scheme: dark)').matches", "--json")...)
 	out, err := cmd.Output()
 	if err != nil {
 		return ""
