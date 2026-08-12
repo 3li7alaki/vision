@@ -75,6 +75,25 @@ func TestVerdictLandsUnderHashedProjectID(t *testing.T) {
 	}
 }
 
+// The status line asks "what is waiting for me here", so a shot queued in another repo
+// must not appear in this one's count. Only the daemon-wide total sees both.
+func TestPendingCountForScopesToOneProject(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	mine, theirs := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	for id, digest := range map[string]string{mine: "sha256:1111", theirs: "sha256:2222"} {
+		snap := store.Snap{SchemaVersion: 1, TS: time.Now(), Project: "shop", Key: "checkout/cart", Variant: "default", Digest: digest}
+		if err := store.AppendSnap(id, snap, []byte(digest)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, err := PendingCountFor(mine); err != nil || n != 1 {
+		t.Fatalf("this project: pending=%d err=%v, want 1 (another repo's review must not count here)", n, err)
+	}
+	if n, err := PendingCount(); err != nil || n != 2 {
+		t.Fatalf("daemon-wide: pending=%d err=%v, want 2", n, err)
+	}
+}
+
 // req.Project reaches filepath.Join via store.ProjectDir, so a value like ../../etc is a
 // write outside the store. The 64-hex guard rejects it before any path use.
 func TestVerdictRejectsInvalidProjectID(t *testing.T) {

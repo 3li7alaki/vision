@@ -194,27 +194,39 @@ func PendingCount() (int, error) {
 		return 0, err
 	}
 	pending := 0
-	seen := make(map[string]bool)
 	for _, id := range ids {
-		snaps, err := store.Snaps(id)
+		n, err := PendingCountFor(id)
 		if err != nil {
 			return 0, err
 		}
-		notes, err := store.Notes(id)
-		if err != nil {
-			return 0, err
+		pending += n
+	}
+	return pending, nil
+}
+
+// PendingCountFor counts one project's undecided shots. A review waiting in another repo
+// is not this repo's work, so anything that speaks for the current project (a status line,
+// `vision status`) counts here rather than through the daemon-wide total.
+func PendingCountFor(project string) (int, error) {
+	snaps, err := store.Snaps(project)
+	if err != nil {
+		return 0, err
+	}
+	notes, err := store.Notes(project)
+	if err != nil {
+		return 0, err
+	}
+	decided := make(map[string]bool, len(notes))
+	for _, n := range notes {
+		decided[n.Digest] = true
+	}
+	pending, seen := 0, make(map[string]bool)
+	for _, snap := range snaps {
+		if decided[snap.Digest] || seen[snap.Digest] {
+			continue
 		}
-		decided := make(map[string]bool, len(notes))
-		for _, n := range notes {
-			decided[n.Digest] = true
-		}
-		for _, snap := range snaps {
-			if decided[snap.Digest] || seen[snap.Digest] {
-				continue
-			}
-			seen[snap.Digest] = true
-			pending++
-		}
+		seen[snap.Digest] = true
+		pending++
 	}
 	return pending, nil
 }

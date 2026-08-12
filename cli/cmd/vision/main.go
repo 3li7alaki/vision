@@ -272,14 +272,30 @@ func status(args []string) error {
 		Pending int `json:"pending"`
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&health)
+	// A review waiting in another repo is not this repo's work. Inside a project, `pending`
+	// is that project's count and the daemon-wide figure moves to `pendingAll`; outside one
+	// there is nothing to scope to, so `pending` stays the daemon-wide total.
+	pending, scope := health.Pending, ""
+	if project, err := store.Identify("."); err == nil {
+		if n, err := server.PendingCountFor(project.ID); err == nil {
+			pending, scope = n, project.Name
+		}
+	}
 	if asJSON {
-		return printJSON(map[string]any{"schemaVersion": 1, "running": true, "pending": health.Pending, "url": "http://vision.test:4747"})
+		out := map[string]any{"schemaVersion": 1, "running": true, "pending": pending, "pendingAll": health.Pending, "url": "http://vision.test:4747"}
+		if scope != "" {
+			out["project"] = scope
+		}
+		return printJSON(out)
 	}
-	if health.Pending > 0 {
-		fmt.Printf("vision on at http://vision.test:4747, %d pending\n", health.Pending)
-		return nil
+	switch {
+	case pending > 0 && scope != "":
+		fmt.Printf("vision on at http://vision.test:4747, %d pending in %s\n", pending, scope)
+	case pending > 0:
+		fmt.Printf("vision on at http://vision.test:4747, %d pending\n", pending)
+	default:
+		fmt.Println("vision on at http://vision.test:4747")
 	}
-	fmt.Println("vision on at http://vision.test:4747")
 	return nil
 }
 
