@@ -5,6 +5,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"strings"
 	"testing"
 	"vision/internal/store"
 )
@@ -46,5 +47,33 @@ func TestComparable(t *testing.T) {
 	b.Width = 390
 	if err := Comparable(a, b); err == nil {
 		t.Fatal("mismatched conditions accepted")
+	}
+}
+
+// A scheme or URL mismatch used to print two identical geometries, which reads as a bug
+// in vision rather than a light shot held against a dark baseline.
+func TestComparableNamesTheFieldThatDiffers(t *testing.T) {
+	a := store.Conditions{Width: 375, Height: 812, DPR: 2, URL: "http://x", Scheme: "dark"}
+	for _, tc := range []struct {
+		name   string
+		change func(*store.Conditions)
+		want   string
+	}{
+		{"scheme", func(c *store.Conditions) { c.Scheme = "light" }, "scheme"},
+		{"empty scheme", func(c *store.Conditions) { c.Scheme = "" }, "scheme"},
+		{"url", func(c *store.Conditions) { c.URL = "http://y" }, "url"},
+		{"size", func(c *store.Conditions) { c.DPR = 1 }, "size"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := a
+			tc.change(&b)
+			err := Comparable(a, b)
+			if err == nil {
+				t.Fatal("mismatched conditions accepted")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %q does not name %q", err, tc.want)
+			}
+		})
 	}
 }
