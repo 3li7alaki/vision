@@ -12,11 +12,30 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
 
 const SchemaVersion = 1
+
+// Viewport bucket boundaries, named for the class they open rather than the one they close,
+// because "mobileMax = 600" reads as "600 is mobile" when mobile actually ends at 599. This
+// is the calibration knob of the dimension model: it decides that a 390 and a 414 wide shot
+// share one baseline. A real device landing near an edge is what will move these, and they
+// stay constants rather than configuration until that actually happens.
+const (
+	tabletMinWidth  = 600
+	desktopMinWidth = 1024
+)
+
+// The dimension vocabulary is closed on purpose. An open one lets "--dim schema=dark" quietly
+// mint a second baseline, and at review time a shot measured against the wrong baseline is
+// indistinguishable from a real visual regression. A typo has to be an error, not a fork.
+var dimensionNames = map[string]bool{
+	"flow": true, "state": true, "case": true, "scheme": true,
+	"vp": true, "locale": true, "role": true,
+}
 
 type Conditions struct {
 	Width  int     `json:"width"`
@@ -27,19 +46,21 @@ type Conditions struct {
 }
 
 type Snap struct {
-	SchemaVersion int        `json:"schemaVersion"`
-	TS            time.Time  `json:"ts"`
-	Project       string     `json:"project,omitempty"`
-	Key           string     `json:"key"`
-	Variant       string     `json:"variant"`
-	Digest        string     `json:"digest"`
-	Branch        string     `json:"branch"`
-	SHA           string     `json:"sha"`
-	Dirty         bool       `json:"dirty"`
-	Worktree      string     `json:"worktree"`
-	Session       string     `json:"session"`
-	Note          string     `json:"note,omitempty"`
-	Conditions    Conditions `json:"conditions"`
+	SchemaVersion int               `json:"schemaVersion"`
+	TS            time.Time         `json:"ts"`
+	Project       string            `json:"project,omitempty"`
+	Key           string            `json:"key"`
+	Variant       string            `json:"variant"`
+	Dims          map[string]string `json:"dims,omitempty"`
+	Meta          map[string]string `json:"meta,omitempty"`
+	Digest        string            `json:"digest"`
+	Branch        string            `json:"branch"`
+	SHA           string            `json:"sha"`
+	Dirty         bool              `json:"dirty"`
+	Worktree      string            `json:"worktree"`
+	Session       string            `json:"session"`
+	Note          string            `json:"note,omitempty"`
+	Conditions    Conditions        `json:"conditions"`
 }
 
 type Note struct {
@@ -75,7 +96,92 @@ func ParseVariant(variant string) error {
 	if variant == "" || strings.ContainsAny(variant, "/@\x00\r\n") {
 		return fmt.Errorf("invalid variant %q", variant)
 	}
+	if strings.Contains(variant, "=") {
+		if _, err := decodeVariant(variant); err != nil {
+			return fmt.Errorf("invalid variant %q: %w", variant, err)
+		}
+	}
 	return nil
+}
+
+// EncodeVariant renders dimensions into the variant token that names a baseline on disk.
+// Sorting is what makes it an identity rather than a label: the same set of dimensions has
+// to produce the same string whatever order the caller happened to build the map in, or two
+// runs of the same check would measure against two different baselines.
+func EncodeVariant(dims map[string]string) (string, error) {
+	keys := make([]string, 0, len(dims))
+	for key, value := range dims {
+		if !dimensionNames[key] {
+			return "", fmt.Errorf("unknown dimension %q", key)
+		}
+		if value == "" {
+			return "", fmt.Errorf("dimension %q must not have an empty value", key)
+		}
+		if strings.ContainsAny(key, "=,") || strings.ContainsAny(value, "=,") {
+			return "", errors.New("dimension key and value must not contain = or ,")
+		}
+		keys = append(keys, key)
+	}
+	if len(keys) == 0 {
+		return "", errors.New("at least one dimension is required")
+	}
+	sort.Strings(keys)
+	pairs := make([]string, 0, len(keys))
+	for _, key := range keys {
+		pairs = append(pairs, key+"="+dims[key])
+	}
+	return strings.Join(pairs, ","), nil
+}
+
+// DecodeVariant returns nil for a variant this scheme does not own, which is how every
+// baseline taken before dimensions existed keeps working: "default" and "mobile-dark" are
+// opaque tokens, they decode to nothing, and nothing on disk had to be renamed for that.
+func DecodeVariant(variant string) map[string]string {
+	if !strings.Contains(variant, "=") {
+		return nil
+	}
+	dims, err := decodeVariant(variant)
+	if err != nil {
+		return nil
+	}
+	return dims
+}
+
+func decodeVariant(variant string) (map[string]string, error) {
+	dims := make(map[string]string)
+	for _, pair := range strings.Split(variant, ",") {
+		parts := strings.Split(pair, "=")
+		if len(parts) != 2 {
+			return nil, errors.New("dimensions must use k=v pairs")
+		}
+		key, value := parts[0], parts[1]
+		if _, exists := dims[key]; exists {
+			return nil, fmt.Errorf("duplicate dimension %q", key)
+		}
+		dims[key] = value
+	}
+	// Re-encoding and comparing is the cheapest way to reject a variant that would name a
+	// baseline no encoder could ever produce. Without it "scheme=dark,flow=pay" and
+	// "flow=pay,scheme=dark" are two files holding the same thing, and only one of them is
+	// ever compared against.
+	encoded, err := EncodeVariant(dims)
+	if err != nil {
+		return nil, err
+	}
+	if encoded != variant {
+		return nil, errors.New("dimensions must be canonically ordered")
+	}
+	return dims, nil
+}
+
+func ViewportClass(width int) string {
+	if width < tabletMinWidth {
+		return "mobile"
+	}
+	if width < desktopMinWidth {
+		return "tablet"
+	}
+	return "desktop"
 }
 
 func StateHome() (string, error) {

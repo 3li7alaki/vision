@@ -62,10 +62,54 @@ func run(args []string) error {
 	}
 }
 
-const usageText = "usage: vision snap <key> [--as <variant>] [--note <text>] [--json] | vision notes [--unread | --since <duration>] [--json] | vision on | off | status | vision --version"
+const usageText = "usage: vision snap <key> [--as <variant> | --dim k=v...] [--meta k=v...] [--note <text>] [--json] | vision notes [--unread | --since <duration>] [--flagged] [--json] | vision on | off | status | vision --version"
 
 func usage() error {
 	return errors.New(usageText)
+}
+
+// unknownDimension is what a derived dimension holds when the browser could not tell us its
+// value. It is a real value rather than a blank, so it sorts, encodes, and names a baseline
+// like any other, and can never be read as "this shot had no such dimension".
+const unknownDimension = "unknown"
+
+// deriveDims fills in the dimensions the tool can measure for itself, which is the point of
+// the whole feature: the reviewer stops typing values the capture already recorded, so a
+// light page can no longer be filed under scheme=dark by a slip of the hand. An explicit
+// --dim always wins, because the human overriding a measurement is a deliberate act.
+//
+// The browser does not always answer. capture.scheme returns "" when its eval fails, and a
+// capture response missing its viewport leaves Width at 0. Neither gap may be dropped: a
+// shot with no scheme dimension shares a baseline with shots of both schemes, which is the
+// exact collision this encoding exists to prevent. Neither may be guessed either, since
+// ViewportClass(0) would confidently call a desktop shot "mobile". Unknown is recorded
+// instead, so the gap is visible in the gallery and still cannot collide with a real value.
+func deriveDims(dims map[string]string, conditions store.Conditions) {
+	if _, ok := dims["scheme"]; !ok {
+		dims["scheme"] = unknownDimension
+		if conditions.Scheme != "" {
+			dims["scheme"] = conditions.Scheme
+		}
+	}
+	if _, ok := dims["vp"]; !ok {
+		dims["vp"] = unknownDimension
+		if conditions.Width > 0 {
+			dims["vp"] = store.ViewportClass(conditions.Width)
+		}
+	}
+}
+
+type keyValueFlag map[string]string
+
+func (values keyValueFlag) String() string { return "" }
+
+func (values keyValueFlag) Set(value string) error {
+	key, item, ok := strings.Cut(value, "=")
+	if !ok || key == "" || item == "" {
+		return errors.New("want k=v with a non-empty key and value")
+	}
+	values[key] = item
+	return nil
 }
 
 func snap(args []string) error {
@@ -78,11 +122,27 @@ func snap(args []string) error {
 	}
 	fs := flag.NewFlagSet("snap", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
+	dims, meta := keyValueFlag{}, keyValueFlag{}
 	variant, note, asJSON := fs.String("as", "default", "variant"), fs.String("note", "", "note"), fs.Bool("json", false, "JSON output")
+	fs.Var(dims, "dim", "visual dimension k=v")
+	fs.Var(meta, "meta", "provenance k=v")
 	if err := fs.Parse(args[1:]); err != nil || fs.NArg() != 0 {
 		return usage()
 	}
-	if err := store.ParseVariant(*variant); err != nil {
+	asSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "as" {
+			asSet = true
+		}
+	})
+	if asSet && len(dims) != 0 {
+		return errors.New("--as and --dim are mutually exclusive")
+	}
+	if len(dims) != 0 {
+		if _, err := store.EncodeVariant(dims); err != nil {
+			return err
+		}
+	} else if err := store.ParseVariant(*variant); err != nil {
 		return err
 	}
 	project, err := store.Identify(".")
@@ -98,7 +158,14 @@ func snap(args []string) error {
 	if err != nil {
 		return err
 	}
-	req := server.SnapRequest{Project: project, Key: key, Variant: *variant, Note: *note, Session: os.Getenv("VISION_SESSION_ID"), PNG: base64.StdEncoding.EncodeToString(shot.PNG), Capture: shot.Conditions}
+	if len(dims) != 0 {
+		deriveDims(dims, shot.Conditions)
+		*variant, err = store.EncodeVariant(dims)
+		if err != nil {
+			return err
+		}
+	}
+	req := server.SnapRequest{Project: project, Key: key, Variant: *variant, Dims: dims, Meta: meta, Note: *note, Session: os.Getenv("VISION_SESSION_ID"), PNG: base64.StdEncoding.EncodeToString(shot.PNG), Capture: shot.Conditions}
 	var result map[string]any
 	if err := post("/api/snap", req, &result); err != nil {
 		return err
@@ -121,7 +188,7 @@ func snap(args []string) error {
 func notes(args []string) error {
 	fs := flag.NewFlagSet("notes", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	unread, since, asJSON := fs.Bool("unread", false, "unread notes"), fs.Duration("since", 0, "notes since duration"), fs.Bool("json", false, "JSON output")
+	unread, since, flagged, asJSON := fs.Bool("unread", false, "unread notes"), fs.Duration("since", 0, "notes since duration"), fs.Bool("flagged", false, "flagged notes"), fs.Bool("json", false, "JSON output")
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || (*unread && *since != 0) {
 		return usage()
 	}
@@ -143,6 +210,20 @@ func notes(args []string) error {
 		filtered := values[:0]
 		for _, n := range values {
 			if !n.TS.Before(cutoff) {
+				filtered = append(filtered, n)
+			}
+		}
+		values = filtered
+	}
+	// Filtering happens after the read, never instead of it. With --unread the cursor has
+	// already advanced past every note fetched above, so "--unread --flagged" marks the ok
+	// verdicts read as well and simply does not print them. That is the honest behaviour for
+	// a cursor that means "seen", but it does mean this pair is a one-shot view, not a query
+	// you can run twice.
+	if *flagged {
+		filtered := values[:0]
+		for _, n := range values {
+			if n.Verdict == "flag" {
 				filtered = append(filtered, n)
 			}
 		}

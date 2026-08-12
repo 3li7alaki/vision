@@ -67,6 +67,23 @@
   .crumb .key     { color: var(--text);  flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
   .crumb .variant { color: var(--muted); flex: 0 0 auto; }
 
+  /* Dimensions are what decides which baseline this shot is measured against, so they
+     read as discrete facts rather than one run-on string. The name is dimmed and the
+     value is not: scanning a column of cards, "dark" and "mobile" are what you are
+     actually looking for, "scheme" and "vp" are just where they live. */
+  .crumb .dims { display: flex; gap: 6px; flex: 0 1 auto; min-width: 0; overflow: hidden; }
+  .crumb .dim {
+    display: inline-flex;
+    gap: 4px;
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: var(--chip, rgba(127, 140, 170, .13));
+    font: 500 11px/1.45 var(--mono);
+    white-space: nowrap;
+  }
+  .crumb .dim b { color: var(--faint); font-weight: 500; }
+  .crumb .dim i { color: var(--text); font-style: normal; }
+
   .spacer { flex: 1 1 auto; min-width: 0; }
 
   .count {
@@ -82,11 +99,21 @@
   #stage {
     position: relative;
     display: grid;
+    /* One explicit minmax(0,1fr) cell, for the same reason #app has one. An implicit auto
+       track is sized BY its item, so the image's max-height: 100% would resolve against
+       the image's own intrinsic height. That is circular, CSS drops the percentage, and a
+       shot taller than the stage paints at full size and is clipped by overflow. A desktop
+       shot hides the bug by hitting max-width first, which scales its height down too; a
+       phone shot is narrower than the stage, so nothing catches it. Both children take the
+       one cell because they never show together, and an implicit second row would push the
+       empty state below the fold. */
+    grid-template: minmax(0, 1fr) / minmax(0, 1fr);
     place-items: center;
     padding: 4px 24px 12px;
     min-height: 0;
     overflow: hidden;
   }
+  #shot, #empty { grid-area: 1 / 1; }
 
   #shot {
     width: auto;
@@ -310,6 +337,7 @@
       <span class="ctx" id="ctx"></span>
       <span class="key" id="key"></span>
       <span class="variant" id="variant"></span>
+      <span class="dims" id="dims"></span>
     </div>
     <div class="spacer"></div>
     <div class="count" id="count"></div>
@@ -330,6 +358,7 @@
     <div class="stat" id="stat"></div>
     <div class="spacer"></div>
     <div class="keys"><kbd class="ok">o</kbd><span class="label">ok</span></div>
+    <div class="keys"><kbd class="ok">a</kbd><span class="label">ok all</span></div>
     <div class="keys"><kbd class="flag">f</kbd><span class="label">flag</span></div>
     <div class="keys"><kbd>space</kbd><span class="label">compare</span></div>
     <div class="keys"><kbd>?</kbd></div>
@@ -357,6 +386,7 @@
       <dt><kbd>b</kbd></dt>                    <dd>hold to peek the baseline</dd>
       <dt><kbd>o</kbd></dt>                    <dd>ok, and this becomes the baseline</dd>
       <dt><kbd>O</kbd></dt>                    <dd>ok with a note</dd>
+      <dt><kbd>a</kbd></dt>                    <dd>ok for every variant of this key</dd>
       <dt><kbd>f</kbd></dt>                    <dd>flag, note required</dd>
       <dt><kbd>u</kbd></dt>                    <dd>undo, while the toast is up</dd>
       <dt><kbd>1</kbd>..<kbd>9</kbd></dt>      <dd>jump to a flow step</dd>
@@ -370,7 +400,7 @@
 (() => {
   const $ = s => document.querySelector(s);
   const el = {
-    ctx: $('#ctx'), key: $('#key'), variant: $('#variant'), count: $('#count'),
+    ctx: $('#ctx'), key: $('#key'), variant: $('#variant'), dims: $('#dims'), count: $('#count'),
     shot: $('#shot'), layer: $('#layer'), stat: $('#stat'), strip: $('#strip'),
     empty: $('#empty'), emptySub: $('#emptySub'),
     note: $('#note'), noteTag: $('#noteTag'), noteInput: $('#noteInput'),
@@ -418,6 +448,18 @@
 
   const current = () => queue[at];
 
+  // A group is one key's whole set of variants: dark, light, mobile, whatever axes it
+  // was shot across. The server sorts them adjacent, but nothing here depends on that,
+  // because one CSS change flips every variant of a key at once and the reviewer should
+  // be able to accept that as a single decision from wherever the cursor happens to sit.
+  const groupOf = it => it.group || `${it.projectId} ${it.key}`;
+  const groupRows = () => {
+    const it = current();
+    if (!it) return [];
+    const g = groupOf(it);
+    return queue.reduce((acc, q, i) => (groupOf(q) === g && acc.push(i), acc), []);
+  };
+
   function render() {
     const it = current();
     const has = Boolean(it);
@@ -426,6 +468,7 @@
     el.shot.style.display = has ? '' : 'none';
     if (!has) {
       el.ctx.textContent = el.key.textContent = el.variant.textContent = '';
+      el.dims.replaceChildren();
       el.count.textContent = '';
       el.stat.textContent = '';
       el.strip.classList.remove('show');
@@ -437,8 +480,16 @@
 
     el.ctx.textContent = `${it.project} · ${it.branch || 'detached'} ·`;
     el.key.textContent = it.key;
-    el.variant.textContent = `@${it.variant}`;
-    el.count.textContent = `${at + 1} / ${queue.length}`;
+    paintDims(it);
+
+    // Position in the group comes second because it answers a different question than the
+    // overall counter: not how much is left, but whether this card's siblings are still
+    // ahead of you. It is omitted for a lone card, where it would only say "1 of 1".
+    const rows = groupRows();
+    const here = rows.indexOf(at);
+    el.count.textContent = rows.length > 1
+      ? `${here + 1} of ${rows.length} · ${at + 1} / ${queue.length}`
+      : `${at + 1} / ${queue.length}`;
 
     // A resize makes a pixel diff meaningless, so the tool refuses to compute one.
     // Say that plainly instead of showing a screen of red.
@@ -455,6 +506,36 @@
 
     paint();
     filmstrip(it);
+  }
+
+  // What the shot is comes before how it was rendered: a reviewer looking at a wall of
+  // cards is hunting the case, not the scheme. Anything outside this list is a variant
+  // string this gallery is too old to understand, so it falls back to showing it raw
+  // rather than dropping a fact it cannot name.
+  const DIM_ORDER = ['flow', 'state', 'case', 'scheme', 'vp', 'locale', 'role'];
+
+  function paintDims(it) {
+    const dims = it.dims || null;
+    const names = dims ? Object.keys(dims) : [];
+    if (!names.length) {
+      el.variant.textContent = `@${it.variant}`;
+      el.dims.replaceChildren();
+      return;
+    }
+    el.variant.textContent = '';
+    const rank = n => { const i = DIM_ORDER.indexOf(n); return i < 0 ? DIM_ORDER.length : i; };
+    el.dims.replaceChildren(...names
+      .sort((a, b) => rank(a) - rank(b) || a.localeCompare(b))
+      .map(n => {
+        const chip = document.createElement('span');
+        chip.className = 'dim';
+        const name = document.createElement('b');
+        name.textContent = n;
+        const value = document.createElement('i');
+        value.textContent = dims[n];
+        chip.append(name, value);
+        return chip;
+      }));
   }
 
   function paint() {
@@ -507,25 +588,31 @@
 
   // The POST is delayed rather than sent immediately, so `o` on the wrong card is
   // recoverable without inventing a delete path the store deliberately does not have.
-  function verdict(kind, note) {
+  function verdict(kind, note, whole) {
     const it = current();
     if (!it) return;
     if (kind === 'flag' && !note) return openNote('flag');
     flushVerdict();
 
-    queue.splice(at, 1);
-    if (at >= queue.length) at = Math.max(0, queue.length - 1);
+    // Ascending index order throughout, and removal walks it backwards, so undo can put
+    // every card back at the position it actually came from instead of at the cursor.
+    const rows = whole ? groupRows() : [at];
+    const taken = rows.map(i => ({ item: queue[i], index: i }));
+    for (let n = rows.length - 1; n >= 0; n--) queue.splice(rows[n], 1);
+    at = Math.max(0, Math.min(rows[0], queue.length - 1));
     render();
 
-    el.toastWhat.textContent = `${kind === 'ok' ? 'ok' : 'flagged'} ${it.key}`;
+    const verb = kind === 'ok' ? 'ok' : 'flagged';
+    el.toastWhat.textContent = taken.length > 1
+      ? `${verb} all ${taken.length} of ${it.key}`
+      : `${verb} ${it.key}`;
     el.toast.style.setProperty('--undo-ms', `${UNDO_MS}ms`);
     el.toast.classList.remove('show');
     void el.toast.offsetWidth;               // restart the drain animation
     el.toast.classList.add('show');
 
     pendingVerdict = {
-      item: it, verdict: kind, note: note || '',
-      index: at,
+      taken, verdict: kind, note: note || '',
       timer: setTimeout(flushVerdict, UNDO_MS),
     };
   }
@@ -536,22 +623,34 @@
     pendingVerdict = null;
     clearTimeout(p.timer);
     el.toast.classList.remove('show');
-    doneCount++;
+    doneCount += p.taken.length;
     if (mock) return;
-    fetch('/api/verdict', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        project: p.item.projectId, key: p.item.key, variant: p.item.variant,
-        digest: p.item.digest, verdict: p.verdict, note: p.note,
-      }),
-    }).catch(() => {
-      // Never lose the reviewer's words: put the card back and say so.
-      queue.splice(p.index, 0, p.item);
-      render();
-      el.stat.className = 'stat warn';
-      el.stat.textContent = 'could not save that verdict, daemon unreachable';
+    // One post per card even for a group verdict. The store is append-only and each shot
+    // carries its own digest, so a batch endpoint would save a round trip and cost the
+    // ability to put back only the cards that actually failed.
+    p.taken.forEach(({ item, index }) => {
+      fetch('/api/verdict', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          project: item.projectId, key: item.key, variant: item.variant,
+          digest: item.digest, verdict: p.verdict, note: p.note,
+        }),
+      }).catch(() => {
+        // Never lose the reviewer's words: put the card back and say so.
+        restore(item, index);
+        render();
+        el.stat.className = 'stat warn';
+        el.stat.textContent = 'could not save that verdict, daemon unreachable';
+      });
     });
+  }
+
+  // Put a card back where it was. Cards ahead of it may already have been restored by a
+  // sibling's failure, so clamp rather than trusting the recorded index to still exist.
+  function restore(item, index) {
+    if (queue.some(q => q.digest === item.digest)) return;
+    queue.splice(Math.min(index, queue.length), 0, item);
   }
 
   function undo() {
@@ -560,8 +659,8 @@
     clearTimeout(p.timer);
     pendingVerdict = null;
     el.toast.classList.remove('show');
-    queue.splice(p.index, 0, p.item);
-    go(p.index);
+    p.taken.forEach(({ item, index }) => restore(item, index));
+    go(p.taken[0].index);
   }
 
   /* ---------- note bar ---------- */
@@ -621,6 +720,10 @@
       case ' ': e.preventDefault(); layer = (layer + 1) % LAYERS.length; return paint();
       case 'b': if (!peeking) { peeking = true; el.shot.classList.add('swap'); paint(); } return;
       case 'o': return verdict('ok', '');
+      // One CSS change flips every variant of a key at once. Reviewing that as four
+      // separate decisions is four chances to accept three and get bored before the
+      // fourth, which is the one that was actually broken on mobile.
+      case 'a': return verdict('ok', '', true);
       // preventDefault because openNote focuses the input: without it the browser
       // delivers this same keystroke to the field it just focused, so pressing f to
       // flag leaves an "f" to delete before you can type.
@@ -654,7 +757,32 @@
         `<rect x="24" y="60" width="${w * 0.6}" height="18" rx="4" fill="#d4d4d8"/>` +
         `<rect x="24" y="94" width="${w * 0.4}" height="14" rx="4" fill="#e4e4e7"/></svg>`);
     return [
+      // One key shot across three axes, so the mock exercises the chips, the group
+      // counter, and `a`. The entries below it keep bare legacy variants on purpose:
+      // both rendering paths have to survive, since no existing baseline was migrated.
+      { project: 'shop', branch: 'feat/checkout', key: 'checkout/pay', group: 'shop checkout/pay',
+        variant: 'case=declined,flow=payment,scheme=dark,vp=mobile',
+        dims: { flow: 'payment', case: 'declined', scheme: 'dark', vp: 'mobile' },
+        digest: 'p1', status: 'changed', changedFraction: 0.031,
+        shotUrl: px(375, 812, '#18181b', '#22c55e'),
+        baselineUrl: px(375, 812, '#18181b', '#6366f1'),
+        diffUrl: px(375, 812, '#1c1917', '#f43f5e') },
+      { project: 'shop', branch: 'feat/checkout', key: 'checkout/pay', group: 'shop checkout/pay',
+        variant: 'case=declined,flow=payment,scheme=light,vp=mobile',
+        dims: { flow: 'payment', case: 'declined', scheme: 'light', vp: 'mobile' },
+        digest: 'p2', status: 'changed', changedFraction: 0.029,
+        shotUrl: px(375, 812, '#fafafa', '#22c55e'),
+        baselineUrl: px(375, 812, '#fafafa', '#6366f1'),
+        diffUrl: px(375, 812, '#fafafa', '#f43f5e') },
+      { project: 'shop', branch: 'feat/checkout', key: 'checkout/pay', group: 'shop checkout/pay',
+        variant: 'case=declined,flow=payment,scheme=dark,vp=desktop',
+        dims: { flow: 'payment', case: 'declined', scheme: 'dark', vp: 'desktop' },
+        digest: 'p3', status: 'changed', changedFraction: 0.028,
+        shotUrl: px(900, 560, '#18181b', '#22c55e'),
+        baselineUrl: px(900, 560, '#18181b', '#6366f1'),
+        diffUrl: px(900, 560, '#1c1917', '#f43f5e') },
       { project: 'shop', branch: 'feat/checkout', key: 'checkout/empty-cart', variant: 'mobile-dark',
+        group: 'shop checkout/empty-cart',
         digest: 'a1', status: 'changed', changedFraction: 0.014,
         shotUrl: px(375, 812, '#18181b', '#3f3f46'),
         baselineUrl: px(375, 812, '#18181b', '#6366f1'),

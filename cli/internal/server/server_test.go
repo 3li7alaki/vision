@@ -138,3 +138,38 @@ func TestQueueItemCarriesHashedProjectID(t *testing.T) {
 		t.Fatalf("Project: got %q, want the display name shop", items[0].Project)
 	}
 }
+
+func TestQueueGroupsVariantsBehindNewerKey(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	id := strings.Repeat("c", 64)
+	now := time.Now()
+	snaps := []store.Snap{
+		{SchemaVersion: 1, TS: now.Add(-2 * time.Minute), Project: "shop", Key: "checkout/cart", Variant: "vp=mobile", Dims: map[string]string{"vp": "mobile"}, Meta: map[string]string{"ticket": "V-1"}, Digest: "sha256:1111"},
+		{SchemaVersion: 1, TS: now.Add(-time.Minute), Project: "shop", Key: "checkout/cart", Variant: "vp=desktop", Dims: map[string]string{"vp": "desktop"}, Digest: "sha256:2222"},
+		{SchemaVersion: 1, TS: now, Project: "shop", Key: "checkout/empty", Variant: "default", Digest: "sha256:3333"},
+	}
+	for _, snap := range snaps {
+		if err := store.AppendSnap(id, snap, []byte(snap.Digest)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	items, err := Queue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("queue length: got %d, want 3", len(items))
+	}
+	want := []string{"checkout/empty@default", "checkout/cart@vp=desktop", "checkout/cart@vp=mobile"}
+	for i, item := range items {
+		if got := item.Key + "@" + item.Variant; got != want[i] {
+			t.Errorf("item %d: got %q, want %q", i, got, want[i])
+		}
+		if item.Group != id+"/"+item.Key {
+			t.Errorf("item %d group: got %q", i, item.Group)
+		}
+	}
+	if items[1].Dims["vp"] != "desktop" || items[2].Meta["ticket"] != "V-1" {
+		t.Fatalf("dimensions or metadata did not survive queue: %#v %#v", items[1].Dims, items[2].Meta)
+	}
+}

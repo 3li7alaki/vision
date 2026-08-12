@@ -28,13 +28,15 @@ const Address = "127.0.0.1:4747"
 var projectIDPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 type SnapRequest struct {
-	Project store.Project    `json:"project"`
-	Key     string           `json:"key"`
-	Variant string           `json:"variant"`
-	Note    string           `json:"note,omitempty"`
-	Session string           `json:"session,omitempty"`
-	PNG     string           `json:"png"`
-	Capture store.Conditions `json:"conditions"`
+	Project store.Project     `json:"project"`
+	Key     string            `json:"key"`
+	Variant string            `json:"variant"`
+	Dims    map[string]string `json:"dims,omitempty"`
+	Meta    map[string]string `json:"meta,omitempty"`
+	Note    string            `json:"note,omitempty"`
+	Session string            `json:"session,omitempty"`
+	PNG     string            `json:"png"`
+	Capture store.Conditions  `json:"conditions"`
 }
 
 type VerdictRequest struct {
@@ -47,20 +49,23 @@ type VerdictRequest struct {
 }
 
 type Item struct {
-	Project         string    `json:"project"`
-	ProjectID       string    `json:"projectId"`
-	Branch          string    `json:"branch"`
-	Key             string    `json:"key"`
-	Variant         string    `json:"variant"`
-	Digest          string    `json:"digest"`
-	Status          string    `json:"status"`
-	ChangedFraction float64   `json:"changedFraction,omitempty"`
-	Incomparable    string    `json:"incomparable,omitempty"`
-	ShotURL         string    `json:"shotUrl"`
-	BaselineURL     string    `json:"baselineUrl,omitempty"`
-	DiffURL         string    `json:"diffUrl,omitempty"`
-	TS              time.Time `json:"-"`
-	Steps           []Step    `json:"steps,omitempty"`
+	Project         string            `json:"project"`
+	ProjectID       string            `json:"projectId"`
+	Branch          string            `json:"branch"`
+	Key             string            `json:"key"`
+	Variant         string            `json:"variant"`
+	Dims            map[string]string `json:"dims,omitempty"`
+	Meta            map[string]string `json:"meta,omitempty"`
+	Group           string            `json:"group"`
+	Digest          string            `json:"digest"`
+	Status          string            `json:"status"`
+	ChangedFraction float64           `json:"changedFraction,omitempty"`
+	Incomparable    string            `json:"incomparable,omitempty"`
+	ShotURL         string            `json:"shotUrl"`
+	BaselineURL     string            `json:"baselineUrl,omitempty"`
+	DiffURL         string            `json:"diffUrl,omitempty"`
+	TS              time.Time         `json:"-"`
+	Steps           []Step            `json:"steps,omitempty"`
 }
 
 type Step struct {
@@ -120,7 +125,7 @@ func (s *Server) snap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	digest := diff.Digest(pngData)
-	record := store.Snap{SchemaVersion: store.SchemaVersion, TS: time.Now().UTC(), Project: req.Project.Name, Key: req.Key, Variant: req.Variant, Digest: digest, Branch: req.Project.Branch, SHA: req.Project.SHA, Dirty: req.Project.Dirty, Worktree: req.Project.Worktree, Session: req.Session, Note: req.Note, Conditions: req.Capture}
+	record := store.Snap{SchemaVersion: store.SchemaVersion, TS: time.Now().UTC(), Project: req.Project.Name, Key: req.Key, Variant: req.Variant, Dims: req.Dims, Meta: req.Meta, Digest: digest, Branch: req.Project.Branch, SHA: req.Project.SHA, Dirty: req.Project.Dirty, Worktree: req.Project.Worktree, Session: req.Session, Note: req.Note, Conditions: req.Capture}
 	if err := store.AppendSnap(req.Project.ID, record, pngData); err != nil {
 		problem(w, http.StatusInternalServerError, err)
 		return
@@ -278,13 +283,34 @@ func Queue() ([]Item, error) {
 			}
 		}
 	}
-	sort.SliceStable(items, func(i, j int) bool { return items[i].TS.After(items[j].TS) })
+	newest := make(map[string]time.Time)
+	for _, item := range items {
+		if item.TS.After(newest[item.Group]) {
+			newest[item.Group] = item.TS
+		}
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].Group != items[j].Group {
+			if newest[items[i].Group].Equal(newest[items[j].Group]) {
+				return items[i].Group < items[j].Group
+			}
+			return newest[items[i].Group].After(newest[items[j].Group])
+		}
+		if items[i].Variant != items[j].Variant {
+			return items[i].Variant < items[j].Variant
+		}
+		return items[i].TS.After(items[j].TS)
+	})
 	attachSteps(items)
 	return items, nil
 }
 
 func makeItem(project, name string, snap store.Snap) (Item, bool, error) {
-	item := Item{Project: name, ProjectID: project, Branch: snap.Branch, Key: snap.Key, Variant: snap.Variant, Digest: snap.Digest, Status: "new", ShotURL: mediaURL("shot", project, snap.Digest), TS: snap.TS}
+	// Dimensions are read back out of the variant rather than out of snap.Dims, even though
+	// the two are identical by construction. The variant is what actually chose the baseline
+	// this shot is measured against, so anything else on screen would let a reviewer read one
+	// set of dimensions while the comparison used another.
+	item := Item{Project: name, ProjectID: project, Branch: snap.Branch, Key: snap.Key, Variant: snap.Variant, Dims: store.DecodeVariant(snap.Variant), Meta: snap.Meta, Group: project + "/" + snap.Key, Digest: snap.Digest, Status: "new", ShotURL: mediaURL("shot", project, snap.Digest), TS: snap.TS}
 	baseline, _ := store.BaselinePath(project, snap.Key, snap.Variant)
 	b, err := os.ReadFile(baseline)
 	if errors.Is(err, os.ErrNotExist) {

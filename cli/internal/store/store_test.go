@@ -77,6 +77,80 @@ func TestParseKeyAndVariant(t *testing.T) {
 	if ParseVariant("mobile-dark") != nil || ParseVariant("mobile/dark") == nil {
 		t.Fatal("variant validation wrong")
 	}
+	for _, variant := range []string{"unknown=value", "vp=mobile,vp=desktop", "vp=mobile,scheme=dark"} {
+		if ParseVariant(variant) == nil {
+			t.Errorf("accepted malformed encoded variant %q", variant)
+		}
+	}
+}
+
+func TestEncodeVariantCanonical(t *testing.T) {
+	first := map[string]string{"scheme": "dark", "state": "empty", "vp": "mobile"}
+	second := make(map[string]string)
+	second["vp"] = "mobile"
+	second["state"] = "empty"
+	second["scheme"] = "dark"
+	a, err := EncodeVariant(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := EncodeVariant(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a != b || a != "scheme=dark,state=empty,vp=mobile" {
+		t.Fatalf("encoded variants differ: %q %q", a, b)
+	}
+}
+
+func TestVariantCodec(t *testing.T) {
+	want := map[string]string{"case": "error", "locale": "ar", "role": "admin"}
+	encoded, err := EncodeVariant(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := DecodeVariant(encoded)
+	if len(got) != len(want) {
+		t.Fatalf("decoded length: got %d, want %d", len(got), len(want))
+	}
+	for key, value := range want {
+		if got[key] != value {
+			t.Errorf("%s: got %q, want %q", key, got[key], value)
+		}
+	}
+	for _, legacy := range []string{"default", "mobile-dark"} {
+		if decoded := DecodeVariant(legacy); decoded != nil {
+			t.Errorf("legacy %q decoded as %#v, want nil", legacy, decoded)
+		}
+	}
+}
+
+func TestEncodeVariantRejectsInvalidDimensions(t *testing.T) {
+	tests := map[string]map[string]string{
+		"unknown key":  {"schema": "dark"},
+		"empty key":    {"": "dark"},
+		"empty value":  {"scheme": ""},
+		"equals key":   {"sche=me": "dark"},
+		"comma key":    {"sche,me": "dark"},
+		"equals value": {"scheme": "da=rk"},
+		"comma value":  {"scheme": "da,rk"},
+	}
+	for name, dims := range tests {
+		t.Run(name, func(t *testing.T) {
+			if encoded, err := EncodeVariant(dims); err == nil {
+				t.Fatalf("encoded invalid dimensions as %q", encoded)
+			}
+		})
+	}
+}
+
+func TestViewportClassBoundaries(t *testing.T) {
+	tests := map[int]string{599: "mobile", 600: "tablet", 1023: "tablet", 1024: "desktop"}
+	for width, want := range tests {
+		if got := ViewportClass(width); got != want {
+			t.Errorf("width %d: got %q, want %q", width, got, want)
+		}
+	}
 }
 
 func TestProjectIdentitySharedByLinkedWorktree(t *testing.T) {

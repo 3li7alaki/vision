@@ -49,6 +49,26 @@ vision snap checkout/happy-path#3 --as desktop-light   # confirmation
 the tool dies. vision refuses to diff across mismatched conditions and will tell you when you
 have drifted.
 
+**One capture size per `vp` bucket, and these are the sizes.** `vp=mobile` is every width under
+600, so a 360 shot and a 430 shot encode to the same variant, claim the same baseline, and then
+refuse to diff against each other. Pick the size from this table and do not improvise a new one:
+
+| `vp` | capture | why this width |
+|---|---|---|
+| `mobile` | 360x700 | narrowest width still in real use, and the common Android one. Every current iPhone is 375 to 440, so a layout that survives 360 survives all of them. Breaks come from too narrow, never too wide. |
+| `tablet` | 820x700 | iPad Air and iPad Pro 11 portrait, the middle of the 744 to 834 tablet cluster. |
+| `desktop` | 1440x700 | common laptop. Avoid 1024: it is an iPad Pro 12.9 portrait, an iPad landscape, and Tailwind's `lg` edge all at once, so it sits exactly where layouts change. |
+
+Two ceilings on that table, both worth knowing before you blame the page:
+
+The height is 700 because the emulated viewport must stay under the real browser window height,
+around 721 CSS px on a laptop. Go taller and the bottom of the capture comes back unpainted
+white. So a phone shot shows the top 700 px of the page, not a real phone's 844. Anything below
+that fold is unreviewed, and shooting it means a second key, not a taller viewport.
+
+Shooting two phone widths needs a second axis, not a second width. `--dim vp=mobile` cannot tell
+them apart, so use `--dim case=narrow` alongside it or the two shots will fight over one baseline.
+
 Shoot the states that actually break, not just the happy one: empty, loading, error, and content
 long enough to overflow. Those are where generated UI fails, and a single desktop screenshot of
 the ideal case hides all of them.
