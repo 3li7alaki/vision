@@ -56,7 +56,7 @@ func Take(ctx context.Context) (Result, error) {
 	}
 	c := conditions(raw)
 	if c.Scheme == "" {
-		c.Scheme = scheme(ctx)
+		c.Scheme = scheme(ctx, text(raw["tabId"]))
 	}
 	return Result{PNG: pngData, Conditions: c, Raw: raw}, nil
 }
@@ -68,13 +68,26 @@ func Take(ctx context.Context) (Result, error) {
 // A failure here returns the empty string rather than failing the snap, because losing the
 // picture is worse than losing one condition. That degrades safely: an empty scheme differs
 // from a recorded one, so the guard refuses the diff instead of rendering a fake one.
-func scheme(ctx context.Context) string {
-	cmd := exec.CommandContext(ctx, "pinchtab", pinchtab("eval", "matchMedia('(prefers-color-scheme: dark)').matches", "--json")...)
+//
+// It aims at the tab the capture actually came from, because pinchtab's current-tab pointer
+// goes stale: an eval with no --tab has been seen answering "tab <id> not found" for a tab
+// that no longer exists, which turned a good capture into scheme=unknown and forked the
+// variant into a new card instead of a diff.
+func scheme(ctx context.Context, tabID string) string {
+	cmd := exec.CommandContext(ctx, "pinchtab", schemeArgs(tabID)...)
 	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}
 	return schemeFrom(out)
+}
+
+func schemeArgs(tabID string) []string {
+	args := []string{"eval", "matchMedia('(prefers-color-scheme: dark)').matches", "--json"}
+	if tabID != "" {
+		args = append(args, "--tab", tabID)
+	}
+	return pinchtab(args...)
 }
 
 func schemeFrom(out []byte) string {

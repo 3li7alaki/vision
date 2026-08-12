@@ -63,6 +63,23 @@ func TestSchemeFrom(t *testing.T) {
 	}
 }
 
+// The scheme eval must name the tab the capture came from. Riding pinchtab's current-tab
+// pointer has been seen answering "tab <id> not found" for a tab that was already gone,
+// which records scheme="" and forks the variant instead of diffing it. No tabId in the
+// response means no --tab, because an empty one would be rejected outright.
+func TestSchemeArgsAimAtTheCapturedTab(t *testing.T) {
+	t.Setenv("PINCHTAB_SERVER", "")
+	got := schemeArgs("77F6347DCF04763782F11997C3E80F4A")
+	if len(got) < 2 || got[len(got)-2] != "--tab" || got[len(got)-1] != "77F6347DCF04763782F11997C3E80F4A" {
+		t.Fatalf("scheme eval did not name the tab: %v", got)
+	}
+	for _, arg := range schemeArgs("") {
+		if arg == "--tab" {
+			t.Fatal("empty tab id still passed --tab")
+		}
+	}
+}
+
 func TestConditionsPermissiveShapes(t *testing.T) {
 	raw := map[string]any{
 		"viewport":    map[string]any{"width": float64(375), "height": float64(812)},
