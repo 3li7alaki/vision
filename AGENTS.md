@@ -165,8 +165,15 @@ port safe and a bookmark stable.
   publish an unauthenticated write endpoint. Do not add a `--host` flag.
 - Reached at `http://vision.test:4747` through a hosts entry. Never `.local`, which is Bonjour on
   macOS and causes multi-second resolution stalls.
-- Managed by launchd on macOS. `vision on`, `off`, and `status` mirror the `model` command
-  already on the box.
+- Managed by launchd on macOS and by a systemd user unit on Linux. `vision on`, `off`, and
+  `status` mirror the `model` command already on the box. The supervisor is the only
+  platform-specific code, split across `supervisor_darwin.go`, `supervisor_linux.go` and a
+  `supervisor_other.go` that errors with the platform name.
+- A systemd `--user` unit dies with the last session unless lingering is on, so `vision on`
+  checks `loginctl` and, when it is off, starts anyway and prints the `enable-linger` line
+  rather than reporting a daemon that is about to vanish. It never enables lingering itself:
+  that is a system-wide setting, and a command that reads as "start my thing" must not change
+  one silently.
 - `vision snap` POSTs to the daemon. If nothing answers it fails loudly and names `vision on`. It
   never drops a shot silently, and it never starts a server as a side effect of a capture.
 

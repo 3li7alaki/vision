@@ -11,9 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 	"vision/internal/base"
@@ -265,9 +263,6 @@ func on(args []string) error {
 	if err != nil {
 		return usage()
 	}
-	if runtime.GOOS != "darwin" {
-		return errors.New("vision on requires macOS launchd")
-	}
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -276,34 +271,19 @@ func on(args []string) error {
 	if err != nil {
 		return err
 	}
-	home, err := os.UserHomeDir()
+	warning, err := installService(exe)
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(home, "Library", "LaunchAgents", "dev.vision.plist")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>dev.vision</string>
-<key>ProgramArguments</key><array><string>%s</string><string>_serve</string></array>
-<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
-<key>StandardOutPath</key><string>%s</string>
-<key>StandardErrorPath</key><string>%s</string>
-</dict></plist>
-`, xmlEscape(exe), xmlEscape(filepath.Join(home, "Library", "Logs", "vision.log")), xmlEscape(filepath.Join(home, "Library", "Logs", "vision.log")))
-	if err := os.WriteFile(path, []byte(plist), 0o644); err != nil {
-		return err
-	}
-	domain := fmt.Sprintf("gui/%d", os.Getuid())
-	exec.Command("launchctl", "bootout", domain+"/dev.vision").Run()
-	if out, err := exec.Command("launchctl", "bootstrap", domain, path).CombinedOutput(); err != nil {
-		return fmt.Errorf("launchctl bootstrap: %w: %s", err, strings.TrimSpace(string(out)))
-	}
 	if asJSON {
-		return printJSON(map[string]any{"schemaVersion": 1, "running": true, "url": "http://vision.test:4747"})
+		out := map[string]any{"schemaVersion": 1, "running": true, "url": "http://vision.test:4747"}
+		if warning != "" {
+			out["warning"] = warning
+		}
+		return printJSON(out)
+	}
+	if warning != "" {
+		fmt.Fprintln(os.Stderr, "vision:", warning)
 	}
 	fmt.Println("vision on at http://vision.test:4747")
 	return nil
@@ -314,12 +294,8 @@ func off(args []string) error {
 	if err != nil {
 		return usage()
 	}
-	if runtime.GOOS != "darwin" {
-		return errors.New("vision off requires macOS launchd")
-	}
-	target := fmt.Sprintf("gui/%d/dev.vision", os.Getuid())
-	if out, err := exec.Command("launchctl", "bootout", target).CombinedOutput(); err != nil {
-		return fmt.Errorf("launchctl bootout: %w: %s", err, strings.TrimSpace(string(out)))
+	if err := removeService(); err != nil {
+		return err
 	}
 	if asJSON {
 		return printJSON(map[string]any{"schemaVersion": 1, "running": false})
@@ -409,9 +385,4 @@ func printJSON(v any) error {
 		fmt.Println(string(b))
 	}
 	return err
-}
-func xmlEscape(s string) string {
-	s = strings.ReplaceAll(s, "&", "&amp;")
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	return strings.ReplaceAll(s, ">", "&gt;")
 }
