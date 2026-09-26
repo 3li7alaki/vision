@@ -2,11 +2,18 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"io"
 	"maps"
+	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"vision/internal/store"
 )
@@ -107,4 +114,158 @@ func buildBin(t *testing.T) string {
 		t.Fatalf("go build failed: %v\n%s", err, out)
 	}
 	return bin
+}
+
+func TestSessionIDPrecedence(t *testing.T) {
+	for _, tc := range []struct{ vision, claude, codex, want string }{
+		{"explicit", "claude", "codex", "explicit"},
+		{"", "claude", "codex", "claude"},
+		{"", "", "codex", "codex"},
+		{"", "", "", ""},
+	} {
+		t.Setenv("VISION_SESSION_ID", tc.vision)
+		t.Setenv("CLAUDE_CODE_SESSION_ID", tc.claude)
+		t.Setenv("CODEX_THREAD_ID", tc.codex)
+		if got := sessionID(); got != tc.want {
+			t.Errorf("sessionID() = %q, want %q", got, tc.want)
+		}
+	}
+}
+
+func TestSessionFlagRejectsEmpty(t *testing.T) {
+	for _, command := range []string{"notes", "status"} {
+		for _, args := range [][]string{{"--session", ""}, {"--session="}, {"--session"}} {
+			if err := run(append([]string{command}, args...)); err == nil || err.Error() != usageText {
+				t.Errorf("%s %q: got %v, want usage error", command, args, err)
+			}
+		}
+	}
+}
+
+func TestNotesSessionFilters(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	project, err := store.Identify(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	for _, row := range []struct {
+		digest, session, verdict string
+		ts                       time.Time
+	}{
+		{"old", "mine", "flag", now.Add(-2 * time.Hour)},
+		{"ok", "mine", "ok", now},
+		{"flag", "mine", "flag", now},
+		{"other", "other", "flag", now},
+		{"anonymous", "", "flag", now},
+	} {
+		if err := store.AppendSnap(project.ID, store.Snap{Digest: row.digest, Session: row.session}, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.AppendNote(project.ID, store.Note{Digest: row.digest, Verdict: row.verdict, TS: row.ts}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		args []string
+		want []string
+	}{
+		{[]string{"--session", "mine"}, []string{"old", "ok", "flag"}},
+		{[]string{"--session", "mine", "--since", "1h", "--flagged"}, []string{"flag"}},
+		{[]string{"--session", "missing"}, nil},
+		{[]string{"--session", "mine", "--unread", "--flagged"}, []string{"old", "flag"}},
+		{[]string{"--session", "mine", "--unread"}, nil},
+		{[]string{"--session", "other", "--unread"}, []string{"other"}},
+		{[]string{"--unread"}, []string{"old", "ok", "flag", "other", "anonymous"}},
+	} {
+		out, err := commandOutput(t, func() error { return notes(append(tc.args, "--json")) })
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result struct{ Notes []store.Note }
+		if err := json.Unmarshal([]byte(out), &result); err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for _, note := range result.Notes {
+			got = append(got, note.Digest)
+		}
+		if !slices.Equal(got, tc.want) {
+			t.Errorf("notes %v: got %v, want %v", tc.args, got, tc.want)
+		}
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestStatusSession(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	project, err := store.Identify(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, session := range []string{"mine", "other"} {
+		if err := store.AppendSnap(project.ID, store.Snap{Digest: session, Session: session}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	original := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = original })
+	for _, running := range []bool{true, false} {
+		http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			deadline, ok := r.Context().Deadline()
+			if !ok || time.Until(deadline) > 300*time.Millisecond {
+				t.Error("status lost its 300ms timeout")
+			}
+			if !running {
+				return nil, errors.New("daemon off")
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"pending":9}`)), Header: make(http.Header)}, nil
+		})
+		out, err := commandOutput(t, func() error { return status([]string{"--session", "mine", "--json"}) })
+		if (err == nil) != running {
+			t.Fatalf("running=%v: unexpected status error %v", running, err)
+		}
+		var result struct {
+			Running             bool
+			Session             string
+			Pending, PendingAll int
+		}
+		if err := json.Unmarshal([]byte(out), &result); err != nil {
+			t.Fatal(err)
+		}
+		want := 0
+		if running {
+			want = 1
+			if result.PendingAll != 9 {
+				t.Errorf("lost daemon count: %s", out)
+			}
+		}
+		if result.Session != "mine" || result.Running != running || result.Pending != want {
+			t.Errorf("unexpected status: %s", out)
+		}
+	}
+}
+
+func commandOutput(t *testing.T, command func() error) (string, error) {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "stdout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	original := os.Stdout
+	os.Stdout = f
+	defer func() { os.Stdout = original }()
+	commandErr := command()
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	out, err := io.ReadAll(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out), commandErr
 }

@@ -44,21 +44,38 @@ func Take(ctx context.Context) (Result, error) {
 	cmd := exec.CommandContext(ctx, "pinchtab", pinchtab("capture", "--json", "-o", path, "--format", "png")...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return Result{}, fmt.Errorf("pinchtab capture: %w: %s", err, strings.TrimSpace(string(out)))
+		return Result{}, captureError(err, out)
 	}
 	var raw map[string]any
 	if err := json.Unmarshal(out, &raw); err != nil {
 		return Result{}, fmt.Errorf("decode pinchtab response: %w", err)
 	}
+	c := conditions(raw)
+	// A fresh or accidentally shared instance can successfully capture its empty tab. That
+	// is not evidence of the page the caller meant to show, so refuse it before it reaches
+	// the queue. Redirecting a PNG into stdin cannot supply the browser state either.
+	if c.URL == "" || c.URL == "about:blank" {
+		return Result{}, fmt.Errorf("the current tab is blank, so the snap would capture nothing; point PINCHTAB_SERVER at your own instance and navigate first")
+	}
 	pngData, err := os.ReadFile(path)
 	if err != nil {
 		return Result{}, err
 	}
-	c := conditions(raw)
 	if c.Scheme == "" {
 		c.Scheme = scheme(ctx, text(raw["tabId"]))
 	}
 	return Result{PNG: pngData, Conditions: c, Raw: raw}, nil
+}
+
+func captureError(err error, out []byte) error {
+	err = fmt.Errorf("pinchtab capture: %w: %s", err, strings.TrimSpace(string(out)))
+	// CommandContext kills the child on timeout, while PinchTab can report its own deadline
+	// in output. Both point at an unresponsive instance; retrying or editing the page does
+	// not recover it. Keep the original error so callers can still inspect the cause.
+	if strings.Contains(err.Error(), "signal: killed") || strings.Contains(err.Error(), "context deadline exceeded") {
+		return fmt.Errorf("the browser instance looks wedged, not the page; restart that instance (with pt on PATH: `pt release && eval \"$(pt claim)\"`), then navigate again: %w", err)
+	}
+	return err
 }
 
 // scheme reads the page's color scheme, which the capture response does not carry. This is

@@ -213,6 +213,12 @@ func PendingCount() (int, error) {
 // is not this repo's work, so anything that speaks for the current project (a status line,
 // `vision status`) counts here rather than through the daemon-wide total.
 func PendingCountFor(project string) (int, error) {
+	return PendingCountForSession(project, "")
+}
+
+// Empty session preserves the project-wide count. Filter before deduplicating because a
+// digest first captured by another session can still belong to this session as well.
+func PendingCountForSession(project, session string) (int, error) {
 	snaps, err := store.Snaps(project)
 	if err != nil {
 		return 0, err
@@ -227,6 +233,9 @@ func PendingCountFor(project string) (int, error) {
 	}
 	pending, seen := 0, make(map[string]bool)
 	for _, snap := range snaps {
+		if session != "" && snap.Session != session {
+			continue
+		}
 		if decided[snap.Digest] || seen[snap.Digest] {
 			continue
 		}

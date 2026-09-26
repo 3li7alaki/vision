@@ -28,6 +28,11 @@ archived silently and never bothers anyone.
 Snap after the state is settled, not while something is still loading. `pinchtab capture` waits
 for stability; do not race it.
 
+Snaps record your session automatically from the first non-empty `VISION_SESSION_ID`,
+`CLAUDE_CODE_SESSION_ID`, or `CODEX_THREAD_ID`. An empty or `about:blank` tab is refused: point
+`PINCHTAB_SERVER` at your own instance and navigate first. `vision snap` captures the browser;
+redirecting a PNG into stdin does not supply a screenshot.
+
 ## Keys and variants
 
 A key is `<feature>/<slug>`, the same shape as a blueprint requirement slug, so a screenshot and
@@ -82,6 +87,12 @@ vision notes --unread
 Returns what the human said since you last looked, and advances the cursor. `ok` means it stands
 and is now the baseline. `flag` always carries a note explaining what is wrong. Fix flagged items
 before moving on, and re-snap the same key so the queue closes.
+
+When sessions share a repo, use `vision notes --session <id> --unread` with the same session id
+resolved above. It returns verdicts whose digest belongs to your session's snaps and advances
+only your cursor. `--since` and `--flagged` also work with `--session`. Identical content captured
+by two sessions shares its verdict. Without `--session`, the cursor stays project-wide.
+`vision status --session <id> --json` reports your session's pending count and includes its id.
 
 ## Rules
 

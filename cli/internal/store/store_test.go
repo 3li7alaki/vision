@@ -1,9 +1,12 @@
 package store
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -201,6 +204,82 @@ func TestUnreadNotesCursor(t *testing.T) {
 	if err != nil || len(third) != 1 || third[0].Digest != "c" {
 		t.Fatalf("third: %#v %v", third, err)
 	}
+}
+
+func TestSessionNotesAndIndependentCursors(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	session := "../../untrusted/session"
+	for _, snap := range []Snap{
+		{Session: session, Digest: "mine"},
+		{Session: "other", Digest: "theirs"},
+		{Session: "other", Digest: "shared"},
+		{Session: session, Digest: "shared"},
+		{Session: session, Digest: "shared"},
+	} {
+		if err := AppendSnap("p", snap, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A matching session in another project must not pull its digest into this view.
+	if err := AppendSnap("elsewhere", Snap{Session: session, Digest: "foreign"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, digest := range []string{"mine", "theirs", "shared", "foreign"} {
+		if err := AppendNote("p", Note{Digest: digest}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(read func() ([]Note, error), want ...string) {
+		t.Helper()
+		notes, err := read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for _, note := range notes {
+			got = append(got, note.Digest)
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("notes: got %v, want %v", got, want)
+		}
+	}
+	mine := func() ([]Note, error) { return UnreadNotesForSession("p", session) }
+	theirs := func() ([]Note, error) { return UnreadNotesForSession("p", "other") }
+	all := func() ([]Note, error) { return UnreadNotes("p") }
+	check(all, "mine", "theirs", "shared", "foreign")
+	dir, err := ProjectDir("p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	global := filepath.Join(dir, "cursor.json")
+	// An unreadable global cursor must not affect a session read at all. Keeping these
+	// bytes intact also proves that a scoped read never advances the old shared cursor.
+	if err := os.WriteFile(global, []byte("invalid global cursor"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	check(mine, "mine", "shared")
+	check(mine)
+	check(theirs, "theirs", "shared")
+	if b, err := os.ReadFile(global); err != nil || string(b) != "invalid global cursor" {
+		t.Fatalf("session touched global cursor: %q %v", b, err)
+	}
+	for _, id := range []string{session, "other"} {
+		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(id)))
+		b, err := os.ReadFile(filepath.Join(dir, "cursors", hash[:16]+".json"))
+		if err != nil || string(b) != "{\"offset\":4}\n" {
+			t.Fatalf("session cursor: %q %v", b, err)
+		}
+	}
+	if err := os.WriteFile(global, []byte("{\"offset\":4}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := AppendNote("p", Note{Digest: "shared", Verdict: "flag"}); err != nil {
+		t.Fatal(err)
+	}
+	check(mine, "shared")
+	check(all, "shared")
+	check(theirs, "shared")
+	check(func() ([]Note, error) { return NotesForSession("p", session) }, "mine", "shared", "shared")
 }
 
 func runGit(t *testing.T, dir string, args ...string) {

@@ -362,6 +362,37 @@ func Notes(project string) ([]Note, error) {
 	return ReadJSONL[Note](filepath.Join(dir, "notes.jsonl"))
 }
 
+func NotesForSession(project, session string) ([]Note, error) {
+	notes, err := Notes(project)
+	if err != nil {
+		return nil, err
+	}
+	return notesForSession(project, session, notes)
+}
+
+// Verdicts belong to content, not to a reader. Joining through the snap ledger keeps old
+// notes usable without rewriting them, and lets both sessions see a verdict when they
+// captured identical content. The join stays inside one project, just like the ledger.
+func notesForSession(project, session string, notes []Note) ([]Note, error) {
+	snaps, err := Snaps(project)
+	if err != nil {
+		return nil, err
+	}
+	digests := make(map[string]bool)
+	for _, snap := range snaps {
+		if snap.Session == session {
+			digests[snap.Digest] = true
+		}
+	}
+	filtered := notes[:0]
+	for _, note := range notes {
+		if digests[note.Digest] {
+			filtered = append(filtered, note)
+		}
+	}
+	return filtered, nil
+}
+
 func ProjectIDs() ([]string, error) {
 	home, err := StateHome()
 	if err != nil {
@@ -500,6 +531,14 @@ type cursor struct {
 }
 
 func UnreadNotes(project string) ([]Note, error) {
+	return unreadNotes(project, "")
+}
+
+func UnreadNotesForSession(project, session string) ([]Note, error) {
+	return unreadNotes(project, session)
+}
+
+func unreadNotes(project, session string) ([]Note, error) {
 	dir, err := ProjectDir(project)
 	if err != nil {
 		return nil, err
@@ -509,6 +548,12 @@ func UnreadNotes(project string) ([]Note, error) {
 		return nil, err
 	}
 	path := filepath.Join(dir, "cursor.json")
+	if session != "" {
+		// Session ids come from callers and may contain path separators. A bounded hash
+		// gives each reader its own cursor without letting an id choose a filesystem path.
+		sum := sha256.Sum256([]byte(session))
+		path = filepath.Join(dir, "cursors", hex.EncodeToString(sum[:])[:16]+".json")
+	}
 	var c cursor
 	if b, err := os.ReadFile(path); err == nil {
 		if err := json.Unmarshal(b, &c); err != nil {
@@ -519,9 +564,17 @@ func UnreadNotes(project string) ([]Note, error) {
 		c.Offset = len(notes)
 	}
 	out := notes[c.Offset:]
+	if session != "" {
+		out, err = notesForSession(project, session, out)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// Offsets count the full append-only ledger, even for a session view. Filtering before
+	// advancing also means a failed join cannot mark verdicts read that we never returned.
 	c.Offset = len(notes)
 	b, _ := json.Marshal(c)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
 	if err := os.WriteFile(path, append(b, '\n'), 0o644); err != nil {

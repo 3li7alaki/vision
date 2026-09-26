@@ -1,7 +1,12 @@
 package capture
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -90,5 +95,67 @@ func TestConditionsPermissiveShapes(t *testing.T) {
 	got := conditions(raw)
 	if got.Width != 375 || got.Height != 812 || got.DPR != 2 || got.URL == "" || got.Scheme != "dark" {
 		t.Fatalf("unexpected conditions: %#v", got)
+	}
+}
+
+func TestTakeRefusesBlankTab(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "pinchtab"), []byte("#!/bin/sh\nprintf '%s\\n' \"$VISION_TEST_CAPTURE\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	for _, body := range []string{
+		`{"url":""}`,
+		`{"url":"about:blank"}`,
+		`{"page":{"url":"about:blank"}}`,
+		`{}`,
+		`{"url":"http://localhost:3000/cart","colorScheme":"light"}`,
+	} {
+		t.Setenv("VISION_TEST_CAPTURE", body)
+		shot, err := Take(context.Background())
+		if strings.Contains(body, "localhost") {
+			if err != nil || shot.Conditions.URL != "http://localhost:3000/cart" {
+				t.Fatalf("valid page rejected: %#v %v", shot, err)
+			}
+			continue
+		}
+		for _, want := range []string{"current tab is blank", "capture nothing", "PINCHTAB_SERVER", "navigate first"} {
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Errorf("Take(%s) = %v, want %q", body, err, want)
+			}
+		}
+	}
+}
+
+func TestCaptureErrorWedgeGuidance(t *testing.T) {
+	for _, tc := range []struct {
+		err    error
+		output string
+		wedged bool
+	}{
+		{errors.New("signal: killed"), "", true},
+		{context.DeadlineExceeded, "", true},
+		{errors.New("exit status 1"), "capture: context deadline exceeded", true},
+		{errors.New("exit status 1"), "signal: killed", true},
+		{errors.New("executable not found"), "", false},
+	} {
+		err := captureError(tc.err, []byte(tc.output))
+		if !errors.Is(err, tc.err) || !strings.Contains(err.Error(), tc.output) {
+			t.Errorf("lost capture cause: %v", err)
+		}
+		for _, hint := range []string{"browser instance looks wedged, not the page", `pt release && eval "$(pt claim)"`, "navigate again"} {
+			if strings.Contains(err.Error(), hint) != tc.wedged {
+				t.Errorf("wedged=%v: unexpected hint %q in %v", tc.wedged, hint, err)
+			}
+		}
+	}
+	// Exercise the real shell-out error path too, without touching a browser instance.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "pinchtab"), []byte("#!/bin/sh\necho 'context deadline exceeded' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if _, err := Take(context.Background()); err == nil || !strings.Contains(err.Error(), "browser instance looks wedged") {
+		t.Fatalf("Take lost wedge guidance: %v", err)
 	}
 }

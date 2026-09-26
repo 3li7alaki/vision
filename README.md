@@ -41,6 +41,11 @@ vision snap checkout/empty-cart --as mobile-dark
 
 Then it keeps working. Nothing blocks.
 
+Snaps record the agent session automatically: `VISION_SESSION_ID` overrides
+`CLAUDE_CODE_SESSION_ID`, then `CODEX_THREAD_ID`. An empty or `about:blank` tab is refused;
+point `PINCHTAB_SERVER` at your own instance and navigate first. Piping a PNG into `vision snap`
+does not supply a screenshot.
+
 You open that URL whenever you feel like it and get one card at a time, only for shots that
 actually changed since you last approved something:
 
@@ -67,13 +72,20 @@ It fixes the first, re-snaps, and the card closes.
 
 ```bash
 vision snap <key> [--as <variant>] [--note <text>]   take the picture
-vision notes [--unread | --since <duration>]         read the verdicts
-vision on | off | status                             the daemon
+vision notes [--unread | --since <duration>] [--flagged] [--session <id>]
+vision status [--session <id>] [--json]            count pending reviews
+vision on | off                                  the daemon
 ```
 
 Three commands, and that is the whole tool. A key is `<feature>/<slug>`, the same shape as a
 [blueprint](https://github.com/3li7alaki/blueprint) requirement slug. A `#n` suffix marks a step
 in a flow and the gallery lays those out as a filmstrip.
+
+Use `vision notes --session <id> --unread` to read verdicts for your session's snaps with an
+independent cursor, and `vision status --session <id> --json` for its pending count. Use the
+same id resolved above. Without `--session`, notes keep the shared project cursor and status
+keeps the project-wide count. A verdict for identical content captured by two sessions belongs
+to both.
 
 ## The rules it will not bend
 

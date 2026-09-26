@@ -60,10 +60,34 @@ func run(args []string) error {
 	}
 }
 
-const usageText = "usage: vision snap <key> [--as <variant> | --dim k=v...] [--meta k=v...] [--note <text>] [--json] | vision notes [--unread | --since <duration>] [--flagged] [--json] | vision on | off | status | vision --version"
+const usageText = "usage: vision snap <key> [--as <variant> | --dim k=v...] [--meta k=v...] [--note <text>] [--json] | vision notes [--unread | --since <duration>] [--flagged] [--session <id>] [--json] | vision on | off | vision status [--session <id>] [--json] | vision --version"
 
 func usage() error {
 	return errors.New(usageText)
+}
+
+// The harness already gives every shell a stable session identity. Requiring a separate
+// export left ordinary agent captures anonymous, so use the harness values as fallbacks
+// while keeping VISION_SESSION_ID as the explicit override for other callers.
+func sessionID() string {
+	for _, name := range []string{"VISION_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"} {
+		if id := os.Getenv(name); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+func sessionFlag(fs *flag.FlagSet) *string {
+	var session string
+	fs.Func("session", "agent session id", func(value string) error {
+		if value == "" {
+			return errors.New("session must not be empty")
+		}
+		session = value
+		return nil
+	})
+	return &session
 }
 
 // unknownDimension is what a derived dimension holds when the browser could not tell us its
@@ -163,7 +187,7 @@ func snap(args []string) error {
 			return err
 		}
 	}
-	req := server.SnapRequest{Project: project, Key: key, Variant: *variant, Dims: dims, Meta: meta, Note: *note, Session: os.Getenv("VISION_SESSION_ID"), PNG: base64.StdEncoding.EncodeToString(shot.PNG), Capture: shot.Conditions}
+	req := server.SnapRequest{Project: project, Key: key, Variant: *variant, Dims: dims, Meta: meta, Note: *note, Session: sessionID(), PNG: base64.StdEncoding.EncodeToString(shot.PNG), Capture: shot.Conditions}
 	var result map[string]any
 	if err := post("/api/snap", req, &result); err != nil {
 		return err
@@ -187,6 +211,7 @@ func notes(args []string) error {
 	fs := flag.NewFlagSet("notes", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	unread, since, flagged, asJSON := fs.Bool("unread", false, "unread notes"), fs.Duration("since", 0, "notes since duration"), fs.Bool("flagged", false, "flagged notes"), fs.Bool("json", false, "JSON output")
+	session := sessionFlag(fs)
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || (*unread && *since != 0) {
 		return usage()
 	}
@@ -195,8 +220,12 @@ func notes(args []string) error {
 		return err
 	}
 	var values []store.Note
-	if *unread {
+	if *unread && *session != "" {
+		values, err = store.UnreadNotesForSession(project.ID, *session)
+	} else if *unread {
 		values, err = store.UnreadNotes(project.ID)
+	} else if *session != "" {
+		values, err = store.NotesForSession(project.ID, *session)
 	} else {
 		values, err = store.Notes(project.ID)
 	}
@@ -305,8 +334,11 @@ func off(args []string) error {
 }
 
 func status(args []string) error {
-	asJSON, err := jsonOnly(args)
-	if err != nil {
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	asJSON := fs.Bool("json", false, "JSON output")
+	session := sessionFlag(fs)
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 {
 		return usage()
 	}
 	// Short timeout because a status line polls this on a timer: a wedged daemon must cost
@@ -314,8 +346,12 @@ func status(args []string) error {
 	client := &http.Client{Timeout: 300 * time.Millisecond}
 	resp, err := client.Get(endpoint + "/health")
 	if err != nil {
-		if asJSON {
-			_ = printJSON(map[string]any{"schemaVersion": 1, "running": false, "pending": 0})
+		if *asJSON {
+			out := map[string]any{"schemaVersion": 1, "running": false, "pending": 0}
+			if *session != "" {
+				out["session"] = *session
+			}
+			_ = printJSON(out)
 			return errors.New("daemon unavailable, run `vision on`")
 		}
 		fmt.Println("vision off")
@@ -334,12 +370,20 @@ func status(args []string) error {
 	// there is nothing to scope to, so `pending` stays the daemon-wide total.
 	pending, scope := health.Pending, ""
 	if project, err := store.Identify("."); err == nil {
-		if n, err := server.PendingCountFor(project.ID); err == nil {
+		if n, err := server.PendingCountForSession(project.ID, *session); err == nil {
 			pending, scope = n, project.Name
+		} else if *session != "" {
+			return err
 		}
+	} else if *session != "" {
+		// A requested session scope must never silently fall back to everybody's count.
+		return err
 	}
-	if asJSON {
+	if *asJSON {
 		out := map[string]any{"schemaVersion": 1, "running": true, "pending": pending, "pendingAll": health.Pending, "url": "http://vision.test:4747"}
+		if *session != "" {
+			out["session"] = *session
+		}
 		if scope != "" {
 			out["project"] = scope
 		}

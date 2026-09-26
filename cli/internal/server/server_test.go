@@ -94,6 +94,37 @@ func TestPendingCountForScopesToOneProject(t *testing.T) {
 	}
 }
 
+func TestPendingCountForSession(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	for _, snap := range []store.Snap{
+		{Session: "other", Digest: "shared"},
+		{Session: "mine", Digest: "shared"},
+		{Session: "mine", Digest: "shared"},
+		{Session: "mine", Digest: "mine"},
+		{Session: "other", Digest: "theirs"},
+		{Session: "mine", Digest: "ok"},
+		{Session: "mine", Digest: "flag"},
+		{Session: "", Digest: "anonymous"},
+	} {
+		if err := store.AppendSnap("p", snap, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, verdict := range []string{"ok", "flag"} {
+		if err := store.AppendNote("p", store.Note{Digest: verdict, Verdict: verdict}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for session, want := range map[string]int{"mine": 2, "other": 2, "missing": 0, "": 4} {
+		if n, err := PendingCountForSession("p", session); err != nil || n != want {
+			t.Errorf("session %q: pending=%d err=%v, want %d", session, n, err, want)
+		}
+	}
+	if n, err := PendingCountFor("p"); err != nil || n != 4 {
+		t.Errorf("legacy project count: pending=%d err=%v, want 4", n, err)
+	}
+}
+
 // req.Project reaches filepath.Join via store.ProjectDir, so a value like ../../etc is a
 // write outside the store. The 64-hex guard rejects it before any path use.
 func TestVerdictRejectsInvalidProjectID(t *testing.T) {
