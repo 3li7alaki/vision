@@ -94,6 +94,32 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) ListenAndServe() error {
+	// Only the daemon owns retention. CLI reads must never sweep another session's
+	// state, and handler-only callers (including tests) must not start background work.
+	sweep := func(now time.Time) {
+		removed, err := store.SweepSessionState(now, store.SessionStateMaxAge)
+		if removed > 0 {
+			fmt.Fprintf(os.Stderr, "vision: removed %d expired session state files\n", removed)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "vision: session state sweep:", err)
+		}
+	}
+	sweep(time.Now())
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			select {
+			case now := <-ticker.C:
+				sweep(now)
+			case <-done:
+				return
+			}
+		}
+	}()
 	return http.ListenAndServe(Address, s.Handler())
 }
 

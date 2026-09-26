@@ -72,7 +72,7 @@ It fixes the first, re-snaps, and the card closes.
 
 ```bash
 vision snap <key> [--as <variant>] [--note <text>]   take the picture
-vision notes [--unread | --since <duration>] [--flagged] [--session <id>]
+vision notes [--unread | --since <duration> | --open] [--flagged] [--session <id>]
 vision status [--session <id>] [--json]            count pending reviews
 vision on | off                                  the daemon
 vision session join <thread>                     continue a handoff
@@ -84,23 +84,33 @@ A key is `<feature>/<slug>`, the same shape as a
 in a flow and the gallery lays those out as a filmstrip.
 
 Use `vision notes --session <id> --unread` to read verdicts for your session's thread with its
-own cursor, and `vision status --session <id> --json` for its pending count. Use the
+own cursor, and `vision status --session <id> --json` for its `pending` and `openFlags` counts. Use the
 same id resolved above. Without `--session`, notes keep the shared project cursor and status
 keeps the project-wide count. A verdict for identical content captured by two sessions belongs
 to both.
+
+`vision notes --session <id> --open` returns the latest open flag per key and variant without
+reading or advancing any cursor. It requires `--session` and cannot combine with `--unread`
+or `--since`. Re-snapping the same key and variant on that thread closes the flag, even with
+an unchanged digest; reading it does not.
 
 ## Threads and handoffs
 
 Each session starts on its own thread. Before a handoff, run `vision session thread` and
 include `vision-thread: <thread>` in the handoff. The successor runs
 `vision session join <thread>` inside the same project before capturing or reading notes.
-A predecessor's raw session id also works: join resolves its mapping one hop.
 
 `--session <id>` on notes and status follows that session's thread, including older snaps
 without a thread field. The unread cursor follows the thread too, so a successor sees only
 verdicts the predecessor has not read. Two live sessions on one thread share that cursor.
 `vision session thread --json` reports the session, thread, and number of snaps on that thread.
 Joining requires a current session id and changes no existing snap records.
+
+At startup and every 24 hours, the daemon removes session mappings and thread cursors unused
+for 30 days, matching Claude Code's default session retention. Notes/status session reads refresh
+mapping mtimes; unread reads refresh cursors. Ledgers, the project cursor, shots and baselines
+are untouched by this sweep. A missing thread cursor replays from the start; `--open` remains
+independent of cursor delivery.
 
 ## The rules it will not bend
 
@@ -110,8 +120,8 @@ Joining requires a current session id and changes no existing snap records.
   manufactures false confidence, which is the problem this tool exists to solve.
 - **A diff is never faked.** If the baseline was 375x812 and this shot is 390x844, vision says
   they are not comparable instead of showing you a screen of red pixels.
-- **Nothing is ever deleted.** Shots, notes, and baselines are append-only. No command exists to
-  make a queue look clean.
+- **The ledger is permanent.** Snap and verdict records are append-only. Old judged images and
+  expired session state can be reclaimed; no command exists to make a queue look clean.
 - **Only you approve.** No model verdict is stored as approval.
 
 ## What it is not

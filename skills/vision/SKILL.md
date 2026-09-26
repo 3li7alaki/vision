@@ -92,13 +92,17 @@ When sessions share a repo, use `vision notes --session <id> --unread` with the 
 resolved above. It returns verdicts whose digest belongs to your thread's snaps and advances
 that thread's cursor. `--since` and `--flagged` also work with `--session`. Identical content captured
 by two sessions shares its verdict. Without `--session`, the cursor stays project-wide.
-`vision status --session <id> --json` reports your thread's pending count and includes the requested session id.
+`vision status --session <id> --json` reports your thread's `pending` and `openFlags` counts
+and includes the requested session id. Use `vision notes --session <id> --open` after context
+loss to recover the latest open flag per key and variant without reading or moving a cursor.
+`--open` requires `--session` and excludes `--unread` and `--since`. Only a later re-snap of
+the same key and variant on your thread closes a flag, regardless of digest.
 
 ## Carry a thread across a handoff
 
 Run `vision session thread` and put `vision-thread: <thread>` in your handoff. The successor
 runs `vision session join <thread>` in the same project before taking snaps or reading notes.
-Joining a predecessor's raw session id resolves its mapping one hop. A current session id
+A current session id
 from the environment is required; `vision session thread --json` includes its thread and
 that thread's snap count.
 
@@ -106,6 +110,11 @@ A session defaults to its own thread until it joins another. `notes --session <i
 `status --session <id>` follow the thread, including old snaps without a thread field.
 The unread cursor follows too: two live sessions deliberately on one thread share one cursor.
 Joining does not move existing snaps between threads.
+
+The daemon sweeps session mappings and thread cursors unused for 30 days at startup and every
+24 hours. Notes/status refresh mapping mtimes; unread reads refresh cursors. The sweep never
+touches ledgers, the project cursor, shots or baselines. Missing thread cursors replay from 0;
+open flags remain independent of cursor delivery.
 
 ## Rules
 

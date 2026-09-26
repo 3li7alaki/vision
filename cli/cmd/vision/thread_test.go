@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"vision/internal/server"
 	"vision/internal/store"
@@ -99,7 +100,7 @@ func TestSessionCommandsAndHandoff(t *testing.T) {
 	notesFor("unrelated", false)
 	notesFor("unrelated", true)
 	t.Setenv("VISION_SESSION_ID", "c")
-	command("joined a", "session", "join", "b")
+	command("joined a", "session", "join", "a")
 	command("a", "session", "thread")
 }
 
@@ -190,6 +191,136 @@ printf '%s\n' '{"url":"http://localhost/cart","colorScheme":"light"}'
 		got := snaps[len(snaps)-1]
 		if got.Session != tc.session || got.Thread != tc.thread {
 			t.Fatalf("captured session=%q thread=%q, want %+v", got.Session, got.Thread, tc)
+		}
+	}
+}
+
+func TestOpenFlagsCommands(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	project, err := store.Identify(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.JoinThread(project.ID, "successor", "work"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := store.AppendSnap(project.ID, store.Snap{Session: "work", Key: "cart/empty", Variant: "mobile", Digest: "flagged", TS: now.Add(-time.Hour)}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendNote(project.ID, store.Note{Key: "cart/empty", Variant: "mobile", Digest: "flagged", Verdict: "flag", Note: "fix CTA", TS: now}); err != nil {
+		t.Fatal(err)
+	}
+	dir, _ := store.ProjectDir(project.ID)
+	entries, err := os.ReadDir(filepath.Join(dir, "sessions"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("mapping: %v %v", entries, err)
+	}
+	mapping := filepath.Join(dir, "sessions", entries[0].Name())
+	checkOpen := func() {
+		t.Helper()
+		out, err := commandOutput(t, func() error {
+			return run([]string{"notes", "--session", "successor", "--open", "--json"})
+		})
+		var result struct{ Notes []store.Note }
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal([]byte(out), &result); err != nil || len(result.Notes) != 1 || result.Notes[0].Note != "fix CTA" {
+			t.Fatalf("open: %s %v", out, err)
+		}
+	}
+	checkOpen()
+	for _, name := range []string{"cursor.json", "cursors"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("--open created %s: %v", name, err)
+		}
+	}
+	if _, err := store.UnreadNotesForSession(project.ID, "successor"); err != nil {
+		t.Fatal(err)
+	}
+	entries, err = os.ReadDir(filepath.Join(dir, "cursors"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("cursor: %v %v", entries, err)
+	}
+	// Corrupt cursors prove --open never reads them, and unchanged bytes and mtimes
+	// prove it never advances them. This applies to both cursor scopes.
+	paths := []string{filepath.Join(dir, "cursor.json"), filepath.Join(dir, "cursors", entries[0].Name())}
+	old := now.Add(-store.SessionStateMaxAge - time.Hour).Truncate(time.Second)
+	for _, path := range paths {
+		if err := os.WriteFile(path, []byte("not JSON"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	checkOpen()
+	checkOpen()
+	for _, path := range paths {
+		if b, err := os.ReadFile(path); err != nil || string(b) != "not JSON" {
+			t.Fatalf("--open changed cursor: %q %v", b, err)
+		}
+		if info, err := os.Stat(path); err != nil || !info.ModTime().Equal(old) {
+			t.Fatalf("--open touched cursor: %v", err)
+		}
+	}
+	original := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = original })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		rec := httptest.NewRecorder()
+		server.New().Handler().ServeHTTP(rec, r)
+		return rec.Result(), nil
+	})
+	for _, args := range [][]string{
+		{"notes", "--session", "successor", "--open", "--json"},
+		{"notes", "--session", "successor", "--json"},
+		{"notes", "--session", "successor", "--unread", "--json"},
+		{"status", "--session", "successor", "--json"},
+	} {
+		// Restore valid cursors for unread. Neither notes nor status may sweep them.
+		for _, path := range paths {
+			if err := os.WriteFile(path, []byte(`{"offset":0}`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(path, old, old); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Chtimes(mapping, old, old); err != nil {
+			t.Fatal(err)
+		}
+		out, err := commandOutput(t, func() error { return run(args) })
+		if err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		if args[0] == "status" {
+			var result struct{ OpenFlags *int }
+			if err := json.Unmarshal([]byte(out), &result); err != nil || result.OpenFlags == nil || *result.OpenFlags != 1 {
+				t.Fatalf("status openFlags: %s %v", out, err)
+			}
+		}
+		if info, err := os.Stat(mapping); err != nil || !info.ModTime().After(old) {
+			t.Fatalf("%v did not refresh mapping: %v", args, err)
+		}
+		for _, path := range paths {
+			if _, err := os.Stat(path); err != nil {
+				t.Fatalf("CLI swept cursor: %v", err)
+			}
+		}
+	}
+}
+
+func TestNotesOpenUsage(t *testing.T) {
+	for _, args := range [][]string{
+		{"--open"}, {"--open", "--session="},
+		{"--session", "a", "--open", "--unread"},
+		{"--session", "a", "--open", "--unread=false"},
+		{"--session", "a", "--open", "--since", "1h"},
+		{"--session", "a", "--open", "--since=0"},
+	} {
+		if err := notes(args); err == nil || err.Error() != usageText {
+			t.Errorf("%v: %v, want usage", args, err)
 		}
 	}
 }

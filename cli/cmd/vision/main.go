@@ -62,7 +62,7 @@ func run(args []string) error {
 	}
 }
 
-const usageText = "usage: vision snap <key> [--as <variant> | --dim k=v...] [--meta k=v...] [--note <text>] [--json] | vision notes [--unread | --since <duration>] [--flagged] [--session <id>] [--json] | vision on | off | vision status [--session <id>] [--json] | vision session join <thread> | vision session thread [--json] | vision --version"
+const usageText = "usage: vision snap <key> [--as <variant> | --dim k=v...] [--meta k=v...] [--note <text>] [--json] | vision notes [--unread | --since <duration> | --open (requires --session)] [--flagged] [--session <id>] [--json] | vision on | off | vision status [--session <id>] [--json] | vision session join <thread> | vision session thread [--json] | vision --version"
 
 func usage() error {
 	return errors.New(usageText)
@@ -274,8 +274,19 @@ func notes(args []string) error {
 	fs := flag.NewFlagSet("notes", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	unread, since, flagged, asJSON := fs.Bool("unread", false, "unread notes"), fs.Duration("since", 0, "notes since duration"), fs.Bool("flagged", false, "flagged notes"), fs.Bool("json", false, "JSON output")
+	open := fs.Bool("open", false, "open flags on the session's thread")
 	session := sessionFlag(fs)
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || (*unread && *since != 0) {
+		return usage()
+	}
+	// Even --since=0 names a conflicting mode; checking only its duration loses that.
+	invalid := *open && *session == ""
+	fs.Visit(func(f *flag.Flag) {
+		if *open && (f.Name == "since" || f.Name == "unread") {
+			invalid = true
+		}
+	})
+	if invalid {
 		return usage()
 	}
 	project, err := store.Identify(".")
@@ -283,7 +294,13 @@ func notes(args []string) error {
 		return err
 	}
 	var values []store.Note
-	if *unread && *session != "" {
+	if *open {
+		thread, resolveErr := store.ActiveThreadFor(project.ID, *session)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		values, err = store.OpenFlags(project.ID, thread)
+	} else if *unread && *session != "" {
 		values, err = store.UnreadNotesForSession(project.ID, *session)
 	} else if *unread {
 		values, err = store.UnreadNotes(project.ID)
@@ -404,6 +421,22 @@ func status(args []string) error {
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 {
 		return usage()
 	}
+	openFlags := 0
+	if *session != "" {
+		project, err := store.Identify(".")
+		if err != nil {
+			return err
+		}
+		thread, err := store.ActiveThreadFor(project.ID, *session)
+		if err != nil {
+			return err
+		}
+		flags, err := store.OpenFlags(project.ID, thread)
+		if err != nil {
+			return err
+		}
+		openFlags = len(flags)
+	}
 	// Short timeout because a status line polls this on a timer: a wedged daemon must cost
 	// the caller a blink, not a second.
 	client := &http.Client{Timeout: 300 * time.Millisecond}
@@ -413,6 +446,7 @@ func status(args []string) error {
 			out := map[string]any{"schemaVersion": 1, "running": false, "pending": 0}
 			if *session != "" {
 				out["session"] = *session
+				out["openFlags"] = openFlags
 			}
 			_ = printJSON(out)
 			return errors.New("daemon unavailable, run `vision on`")
@@ -446,6 +480,7 @@ func status(args []string) error {
 		out := map[string]any{"schemaVersion": 1, "running": true, "pending": pending, "pendingAll": health.Pending, "url": "http://vision.test:4747"}
 		if *session != "" {
 			out["session"] = *session
+			out["openFlags"] = openFlags
 		}
 		if scope != "" {
 			out["project"] = scope

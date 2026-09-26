@@ -368,7 +368,7 @@ func NotesForSession(project, session string) ([]Note, error) {
 	if err != nil {
 		return nil, err
 	}
-	thread, err := ThreadFor(project, session)
+	thread, err := ActiveThreadFor(project, session)
 	if err != nil {
 		return nil, err
 	}
@@ -540,7 +540,7 @@ func UnreadNotes(project string) ([]Note, error) {
 }
 
 func UnreadNotesForSession(project, session string) ([]Note, error) {
-	thread, err := ThreadFor(project, session)
+	thread, err := ActiveThreadFor(project, session)
 	if err != nil {
 		return nil, err
 	}
