@@ -35,6 +35,7 @@ type SnapRequest struct {
 	Meta    map[string]string `json:"meta,omitempty"`
 	Note    string            `json:"note,omitempty"`
 	Session string            `json:"session,omitempty"`
+	Thread  string            `json:"thread,omitempty"`
 	PNG     string            `json:"png"`
 	Capture store.Conditions  `json:"conditions"`
 }
@@ -125,7 +126,7 @@ func (s *Server) snap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	digest := diff.Digest(pngData)
-	record := store.Snap{SchemaVersion: store.SchemaVersion, TS: time.Now().UTC(), Project: req.Project.Name, Key: req.Key, Variant: req.Variant, Dims: req.Dims, Meta: req.Meta, Digest: digest, Branch: req.Project.Branch, SHA: req.Project.SHA, Dirty: req.Project.Dirty, Worktree: req.Project.Worktree, Session: req.Session, Note: req.Note, Conditions: req.Capture}
+	record := store.Snap{SchemaVersion: store.SchemaVersion, TS: time.Now().UTC(), Project: req.Project.Name, Key: req.Key, Variant: req.Variant, Dims: req.Dims, Meta: req.Meta, Digest: digest, Branch: req.Project.Branch, SHA: req.Project.SHA, Dirty: req.Project.Dirty, Worktree: req.Project.Worktree, Session: req.Session, Thread: req.Thread, Note: req.Note, Conditions: req.Capture}
 	if err := store.AppendSnap(req.Project.ID, record, pngData); err != nil {
 		problem(w, http.StatusInternalServerError, err)
 		return
@@ -219,6 +220,10 @@ func PendingCountFor(project string) (int, error) {
 // Empty session preserves the project-wide count. Filter before deduplicating because a
 // digest first captured by another session can still belong to this session as well.
 func PendingCountForSession(project, session string) (int, error) {
+	thread, err := store.ThreadFor(project, session)
+	if err != nil {
+		return 0, err
+	}
 	snaps, err := store.Snaps(project)
 	if err != nil {
 		return 0, err
@@ -233,7 +238,7 @@ func PendingCountForSession(project, session string) (int, error) {
 	}
 	pending, seen := 0, make(map[string]bool)
 	for _, snap := range snaps {
-		if session != "" && snap.Session != session {
+		if session != "" && snap.ThreadID() != thread {
 			continue
 		}
 		if decided[snap.Digest] || seen[snap.Digest] {

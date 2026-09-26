@@ -75,17 +75,32 @@ vision snap <key> [--as <variant>] [--note <text>]   take the picture
 vision notes [--unread | --since <duration>] [--flagged] [--session <id>]
 vision status [--session <id>] [--json]            count pending reviews
 vision on | off                                  the daemon
+vision session join <thread>                     continue a handoff
+vision session thread [--json]                    show current thread
 ```
 
-Three commands, and that is the whole tool. A key is `<feature>/<slug>`, the same shape as a
+A key is `<feature>/<slug>`, the same shape as a
 [blueprint](https://github.com/3li7alaki/blueprint) requirement slug. A `#n` suffix marks a step
 in a flow and the gallery lays those out as a filmstrip.
 
-Use `vision notes --session <id> --unread` to read verdicts for your session's snaps with an
-independent cursor, and `vision status --session <id> --json` for its pending count. Use the
+Use `vision notes --session <id> --unread` to read verdicts for your session's thread with its
+own cursor, and `vision status --session <id> --json` for its pending count. Use the
 same id resolved above. Without `--session`, notes keep the shared project cursor and status
 keeps the project-wide count. A verdict for identical content captured by two sessions belongs
 to both.
+
+## Threads and handoffs
+
+Each session starts on its own thread. Before a handoff, run `vision session thread` and
+include `vision-thread: <thread>` in the handoff. The successor runs
+`vision session join <thread>` inside the same project before capturing or reading notes.
+A predecessor's raw session id also works: join resolves its mapping one hop.
+
+`--session <id>` on notes and status follows that session's thread, including older snaps
+without a thread field. The unread cursor follows the thread too, so a successor sees only
+verdicts the predecessor has not read. Two live sessions on one thread share that cursor.
+`vision session thread --json` reports the session, thread, and number of snaps on that thread.
+Joining requires a current session id and changes no existing snap records.
 
 ## The rules it will not bend
 

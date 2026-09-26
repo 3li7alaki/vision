@@ -59,6 +59,7 @@ type Snap struct {
 	Dirty         bool              `json:"dirty"`
 	Worktree      string            `json:"worktree"`
 	Session       string            `json:"session"`
+	Thread        string            `json:"thread,omitempty"`
 	Note          string            `json:"note,omitempty"`
 	Conditions    Conditions        `json:"conditions"`
 }
@@ -367,20 +368,24 @@ func NotesForSession(project, session string) ([]Note, error) {
 	if err != nil {
 		return nil, err
 	}
-	return notesForSession(project, session, notes)
+	thread, err := ThreadFor(project, session)
+	if err != nil {
+		return nil, err
+	}
+	return notesForThread(project, thread, notes)
 }
 
 // Verdicts belong to content, not to a reader. Joining through the snap ledger keeps old
 // notes usable without rewriting them, and lets both sessions see a verdict when they
 // captured identical content. The join stays inside one project, just like the ledger.
-func notesForSession(project, session string, notes []Note) ([]Note, error) {
+func notesForThread(project, thread string, notes []Note) ([]Note, error) {
 	snaps, err := Snaps(project)
 	if err != nil {
 		return nil, err
 	}
 	digests := make(map[string]bool)
 	for _, snap := range snaps {
-		if snap.Session == session {
+		if snap.ThreadID() == thread {
 			digests[snap.Digest] = true
 		}
 	}
@@ -535,10 +540,14 @@ func UnreadNotes(project string) ([]Note, error) {
 }
 
 func UnreadNotesForSession(project, session string) ([]Note, error) {
-	return unreadNotes(project, session)
+	thread, err := ThreadFor(project, session)
+	if err != nil {
+		return nil, err
+	}
+	return unreadNotes(project, thread)
 }
 
-func unreadNotes(project, session string) ([]Note, error) {
+func unreadNotes(project, thread string) ([]Note, error) {
 	dir, err := ProjectDir(project)
 	if err != nil {
 		return nil, err
@@ -548,11 +557,11 @@ func unreadNotes(project, session string) ([]Note, error) {
 		return nil, err
 	}
 	path := filepath.Join(dir, "cursor.json")
-	if session != "" {
-		// Session ids come from callers and may contain path separators. A bounded hash
-		// gives each reader its own cursor without letting an id choose a filesystem path.
-		sum := sha256.Sum256([]byte(session))
-		path = filepath.Join(dir, "cursors", hex.EncodeToString(sum[:])[:16]+".json")
+	if thread != "" {
+		// Hashing keeps caller ids out of filesystem paths and preserves existing cursor
+		// names when thread == session. Two live sessions deliberately on one thread
+		// share one read cursor: a successor continues where its predecessor stopped.
+		path = filepath.Join(dir, "cursors", identityFile(thread))
 	}
 	var c cursor
 	if b, err := os.ReadFile(path); err == nil {
@@ -564,8 +573,8 @@ func unreadNotes(project, session string) ([]Note, error) {
 		c.Offset = len(notes)
 	}
 	out := notes[c.Offset:]
-	if session != "" {
-		out, err = notesForSession(project, session, out)
+	if thread != "" {
+		out, err = notesForThread(project, thread, out)
 		if err != nil {
 			return nil, err
 		}

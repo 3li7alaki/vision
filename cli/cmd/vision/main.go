@@ -45,6 +45,8 @@ func run(args []string) error {
 	switch args[0] {
 	case "snap":
 		return snap(args[1:])
+	case "session":
+		return session(args[1:])
 	case "notes":
 		return notes(args[1:])
 	case "on":
@@ -60,7 +62,7 @@ func run(args []string) error {
 	}
 }
 
-const usageText = "usage: vision snap <key> [--as <variant> | --dim k=v...] [--meta k=v...] [--note <text>] [--json] | vision notes [--unread | --since <duration>] [--flagged] [--session <id>] [--json] | vision on | off | vision status [--session <id>] [--json] | vision --version"
+const usageText = "usage: vision snap <key> [--as <variant> | --dim k=v...] [--meta k=v...] [--note <text>] [--json] | vision notes [--unread | --since <duration>] [--flagged] [--session <id>] [--json] | vision on | off | vision status [--session <id>] [--json] | vision session join <thread> | vision session thread [--json] | vision --version"
 
 func usage() error {
 	return errors.New(usageText)
@@ -88,6 +90,62 @@ func sessionFlag(fs *flag.FlagSet) *string {
 		return nil
 	})
 	return &session
+}
+
+func session(args []string) error {
+	if len(args) == 0 {
+		return usage()
+	}
+	fs := flag.NewFlagSet("session "+args[0], flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	asJSON := fs.Bool("json", false, "JSON output")
+	switch args[0] {
+	case "join":
+		if len(args) != 2 {
+			return usage()
+		}
+	case "thread":
+		if err := fs.Parse(args[1:]); err != nil || fs.NArg() != 0 {
+			return usage()
+		}
+	default:
+		return usage()
+	}
+	id := sessionID()
+	if id == "" {
+		return errors.New("no session id; set VISION_SESSION_ID, CLAUDE_CODE_SESSION_ID, or CODEX_THREAD_ID")
+	}
+	project, err := store.Identify(".")
+	if err != nil {
+		return err
+	}
+	if args[0] == "join" {
+		thread, err := store.JoinThread(project.ID, id, args[1])
+		if err != nil {
+			return err
+		}
+		fmt.Println("joined", thread)
+		return nil
+	}
+	thread, err := store.ThreadFor(project.ID, id)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		snaps, err := store.Snaps(project.ID)
+		if err != nil {
+			return err
+		}
+		count := 0
+		for _, snap := range snaps {
+			if snap.ThreadID() == thread {
+				count++
+			}
+		}
+		return printJSON(map[string]any{"schemaVersion": store.SchemaVersion, "session": id, "thread": thread, "snaps": count})
+	}
+	fmt.Println(thread)
+	return nil
 }
 
 // unknownDimension is what a derived dimension holds when the browser could not tell us its
@@ -171,6 +229,11 @@ func snap(args []string) error {
 	if err != nil {
 		return err
 	}
+	id := sessionID()
+	thread, err := store.ThreadFor(project.ID, id)
+	if err != nil {
+		return err
+	}
 	if err := healthy(); err != nil {
 		return err
 	}
@@ -187,7 +250,7 @@ func snap(args []string) error {
 			return err
 		}
 	}
-	req := server.SnapRequest{Project: project, Key: key, Variant: *variant, Dims: dims, Meta: meta, Note: *note, Session: sessionID(), PNG: base64.StdEncoding.EncodeToString(shot.PNG), Capture: shot.Conditions}
+	req := server.SnapRequest{Project: project, Key: key, Variant: *variant, Dims: dims, Meta: meta, Note: *note, Session: id, Thread: thread, PNG: base64.StdEncoding.EncodeToString(shot.PNG), Capture: shot.Conditions}
 	var result map[string]any
 	if err := post("/api/snap", req, &result); err != nil {
 		return err

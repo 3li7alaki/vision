@@ -89,10 +89,23 @@ and is now the baseline. `flag` always carries a note explaining what is wrong. 
 before moving on, and re-snap the same key so the queue closes.
 
 When sessions share a repo, use `vision notes --session <id> --unread` with the same session id
-resolved above. It returns verdicts whose digest belongs to your session's snaps and advances
-only your cursor. `--since` and `--flagged` also work with `--session`. Identical content captured
+resolved above. It returns verdicts whose digest belongs to your thread's snaps and advances
+that thread's cursor. `--since` and `--flagged` also work with `--session`. Identical content captured
 by two sessions shares its verdict. Without `--session`, the cursor stays project-wide.
-`vision status --session <id> --json` reports your session's pending count and includes its id.
+`vision status --session <id> --json` reports your thread's pending count and includes the requested session id.
+
+## Carry a thread across a handoff
+
+Run `vision session thread` and put `vision-thread: <thread>` in your handoff. The successor
+runs `vision session join <thread>` in the same project before taking snaps or reading notes.
+Joining a predecessor's raw session id resolves its mapping one hop. A current session id
+from the environment is required; `vision session thread --json` includes its thread and
+that thread's snap count.
+
+A session defaults to its own thread until it joins another. `notes --session <id>` and
+`status --session <id>` follow the thread, including old snaps without a thread field.
+The unread cursor follows too: two live sessions deliberately on one thread share one cursor.
+Joining does not move existing snaps between threads.
 
 ## Rules
 
