@@ -36,18 +36,19 @@ func TestPruneKeepsPendingBaselineAndRecent(t *testing.T) {
 		approve(d)
 	}
 	pending := shot(4)
+	// Age every picture past the grace window, which is covered by its own test below.
+	old := time.Now().Add(-2 * pruneGrace)
+	for _, d := range []string{oldest, superseded, previous, baseline, pending} {
+		p, _ := ShotPath("p", d)
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	if err := Prune("p"); err != nil {
 		t.Fatal(err)
 	}
-	exists := func(digest string) bool {
-		p, err := ShotPath("p", digest)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = os.Stat(p)
-		return err == nil
-	}
+	exists := func(digest string) bool { return HasShot("p", digest) }
 	for _, keep := range []string{pending, baseline, previous, superseded} {
 		if !exists(keep) {
 			t.Errorf("pruned a shot it must keep: %s", keep)
@@ -63,6 +64,25 @@ func TestPruneKeepsPendingBaselineAndRecent(t *testing.T) {
 	}
 	if len(snaps) != 5 {
 		t.Fatalf("prune changed the index: got %d records, want 5", len(snaps))
+	}
+}
+
+// A snap writes its picture before its index line. A Prune that lands in between sees a
+// picture with no record, and must not delete a shot nobody has reviewed yet.
+func TestPruneSparesAFreshPictureWithNoRecordYet(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	if err := AppendSnap("p", Snap{SchemaVersion: 1, TS: time.Now(), Key: "a/b", Variant: "default", Digest: "sha256:aaaa"}, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := ShotPath("p", "sha256:bbbb")
+	if err := os.WriteFile(p, []byte{2}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Prune("p"); err != nil {
+		t.Fatal(err)
+	}
+	if !HasShot("p", "sha256:bbbb") {
+		t.Fatal("pruned a picture written moments ago, before its record landed")
 	}
 }
 

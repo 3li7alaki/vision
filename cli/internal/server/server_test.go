@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +49,56 @@ func TestPendingCountMatchesQueue(t *testing.T) {
 	if got := count(); got != 1 {
 		t.Fatalf("after one verdict: got %d, want 1", got)
 	}
+}
+
+// One record whose picture is gone, in any project, used to fail the whole queue with a
+// file-not-found, so the gallery showed nothing for every repo. It is skipped instead, and
+// the count agrees with what the queue shows.
+func TestQueueSurvivesAMissingPicture(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	ids := []string{strings.Repeat("a", 64), strings.Repeat("b", 64)}
+	for i, id := range ids {
+		digest := "sha256:" + strings.Repeat(string(rune('c'+i)), 8)
+		snap := store.Snap{SchemaVersion: 1, TS: time.Now(), Project: "p", Key: "checkout/cart", Variant: "default", Digest: digest}
+		if err := store.AppendSnap(id, snap, []byte(digest)); err != nil {
+			t.Fatal(err)
+		}
+		// Give each a baseline, the path that reads the picture back.
+		if err := os.MkdirAll(baseDir(t, id), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		base, _ := store.BaselinePath(id, "checkout/cart", "default")
+		if err := os.WriteFile(base, []byte("old"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gone, _ := store.ShotPath(ids[0], "sha256:cccccccc")
+	if err := os.Remove(gone); err != nil {
+		t.Fatal(err)
+	}
+	items, err := Queue()
+	if err != nil {
+		t.Fatalf("one missing picture failed the whole queue: %v", err)
+	}
+	if len(items) != 1 || items[0].ProjectID != ids[1] {
+		t.Fatalf("want only the intact project's shot, got %d items", len(items))
+	}
+	n, err := PendingCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(items) {
+		t.Fatalf("count %d disagrees with the queue's %d", n, len(items))
+	}
+}
+
+func baseDir(t *testing.T, id string) string {
+	t.Helper()
+	p, err := store.BaselinePath(id, "checkout/cart", "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Dir(p)
 }
 
 // Before the fix the gallery posted the display name back as project, so the note landed

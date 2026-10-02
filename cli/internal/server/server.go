@@ -271,6 +271,9 @@ func PendingCountForSession(project, session string) (int, error) {
 			continue
 		}
 		seen[snap.Digest] = true
+		if !store.HasShot(project, snap.Digest) {
+			continue
+		}
 		pending++
 	}
 	return pending, nil
@@ -311,6 +314,12 @@ func Queue() ([]Item, error) {
 				continue
 			}
 			seen[snap.Digest] = true
+			// A record whose picture is gone cannot be reviewed, and one such record must
+			// not take down every other project's queue with it, so it is skipped here and
+			// in the pending count alike.
+			if !store.HasShot(id, snap.Digest) {
+				continue
+			}
 			if snap.Project != "" {
 				name = snap.Project
 			}

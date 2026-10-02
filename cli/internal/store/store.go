@@ -274,6 +274,18 @@ func BaselinePath(project, key, variant string) (string, error) {
 	return filepath.Join(dir, "base", filepath.FromSlash(key)+"@"+variant+".png"), nil
 }
 
+// HasShot reports whether a snap's picture is still on disk. The index outlives pictures by
+// design (see Prune), so anything that has to show or count a shot asks this first rather than
+// assuming the record and the file travel together.
+func HasShot(project, digest string) bool {
+	p, err := ShotPath(project, digest)
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(p)
+	return err == nil
+}
+
 func AppendSnap(project string, snap Snap, png []byte) error {
 	path, err := ShotPath(project, snap.Digest)
 	if err != nil {
@@ -457,6 +469,12 @@ func CopyBaseline(project, key, variant, digest string) error {
 // replaced would be gone the moment it was replaced.
 const KeepSuperseded = 2
 
+// pruneGrace spares any picture younger than this. AppendSnap writes the picture before its
+// index line, so a Prune triggered by a verdict in that gap would see a file with no record
+// and delete a shot nobody has reviewed. A minute is far past that gap and far short of
+// anything a human would notice as wasted disk.
+const pruneGrace = time.Minute
+
 // Prune deletes shot files that no longer serve anyone: not pending, not the current
 // baseline, and older than the last KeepSuperseded decided shots for their key and variant.
 //
@@ -522,6 +540,9 @@ func Prune(project string) error {
 			continue
 		}
 		if keep["sha256:"+strings.TrimSuffix(name, ".png")] {
+			continue
+		}
+		if info, err := e.Info(); err != nil || time.Since(info.ModTime()) < pruneGrace {
 			continue
 		}
 		if err := os.Remove(filepath.Join(shots, name)); err != nil {
