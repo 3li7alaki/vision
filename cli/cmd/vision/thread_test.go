@@ -164,7 +164,7 @@ while [ "$#" -gt 0 ]; do
   fi
   shift
 done
-printf '%s\n' '{"url":"http://localhost/cart","colorScheme":"light"}'
+printf '%s\n' '{"url":"http://localhost/cart","colorScheme":"light","image":{"viewport":{"w":1,"h":1}}}'
 `
 	if err := os.WriteFile(filepath.Join(dir, "pinchtab"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)

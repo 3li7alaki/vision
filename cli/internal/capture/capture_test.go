@@ -1,9 +1,13 @@
 package capture
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"image"
+	"image/color"
+	"image/png"
 	"os"
 	"path/filepath"
 	"strings"
@@ -98,18 +102,48 @@ func TestConditionsPermissiveShapes(t *testing.T) {
 	}
 }
 
-func TestTakeRefusesBlankTab(t *testing.T) {
+// fakePinchtab stands in for the CLI: it prints $VISION_TEST_CAPTURE, copies doc to the -o
+// path the way pinchtab writes its image, and records its arguments in the returned file.
+func fakePinchtab(t *testing.T, doc image.Image) string {
+	t.Helper()
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "pinchtab"), []byte("#!/bin/sh\nprintf '%s\\n' \"$VISION_TEST_CAPTURE\"\n"), 0o755); err != nil {
+	docPath, argsPath := filepath.Join(dir, "doc.png"), filepath.Join(dir, "args")
+	f, err := os.Create(docPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := png.Encode(f, doc); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	script := "#!/bin/sh\necho \"$@\" >> " + argsPath + "\nwhile [ $# -gt 0 ]; do [ \"$1\" = -o ] && cp " + docPath + " \"$2\"; shift; done\nprintf '%s\\n' \"$VISION_TEST_CAPTURE\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "pinchtab"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return argsPath
+}
+
+// A document image whose every pixel encodes its own position, so a crop that lands on the
+// wrong rows or columns cannot pass by accident.
+func positional(w, h int) *image.RGBA {
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := range h {
+		for x := range w {
+			img.Set(x, y, color.RGBA{R: uint8(x), G: uint8(y), B: 7, A: 255})
+		}
+	}
+	return img
+}
+
+func TestTakeRefusesBlankTab(t *testing.T) {
+	fakePinchtab(t, positional(4, 3))
 	for _, body := range []string{
 		`{"url":""}`,
 		`{"url":"about:blank"}`,
 		`{"page":{"url":"about:blank"}}`,
 		`{}`,
-		`{"url":"http://localhost:3000/cart","colorScheme":"light"}`,
+		`{"url":"http://localhost:3000/cart","colorScheme":"light","image":{"viewport":{"w":4,"h":3}}}`,
 	} {
 		t.Setenv("VISION_TEST_CAPTURE", body)
 		shot, err := Take(context.Background())
@@ -157,5 +191,74 @@ func TestCaptureErrorWedgeGuidance(t *testing.T) {
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	if _, err := Take(context.Background()); err == nil || !strings.Contains(err.Error(), "browser instance looks wedged") {
 		t.Fatalf("Take lost wedge guidance: %v", err)
+	}
+}
+
+// Take must ask for a whole-document render and cut the scrolled viewport out of it. A
+// plain capture in a browser window smaller than the emulated viewport came back with the
+// overhang unpainted white (pinchtab picks the window at random), and those shots were
+// approved as baselines before anyone noticed.
+func TestTakeCutsTheViewportOutOfTheDocument(t *testing.T) {
+	argsPath := fakePinchtab(t, positional(40, 100))
+	t.Setenv("VISION_TEST_CAPTURE", `{"url":"http://localhost:3000/cart","colorScheme":"light",
+	  "image":{"coordinateSpace":"document","devicePixelRatio":1,"viewport":{"w":30,"h":20,"scrollX":5,"scrollY":50}}}`)
+	shot, err := Take(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	args, _ := os.ReadFile(argsPath)
+	if !strings.Contains(string(args), "capture --json --beyond-viewport") {
+		t.Fatalf("capture did not ask for a whole-document render: %s", args)
+	}
+	img, err := png.Decode(bytes.NewReader(shot.PNG))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := img.Bounds(); b.Dx() != 30 || b.Dy() != 20 {
+		t.Fatalf("shot is %v, want the 30x20 viewport", b)
+	}
+	if r, g, _, _ := img.At(img.Bounds().Min.X, img.Bounds().Min.Y).RGBA(); r>>8 != 5 || g>>8 != 50 {
+		t.Fatalf("shot starts at document (%d,%d), want the scroll offset (5,50)", r>>8, g>>8)
+	}
+}
+
+func TestCropToViewport(t *testing.T) {
+	encode := func(img image.Image) []byte {
+		var b bytes.Buffer
+		if err := png.Encode(&b, img); err != nil {
+			t.Fatal(err)
+		}
+		return b.Bytes()
+	}
+	vp := func(w, h, x, y float64) map[string]any {
+		return map[string]any{"w": w, "h": h, "scrollX": x, "scrollY": y}
+	}
+
+	// Device pixels: a 2x capture of a 10x8 viewport scrolled to (3,4) is the 20x16 block at (6,8).
+	out, err := cropToViewport(encode(positional(40, 40)), vp(10, 8, 3, 4), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, _ := png.Decode(bytes.NewReader(out))
+	if b := img.Bounds(); b.Dx() != 20 || b.Dy() != 16 {
+		t.Fatalf("2x crop is %v, want 20x16", b)
+	}
+	if r, g, _, _ := img.At(img.Bounds().Min.X, img.Bounds().Min.Y).RGBA(); r>>8 != 6 || g>>8 != 8 {
+		t.Fatalf("2x crop starts at (%d,%d), want (6,8)", r>>8, g>>8)
+	}
+
+	// An image that already is the viewport passes through byte for byte.
+	exact := encode(positional(10, 8))
+	if out, err := cropToViewport(exact, vp(10, 8, 0, 0), 1); err != nil || !bytes.Equal(out, exact) {
+		t.Fatalf("exact viewport was re-encoded or refused: %v", err)
+	}
+
+	// A capture smaller than the viewport it claims is the half-painted shot: refuse it.
+	if _, err := cropToViewport(encode(positional(1280, 576)), vp(1440, 700, 0, 0), 1); err == nil || !strings.Contains(err.Error(), "does not show the whole viewport") {
+		t.Fatalf("short capture was not refused: %v", err)
+	}
+	// No viewport in the response means nothing to cut to.
+	if _, err := cropToViewport(exact, map[string]any{}, 1); err == nil || !strings.Contains(err.Error(), "no viewport size") {
+		t.Fatalf("missing viewport was not refused: %v", err)
 	}
 }

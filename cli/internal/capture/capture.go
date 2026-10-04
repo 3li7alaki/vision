@@ -1,9 +1,13 @@
 package capture
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/png"
+	"math"
 	"os"
 	"os/exec"
 	"strconv"
@@ -41,7 +45,14 @@ func Take(ctx context.Context) (Result, error) {
 	path := f.Name()
 	f.Close()
 	defer os.Remove(path)
-	cmd := exec.CommandContext(ctx, "pinchtab", pinchtab("capture", "--json", "-o", path, "--format", "png")...)
+	// --beyond-viewport makes Chrome render the page itself instead of copying the window's
+	// compositor. PinchTab launches every browser at a random window size (1280x720 up to
+	// 2560x1440, internal/bridge/runtime/init.go in pinchtab 0.15.2) and opens new tabs at
+	// 1280x720, so an emulated 1440x700 viewport is wider than the real window and a plain
+	// capture comes back with the overhang unpainted white. Puppeteer captures this way by
+	// default (captureBeyondViewport) for the same reason. The image is the whole document,
+	// so it is cropped back to the viewport below.
+	cmd := exec.CommandContext(ctx, "pinchtab", pinchtab("capture", "--json", "--beyond-viewport", "-o", path, "--format", "png")...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return Result{}, captureError(err, out)
@@ -61,10 +72,53 @@ func Take(ctx context.Context) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	if pngData, err = cropToViewport(pngData, object(object(raw, "image"), "viewport"), c.DPR); err != nil {
+		return Result{}, err
+	}
 	if c.Scheme == "" {
 		c.Scheme = scheme(ctx, text(raw["tabId"]))
 	}
 	return Result{PNG: pngData, Conditions: c, Raw: raw}, nil
+}
+
+// cropToViewport cuts the viewport the caller was looking at out of a whole-document capture:
+// {scrollX, scrollY, w, h} in CSS pixels, scaled by the device pixel ratio. A shot stays a
+// viewport shot ("the top 700 px"), never a full page, so baselines keep their meaning.
+//
+// An image that does not cover that rectangle is refused rather than padded or scaled: it
+// means the capture and the reported viewport disagree, and a picture of the wrong region
+// queued as evidence is worse than no picture.
+func cropToViewport(data []byte, viewport map[string]any, dpr float64) ([]byte, error) {
+	if dpr <= 0 {
+		dpr = 1
+	}
+	scaled := func(key string) int { return int(math.Round(number(viewport[key]) * dpr)) }
+	origin := image.Pt(scaled("scrollX"), scaled("scrollY"))
+	rect := image.Rectangle{Min: origin, Max: origin.Add(image.Pt(scaled("w"), scaled("h")))}
+	if rect.Dx() <= 0 || rect.Dy() <= 0 {
+		return nil, fmt.Errorf("pinchtab capture reported no viewport size, so the shot cannot be cut to what the page showed; this happens under load, snap again")
+	}
+	img, err := png.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("decode capture: %w", err)
+	}
+	if !rect.In(img.Bounds()) {
+		return nil, fmt.Errorf("capture is %dx%d but the viewport covers %v at device pixel ratio %g; the capture does not show the whole viewport, so it was not queued", img.Bounds().Dx(), img.Bounds().Dy(), rect, dpr)
+	}
+	if rect == img.Bounds() {
+		return data, nil
+	}
+	sub, ok := img.(interface {
+		SubImage(image.Rectangle) image.Image
+	})
+	if !ok {
+		return nil, fmt.Errorf("decode capture: %T cannot be cropped", img)
+	}
+	var out bytes.Buffer
+	if err := png.Encode(&out, sub.SubImage(rect)); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
 }
 
 func captureError(err error, out []byte) error {
