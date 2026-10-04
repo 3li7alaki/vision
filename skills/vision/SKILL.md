@@ -64,12 +64,13 @@ refuse to diff against each other. Pick the size from this table and do not impr
 | `tablet` | 820x700 | iPad Air and iPad Pro 11 portrait, the middle of the 744 to 834 tablet cluster. |
 | `desktop` | 1440x700 | common laptop. Avoid 1024: it is an iPad Pro 12.9 portrait, an iPad landscape, and Tailwind's `lg` edge all at once, so it sits exactly where layouts change. |
 
-Two ceilings on that table, both worth knowing before you blame the page:
+Two things to know about that table before you blame the page:
 
-The height is 700 because the emulated viewport must stay under the real browser window height,
-around 721 CSS px on a laptop. Go taller and the bottom of the capture comes back unpainted
-white. So a phone shot shows the top 700 px of the page, not a real phone's 844. Anything below
-that fold is unreviewed, and shooting it means a second key, not a taller viewport.
+The height is 700 so every recorded baseline keeps one size, which means a phone shot shows the
+top 700 px of the page, not a real phone's 844. Anything below that fold is unreviewed, and
+shooting it means a second key, not a taller viewport. The real browser window does not limit
+any of these sizes: vision renders the page beyond the window and crops to the viewport, so a
+viewport larger than the browser window still captures fully.
 
 Shooting two phone widths needs a second axis, not a second width. `--dim vp=mobile` cannot tell
 them apart, so use `--dim case=narrow` alongside it or the two shots will fight over one baseline.
