@@ -56,7 +56,7 @@ func TestPruneKeepsPendingBaselineAndRecent(t *testing.T) {
 	if err := Prune("p"); err != nil {
 		t.Fatal(err)
 	}
-	exists := func(digest string) bool { return HasShot("p", digest) }
+	exists := func(digest string) bool { return HasShot("p", Snap{Digest: digest}) }
 	for _, keep := range []string{pending, baseline, previous, superseded} {
 		if !exists(keep) {
 			t.Errorf("pruned a shot it must keep: %s", keep)
@@ -98,7 +98,7 @@ func TestPruneSparesAFreshPictureWithNoRecordYet(t *testing.T) {
 	if err := Prune("p"); err != nil {
 		t.Fatal(err)
 	}
-	if !HasShot("p", "sha256:bbbb") {
+	if !HasShot("p", Snap{Digest: "sha256:bbbb"}) {
 		t.Fatal("pruned a picture written moments ago, before its record landed")
 	}
 	if elements, err := ReadElements("p", "sha256:bbbb"); err != nil || len(elements) != 1 {
@@ -154,7 +154,7 @@ func TestPruneKeepsSharedPendingShot(t *testing.T) {
 	if err := Prune("p"); err != nil {
 		t.Fatal(err)
 	}
-	if !HasShot("p", shared) {
+	if !HasShot("p", Snap{Digest: shared}) {
 		t.Fatal("pruned shared pixels for the unjudged orders/theme review")
 	}
 	if got, err := ReadElements("p", shared); err != nil || len(got) != 1 {
@@ -288,7 +288,7 @@ func TestPruneReclaimsClosedReviews(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i, want := range []bool{true, false, false, true, true, true, true} {
-		if got := HasShot("p", snaps[i].Digest); got != want {
+		if got := HasShot("p", snaps[i]); got != want {
 			t.Errorf("shot %d exists=%v, want %v", i, got, want)
 		}
 	}

@@ -19,6 +19,29 @@ import (
 
 const SchemaVersion = 1
 
+// Media extensions are closed so mislabeled evidence cannot silently choose a file format.
+var mediaExtensions = map[string]string{
+	"image/png":  ".png",
+	"video/mp4":  ".mp4",
+	"video/webm": ".webm",
+}
+
+func MediaExtension(media string) (string, error) {
+	if media == "" {
+		media = "image/png"
+	}
+	ext, ok := mediaExtensions[media]
+	if !ok {
+		return "", fmt.Errorf("unknown media %q", media)
+	}
+	return ext, nil
+}
+
+func ValidateMedia(media string) error {
+	_, err := MediaExtension(media)
+	return err
+}
+
 // Viewport bucket boundaries, named for the class they open rather than the one they close,
 // because "mobileMax = 600" reads as "600 is mobile" when mobile actually ends at 599. This
 // is the calibration knob of the dimension model: it decides that a 390 and a 414 wide shot
@@ -57,6 +80,7 @@ type Snap struct {
 	Dims          map[string]string `json:"dims,omitempty"`
 	Meta          map[string]string `json:"meta,omitempty"`
 	Digest        string            `json:"digest"`
+	Media         string            `json:"media,omitempty"`
 	Branch        string            `json:"branch"`
 	SHA           string            `json:"sha"`
 	Dirty         bool              `json:"dirty"`
@@ -82,14 +106,15 @@ type Element struct {
 // Region is one mark a human drew on a shot in the gallery, in image pixels. Element is
 // filled by the daemon, never trusted from the client.
 type Region struct {
-	X       int    `json:"x"`
-	Y       int    `json:"y"`
-	W       int    `json:"w"`
-	H       int    `json:"h"`
-	Tone    string `json:"tone"`
-	Text    string `json:"text"`
-	Flow    bool   `json:"flow,omitempty"`
-	Element string `json:"element,omitempty"`
+	X       int      `json:"x"`
+	Y       int      `json:"y"`
+	W       int      `json:"w"`
+	H       int      `json:"h"`
+	Tone    string   `json:"tone"`
+	Text    string   `json:"text"`
+	Flow    bool     `json:"flow,omitempty"`
+	Element string   `json:"element,omitempty"`
+	T       *float64 `json:"t,omitempty"`
 }
 
 type Note struct {
@@ -346,11 +371,19 @@ func ProjectDir(id string) (string, error) {
 }
 
 func ShotPath(project, digest string) (string, error) {
+	return ShotPathMedia(project, digest, "")
+}
+
+func ShotPathMedia(project, digest, media string) (string, error) {
+	ext, err := MediaExtension(media)
+	if err != nil {
+		return "", err
+	}
 	dir, err := ProjectDir(project)
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "shots", strings.TrimPrefix(digest, "sha256:")+".png"), nil
+	return filepath.Join(dir, "shots", strings.TrimPrefix(digest, "sha256:")+ext), nil
 }
 
 func ElementsPath(project, digest string) (string, error) {
@@ -362,18 +395,26 @@ func ElementsPath(project, digest string) (string, error) {
 }
 
 func BaselinePath(project, key, variant string) (string, error) {
+	return BaselinePathMedia(project, key, variant, "")
+}
+
+func BaselinePathMedia(project, key, variant, media string) (string, error) {
+	ext, err := MediaExtension(media)
+	if err != nil {
+		return "", err
+	}
 	dir, err := ProjectDir(project)
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "base", filepath.FromSlash(key)+"@"+variant+".png"), nil
+	return filepath.Join(dir, "base", filepath.FromSlash(key)+"@"+variant+ext), nil
 }
 
 // HasShot reports whether a snap's picture is still on disk. The index outlives pictures by
 // design (see Prune), so anything that has to show or count a shot asks this first rather than
 // assuming the record and the file travel together.
-func HasShot(project, digest string) bool {
-	p, err := ShotPath(project, digest)
+func HasShot(project string, snap Snap) bool {
+	p, err := ShotPathMedia(project, snap.Digest, snap.Media)
 	if err != nil {
 		return false
 	}
@@ -381,8 +422,8 @@ func HasShot(project, digest string) bool {
 	return err == nil
 }
 
-func AppendSnap(project string, snap Snap, png []byte) error {
-	path, err := ShotPath(project, snap.Digest)
+func AppendSnap(project string, snap Snap, data []byte) error {
+	path, err := ShotPathMedia(project, snap.Digest, snap.Media)
 	if err != nil {
 		return err
 	}
@@ -391,7 +432,7 @@ func AppendSnap(project string, snap Snap, png []byte) error {
 	}
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err == nil {
-		if _, err = f.Write(png); err == nil {
+		if _, err = f.Write(data); err == nil {
 			err = f.Sync()
 		}
 		err = errors.Join(err, f.Close())
@@ -591,11 +632,15 @@ func ProjectIDs() ([]string, error) {
 }
 
 func CopyBaseline(project, key, variant, digest string) error {
-	src, err := ShotPath(project, digest)
+	return CopyBaselineMedia(project, key, variant, digest, "")
+}
+
+func CopyBaselineMedia(project, key, variant, digest, media string) error {
+	src, err := ShotPathMedia(project, digest, media)
 	if err != nil {
 		return err
 	}
-	dst, err := BaselinePath(project, key, variant)
+	dst, err := BaselinePathMedia(project, key, variant, media)
 	if err != nil {
 		return err
 	}
@@ -634,10 +679,10 @@ const KeepSuperseded = 2
 // anything a human would notice as wasted disk.
 const pruneGrace = time.Minute
 
-// Prune deletes shot PNGs and their element snapshots that no longer serve anyone: not
+// Prune deletes shot media and element snapshots that no longer serve anyone: not
 // pending, not the current baseline, and older than the last KeepSuperseded closed shots
 // for their key and variant. Superseded and withdrawn reviews enter the same retention
-// window as decided reviews. Both file types use the same digest and grace window.
+// window as decided reviews. All file types use the same digest and grace window.
 // A shared file survives if any review on any thread still needs it.
 //
 // It never touches index.jsonl, notes.jsonl or withdrawn.jsonl. Those ledgers preserve
@@ -701,7 +746,11 @@ func Prune(project string) error {
 	for _, e := range entries {
 		name := e.Name()
 		ext := filepath.Ext(name)
-		if e.IsDir() || (ext != ".png" && ext != ".json") {
+		known := ext == ".json"
+		for _, mediaExt := range mediaExtensions {
+			known = known || ext == mediaExt
+		}
+		if e.IsDir() || !known {
 			continue
 		}
 		if keep["sha256:"+strings.TrimSuffix(name, ext)] {

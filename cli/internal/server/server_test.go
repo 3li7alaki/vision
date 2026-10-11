@@ -311,15 +311,17 @@ func TestQueueKeepsIdenticalReviewsSeparate(t *testing.T) {
 
 // A later snap with shared pixels must not supply another review's baseline conditions.
 func TestBaselineRecordMatchesReview(t *testing.T) {
-	for _, tc := range []struct{ name, key, variant string }{
-		{"keys", "orders/theme", "default"},
-		{"variants", "orders/list", "dark"},
+	for _, tc := range []struct{ name, key, variant, media string }{
+		{"keys", "orders/theme", "default", ""},
+		{"variants", "orders/list", "dark", ""},
+		{"media", "orders/list", "default", "video/mp4"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("VISION_STATE_HOME", t.TempDir())
 			base := store.Snap{Key: "orders/list", Variant: "default", Digest: "sha256:aaaa", Conditions: store.Conditions{Width: 1}}
 			other := base
 			other.Key, other.Variant, other.Conditions.Width = tc.key, tc.variant, 2
+			other.Media = tc.media
 			for _, snap := range []store.Snap{base, other} {
 				if err := store.AppendSnap("p", snap, nil); err != nil {
 					t.Fatal(err)
@@ -328,7 +330,7 @@ func TestBaselineRecordMatchesReview(t *testing.T) {
 			if err := store.AppendNote("p", store.Note{Key: base.Key, Variant: base.Variant, Digest: base.Digest, Verdict: "ok"}); err != nil {
 				t.Fatal(err)
 			}
-			if got, ok := baselineRecord("p", base.Key, base.Variant); !ok || got.Key != base.Key || got.Variant != base.Variant || got.Conditions != base.Conditions {
+			if got, ok := baselineRecord("p", base.Key, base.Variant, ""); !ok || got.Key != base.Key || got.Variant != base.Variant || got.Conditions != base.Conditions {
 				t.Fatalf("baseline record: got %+v ok=%v, want %+v", got, ok, base)
 			}
 		})
@@ -928,7 +930,11 @@ func TestSnapDoesNotRequeueClosedReview(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			t.Setenv("VISION_STATE_HOME", t.TempDir())
 			id := strings.Repeat("a", 64)
-			data := []byte("shot")
+			var pngData bytes.Buffer
+			if err := png.Encode(&pngData, image.NewRGBA(image.Rect(0, 0, 1, 1))); err != nil {
+				t.Fatal(err)
+			}
+			data := pngData.Bytes()
 			snap := store.Snap{Key: "cart/empty", Variant: "default", Digest: diff.Digest(data), Session: "mine"}
 			if err := store.AppendSnap(id, snap, data); err != nil {
 				t.Fatal(err)

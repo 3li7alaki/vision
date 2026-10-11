@@ -60,6 +60,8 @@ func run(args []string) error {
 	switch args[0] {
 	case "snap":
 		return snap(args[1:])
+	case "add":
+		return add(args[1:])
 	case "discard":
 		return discard(args[1:])
 	case "session":
@@ -79,7 +81,7 @@ func run(args []string) error {
 	}
 }
 
-const usageText = "usage: vision snap <key> [--as <variant> | --dim k=v...] [--selector <css>] [--meta k=v...] [--note <text>] [--json] | vision discard <key> [--as <variant>] [--json] | vision notes [--unread | --since <duration> | --open (requires --session) | --wait <duration>] [--flagged] [--session <id>] [--json] | vision on | off | vision status [--session <id>] [--json] | vision session join <thread> | vision session thread [--json] | vision --version"
+const usageText = "usage: vision snap <key> [--as <variant> | --dim k=v...] [--selector <css>] [--meta k=v...] [--note <text>] [--json] | vision add <key> <file> [--as <variant>] [--meta k=v...] [--note <text>] [--json] | vision discard <key> [--as <variant>] [--json] | vision notes [--unread | --since <duration> | --open (requires --session) | --wait <duration>] [--flagged] [--session <id>] [--json] | vision on | off | vision status [--session <id>] [--json] | vision session join <thread> | vision session thread [--json] | vision --version"
 
 func usage() error {
 	return errors.New(usageText)
@@ -329,12 +331,100 @@ func snap(args []string) error {
 		}
 	}
 	req := server.SnapRequest{Project: project, Key: key, Variant: *variant, Dims: dims, Meta: meta, Note: *note, Session: id, Thread: thread, PNG: base64.StdEncoding.EncodeToString(shot.PNG), Capture: shot.Conditions, Elements: shot.Elements}
+	return submitSnap(req, *asJSON)
+}
+
+// Base64 of 15 MB leaves room for JSON under the daemon's 20 MB request cap.
+const maxVideoBytes = 15_000_000
+
+func readVideo(file string) ([]byte, string, error) {
+	info, err := os.Stat(file)
+	if err != nil {
+		return nil, "", err
+	}
+	tooLarge := errors.New("file over the 15 MB limit; record shorter or with --scale 0.5")
+	if info.Size() > maxVideoBytes {
+		return nil, "", tooLarge
+	}
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, "", err
+	}
+	defer f.Close()
+	// Bound the read because the recorder could still be writing after the size check.
+	data, err := io.ReadAll(io.LimitReader(f, maxVideoBytes+1))
+	if err != nil {
+		return nil, "", err
+	}
+	if len(data) > maxVideoBytes {
+		return nil, "", tooLarge
+	}
+	media := ""
+	switch {
+	case len(data) >= 8 && string(data[4:8]) == "ftyp":
+		media = "video/mp4"
+	case bytes.HasPrefix(data, []byte("\x1a\x45\xdf\xa3")):
+		media = "video/webm"
+	default:
+		// Screenshots must come from vision's capture to record conditions for the conditions guard.
+		return nil, "", errors.New("vision add files recorded video (.mp4 or .webm); use vision snap for a screenshot")
+	}
+	ext, err := store.MediaExtension(media)
+	if err != nil {
+		return nil, "", err
+	}
+	if actual := strings.ToLower(filepath.Ext(file)); actual != ext {
+		return nil, "", fmt.Errorf("file extension %q disagrees with %s bytes (want %s); check that you filed the right recording", actual, media, ext)
+	}
+	return data, media, nil
+}
+
+func add(args []string) error {
+	if len(args) < 2 {
+		return usage()
+	}
+	key, file := args[0], args[1]
+	if err := store.ParseKey(key); err != nil {
+		return err
+	}
+	fs := flag.NewFlagSet("add", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	variant, note, asJSON := fs.String("as", "default", "variant"), fs.String("note", "", "note"), fs.Bool("json", false, "JSON output")
+	meta := keyValueFlag{}
+	fs.Var(meta, "meta", "provenance k=v")
+	if err := fs.Parse(args[2:]); err != nil || fs.NArg() != 0 {
+		return usage()
+	}
+	if err := store.ParseVariant(*variant); err != nil {
+		return err
+	}
+	data, media, err := readVideo(file)
+	if err != nil {
+		return err
+	}
+	project, err := store.Identify(".")
+	if err != nil {
+		return err
+	}
+	id := sessionID()
+	thread, err := store.ThreadFor(project.ID, id)
+	if err != nil {
+		return err
+	}
+	if err := healthy(); err != nil {
+		return err
+	}
+	req := server.SnapRequest{Project: project, Key: key, Variant: *variant, Meta: meta, Note: *note, Session: id, Thread: thread, Media: media, PNG: base64.StdEncoding.EncodeToString(data), Capture: store.Conditions{}}
+	return submitSnap(req, *asJSON)
+}
+
+func submitSnap(req server.SnapRequest, asJSON bool) error {
 	var result map[string]any
 	if err := post("/api/snap", req, &result); err != nil {
 		return err
 	}
-	result["url"] = viewURL(project.Name, thread)
-	if *asJSON {
+	result["url"] = viewURL(req.Project.Name, req.Thread)
+	if asJSON {
 		return printJSON(result)
 	}
 	if warning, _ := result["warning"].(string); warning != "" {
@@ -342,10 +432,10 @@ func snap(args []string) error {
 	}
 	queued, _ := result["queued"].(bool)
 	if queued {
-		fmt.Printf("queued %s@%s\n", key, *variant)
-		fmt.Println(viewURL(project.Name, thread))
+		fmt.Printf("queued %s@%s\n", req.Key, req.Variant)
+		fmt.Println(viewURL(req.Project.Name, req.Thread))
 	} else {
-		fmt.Printf("archived unchanged %s@%s\n", key, *variant)
+		fmt.Printf("archived unchanged %s@%s\n", req.Key, req.Variant)
 	}
 	return nil
 }

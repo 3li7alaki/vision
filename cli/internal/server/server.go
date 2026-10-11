@@ -1,11 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -30,17 +32,19 @@ var projectIDPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]+$`)
 
 type SnapRequest struct {
-	Project  store.Project     `json:"project"`
-	Key      string            `json:"key"`
-	Variant  string            `json:"variant"`
-	Dims     map[string]string `json:"dims,omitempty"`
-	Meta     map[string]string `json:"meta,omitempty"`
-	Note     string            `json:"note,omitempty"`
-	Session  string            `json:"session,omitempty"`
-	Thread   string            `json:"thread,omitempty"`
-	PNG      string            `json:"png"`
-	Capture  store.Conditions  `json:"conditions"`
-	Elements []store.Element   `json:"elements,omitempty"`
+	Project store.Project     `json:"project"`
+	Key     string            `json:"key"`
+	Variant string            `json:"variant"`
+	Dims    map[string]string `json:"dims,omitempty"`
+	Meta    map[string]string `json:"meta,omitempty"`
+	Note    string            `json:"note,omitempty"`
+	Session string            `json:"session,omitempty"`
+	Thread  string            `json:"thread,omitempty"`
+	Media   string            `json:"media,omitempty"`
+	// PNG is a historical field name; both images and videos travel as base64 here.
+	PNG      string           `json:"png"`
+	Capture  store.Conditions `json:"conditions"`
+	Elements []store.Element  `json:"elements,omitempty"`
 }
 
 type VerdictRequest struct {
@@ -72,6 +76,7 @@ type Item struct {
 	Meta            map[string]string `json:"meta,omitempty"`
 	Group           string            `json:"group"`
 	Digest          string            `json:"digest"`
+	Media           string            `json:"media,omitempty"`
 	Status          string            `json:"status"`
 	ChangedFraction float64           `json:"changedFraction,omitempty"`
 	Incomparable    string            `json:"incomparable,omitempty"`
@@ -88,6 +93,7 @@ type Item struct {
 type Step struct {
 	Key      string `json:"key"`
 	Digest   string `json:"digest"`
+	Media    string `json:"media,omitempty"`
 	ThumbURL string `json:"thumbUrl,omitempty"`
 }
 
@@ -154,8 +160,7 @@ func (s *Server) gallery(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) snap(w http.ResponseWriter, r *http.Request) {
 	var req SnapRequest
-	if err := decode(r.Body, &req); err != nil {
-		problem(w, http.StatusBadRequest, err)
+	if !decode(w, r, &req) {
 		return
 	}
 	if !projectIDPattern.MatchString(req.Project.ID) {
@@ -170,20 +175,34 @@ func (s *Server) snap(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusBadRequest, err)
 		return
 	}
-	pngData, err := base64.StdEncoding.DecodeString(req.PNG)
-	if err != nil {
-		problem(w, http.StatusBadRequest, errors.New("invalid PNG encoding"))
+	if err := store.ValidateMedia(req.Media); err != nil {
+		problem(w, http.StatusBadRequest, err)
 		return
 	}
-	digest := diff.Digest(pngData)
+	data, err := base64.StdEncoding.DecodeString(req.PNG)
+	if err != nil {
+		problem(w, http.StatusBadRequest, errors.New("invalid file encoding"))
+		return
+	}
+	if !matchesMedia(req.Media, data) {
+		media := req.Media
+		if media == "" {
+			media = "image/png"
+		}
+		problem(w, http.StatusBadRequest, fmt.Errorf("file is not %s", media))
+		return
+	}
+	digest := diff.Digest(data)
 	s.ledger.Lock()
 	defer s.ledger.Unlock()
-	record := store.Snap{SchemaVersion: store.SchemaVersion, TS: time.Now().UTC(), Project: req.Project.Name, Key: req.Key, Variant: req.Variant, Dims: req.Dims, Meta: req.Meta, Digest: digest, Branch: req.Project.Branch, SHA: req.Project.SHA, Dirty: req.Project.Dirty, Worktree: req.Project.Worktree, Session: req.Session, Thread: req.Thread, Note: req.Note, Conditions: req.Capture}
-	if err := store.WriteElements(req.Project.ID, digest, req.Elements); err != nil {
-		problem(w, http.StatusInternalServerError, err)
-		return
+	record := store.Snap{SchemaVersion: store.SchemaVersion, TS: time.Now().UTC(), Project: req.Project.Name, Key: req.Key, Variant: req.Variant, Dims: req.Dims, Meta: req.Meta, Digest: digest, Media: req.Media, Branch: req.Project.Branch, SHA: req.Project.SHA, Dirty: req.Project.Dirty, Worktree: req.Project.Worktree, Session: req.Session, Thread: req.Thread, Note: req.Note, Conditions: req.Capture}
+	if req.Media == "" || req.Media == "image/png" {
+		if err := store.WriteElements(req.Project.ID, digest, req.Elements); err != nil {
+			problem(w, http.StatusInternalServerError, err)
+			return
+		}
 	}
-	if err := store.AppendSnap(req.Project.ID, record, pngData); err != nil {
+	if err := store.AppendSnap(req.Project.ID, record, data); err != nil {
 		problem(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -211,8 +230,7 @@ func (s *Server) snap(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) verdict(w http.ResponseWriter, r *http.Request) {
 	var req VerdictRequest
-	if err := decode(r.Body, &req); err != nil {
-		problem(w, http.StatusBadRequest, err)
+	if !decode(w, r, &req) {
 		return
 	}
 	if !projectIDPattern.MatchString(req.Project) {
@@ -245,6 +263,10 @@ func (s *Server) verdict(w http.ResponseWriter, r *http.Request) {
 			problem(w, http.StatusBadRequest, errors.New("region coordinates and dimensions must be non-negative"))
 			return
 		}
+		if region.T != nil && (*region.T < 0 || math.IsNaN(*region.T) || math.IsInf(*region.T, 0)) {
+			problem(w, http.StatusBadRequest, errors.New("region time must be non-negative and finite"))
+			return
+		}
 		region.Element = ""
 	}
 	if req.Verdict != "ok" && req.Verdict != "flag" {
@@ -265,7 +287,9 @@ func (s *Server) verdict(w http.ResponseWriter, r *http.Request) {
 						continue
 					}
 					for j := range req.Regions {
-						req.Regions[j].Element = resolve(elements, req.Regions[j], snaps[i].Conditions.DPR)
+						if req.Regions[j].T == nil {
+							req.Regions[j].Element = resolve(elements, req.Regions[j], snaps[i].Conditions.DPR)
+						}
 					}
 					break
 				}
@@ -283,7 +307,19 @@ func (s *Server) verdict(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Verdict == "ok" {
-		if err := store.CopyBaseline(req.Project, req.Key, req.Variant, req.Digest); err != nil {
+		snaps, err := store.Snaps(req.Project)
+		if err != nil {
+			problem(w, http.StatusInternalServerError, err)
+			return
+		}
+		media := ""
+		for i := len(snaps) - 1; i >= 0; i-- {
+			if snaps[i].Key == req.Key && snaps[i].Variant == req.Variant && snaps[i].Digest == req.Digest {
+				media = snaps[i].Media
+				break
+			}
+		}
+		if err := store.CopyBaselineMedia(req.Project, req.Key, req.Variant, req.Digest, media); err != nil {
 			problem(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -297,8 +333,7 @@ func (s *Server) verdict(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) withdraw(w http.ResponseWriter, r *http.Request) {
 	var req WithdrawRequest
-	if err := decode(r.Body, &req); err != nil {
-		problem(w, http.StatusBadRequest, err)
+	if !decode(w, r, &req) {
 		return
 	}
 	if !projectIDPattern.MatchString(req.Project) {
@@ -399,10 +434,15 @@ func render(free string, regions []store.Region) string {
 			tone += " (every step)"
 		}
 		where := fmt.Sprintf("at %d,%d", r.X, r.Y)
-		if r.Element != "" {
+		if r.Element != "" && r.T == nil {
 			where = "on " + r.Element
 		} else if r.W != 0 || r.H != 0 {
 			where = fmt.Sprintf("box %d,%d %dx%d", r.X, r.Y, r.W, r.H)
+		}
+		if r.T != nil {
+			seconds := math.Round(math.Mod(*r.T, 60)*10) / 10
+			minutes := math.Floor(*r.T/60) + math.Floor(seconds/60)
+			where = fmt.Sprintf("%.0f:%04.1f %s", minutes, math.Mod(seconds, 60), where)
 		}
 		lines = append(lines, fmt.Sprintf("[%d] %s %s: %s", i+1, tone, where, strings.ReplaceAll(r.Text, "\n", "\n    ")))
 	}
@@ -473,7 +513,7 @@ func PendingCountForSession(project, session string) (int, error) {
 			continue
 		}
 		seen[review] = true
-		if !store.HasShot(project, snap.Digest) {
+		if !store.HasShot(project, snap) {
 			continue
 		}
 		pending++
@@ -516,7 +556,7 @@ func Queue() ([]Item, error) {
 			// A record whose picture is gone cannot be reviewed, and one such record must
 			// not take down every other project's queue with it, so it is skipped here and
 			// in the pending count alike.
-			if !store.HasShot(id, snap.Digest) {
+			if !store.HasShot(id, snap) {
 				continue
 			}
 			if snap.Project != "" {
@@ -558,8 +598,11 @@ func makeItem(project, name string, snap store.Snap) (Item, bool, error) {
 	// the two are identical by construction. The variant is what actually chose the baseline
 	// this shot is measured against, so anything else on screen would let a reviewer read one
 	// set of dimensions while the comparison used another.
-	item := Item{Project: name, ProjectID: project, Branch: snap.Branch, Thread: snap.ThreadID(), Key: snap.Key, Variant: snap.Variant, Dims: store.DecodeVariant(snap.Variant), Meta: snap.Meta, Group: project + "/" + snap.Key, Digest: snap.Digest, Status: "new", ShotURL: mediaURL("shot", project, snap.Digest), TS: snap.TS}
-	baseline, _ := store.BaselinePath(project, snap.Key, snap.Variant)
+	item := Item{Project: name, ProjectID: project, Branch: snap.Branch, Thread: snap.ThreadID(), Key: snap.Key, Variant: snap.Variant, Dims: store.DecodeVariant(snap.Variant), Meta: snap.Meta, Group: project + "/" + snap.Key, Digest: snap.Digest, Media: snap.Media, Status: "new", ShotURL: mediaURL("shot", project, snap.Digest, snap.Media), TS: snap.TS}
+	baseline, err := store.BaselinePathMedia(project, snap.Key, snap.Variant, snap.Media)
+	if err != nil {
+		return Item{}, false, err
+	}
 	b, err := os.ReadFile(baseline)
 	if errors.Is(err, os.ErrNotExist) {
 		return item, true, nil
@@ -567,17 +610,25 @@ func makeItem(project, name string, snap store.Snap) (Item, bool, error) {
 	if err != nil {
 		return Item{}, false, err
 	}
-	shot, err := os.ReadFile(mustShotPath(project, snap.Digest))
-	if err != nil {
-		return Item{}, false, err
-	}
 	query := "?key=" + url.QueryEscape(snap.Key) + "&variant=" + url.QueryEscape(snap.Variant)
-	item.BaselineURL = mediaURL("baseline", project, snap.Digest) + query
+	video := snap.Media == "video/mp4" || snap.Media == "video/webm"
+	if video {
+		query += "&media=" + url.QueryEscape(snap.Media)
+	}
+	item.BaselineURL = mediaURL("baseline", project, snap.Digest, "") + query
 	if diff.Digest(b) == snap.Digest {
 		return item, false, nil
 	}
 	item.Status = "changed"
-	baseSnap, ok := baselineRecord(project, snap.Key, snap.Variant)
+	// Videos have no capture conditions or pixel comparison, only content identity.
+	if video {
+		return item, true, nil
+	}
+	shot, err := os.ReadFile(mustShotPath(project, snap.Digest))
+	if err != nil {
+		return Item{}, false, err
+	}
+	baseSnap, ok := baselineRecord(project, snap.Key, snap.Variant, snap.Media)
 	if ok {
 		if err := diff.Comparable(baseSnap.Conditions, snap.Conditions); err != nil {
 			item.Incomparable = err.Error()
@@ -595,13 +646,17 @@ func makeItem(project, name string, snap store.Snap) (Item, bool, error) {
 		item.Changes = diff.Changes(store.Conditions{}, store.Conditions{}, b, shot)
 	}
 	item.ChangedFraction = fraction
-	item.DiffURL = mediaURL("diff", project, snap.Digest) + query
+	item.DiffURL = mediaURL("diff", project, snap.Digest, "") + query
 	return item, true, nil
 }
 
-func baselineRecord(project, key, variant string) (store.Snap, bool) {
+func baselineRecord(project, key, variant, media string) (store.Snap, bool) {
 	snaps, _ := store.Snaps(project)
 	notes, _ := store.Notes(project)
+	want, err := store.MediaExtension(media)
+	if err != nil {
+		return store.Snap{}, false
+	}
 	approved := make(map[string]bool)
 	for _, n := range notes {
 		if n.Verdict == "ok" && n.Key == key && n.Variant == variant {
@@ -609,7 +664,8 @@ func baselineRecord(project, key, variant string) (store.Snap, bool) {
 		}
 	}
 	for i := len(snaps) - 1; i >= 0; i-- {
-		if approved[store.ReviewID(snaps[i].Key, snaps[i].Variant, snaps[i].Digest)] {
+		ext, err := store.MediaExtension(snaps[i].Media)
+		if err == nil && ext == want && approved[store.ReviewID(snaps[i].Key, snaps[i].Variant, snaps[i].Digest)] {
 			return snaps[i], true
 		}
 	}
@@ -621,7 +677,7 @@ func attachSteps(items []Item) {
 		base := strings.Split(items[i].Key, "#")[0]
 		for _, candidate := range items {
 			if strings.Split(candidate.Key, "#")[0] == base && strings.Contains(candidate.Key, "#") && candidate.Variant == items[i].Variant {
-				items[i].Steps = append(items[i].Steps, Step{Key: candidate.Key, Digest: candidate.Digest, ThumbURL: candidate.ShotURL})
+				items[i].Steps = append(items[i].Steps, Step{Key: candidate.Key, Digest: candidate.Digest, Media: candidate.Media, ThumbURL: candidate.ShotURL})
 			}
 		}
 	}
@@ -696,33 +752,60 @@ func (s *Server) projectIcon(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 	kind, project, digest := r.PathValue("kind"), r.PathValue("project"), r.PathValue("digest")
-	var data []byte
+	media := r.URL.Query().Get("media")
+	if err := store.ValidateMedia(media); err != nil {
+		problem(w, http.StatusBadRequest, err)
+		return
+	}
+	video := media == "video/mp4" || media == "video/webm"
+	if kind == "diff" && video {
+		http.NotFound(w, r)
+		return
+	}
+	var path string
 	var err error
 	switch kind {
 	case "shot":
-		data, err = os.ReadFile(mustShotPath(project, digest))
+		path, err = store.ShotPathMedia(project, digest, media)
 	case "baseline", "diff":
 		if store.ParseKey(r.URL.Query().Get("key")) != nil || store.ParseVariant(r.URL.Query().Get("variant")) != nil {
 			http.NotFound(w, r)
 			return
 		}
-		base, e := store.BaselinePath(project, r.URL.Query().Get("key"), r.URL.Query().Get("variant"))
-		if e != nil {
-			err = e
-			break
-		}
-		data, err = os.ReadFile(base)
-		if kind == "diff" && err == nil {
-			shot, e := os.ReadFile(mustShotPath(project, digest))
-			if e != nil {
-				err = e
-			} else {
-				data, _, err = diff.PNG(data, shot)
-			}
-		}
+		path, err = store.BaselinePathMedia(project, r.URL.Query().Get("key"), r.URL.Query().Get("variant"), media)
 	default:
 		http.NotFound(w, r)
 		return
+	}
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if video {
+		f, err := os.Open(path)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		defer f.Close()
+		info, err := f.Stat()
+		if err != nil || !info.Mode().IsRegular() {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", media)
+		// ServeContent handles byte ranges, which Safari needs to play recorded videos.
+		http.ServeContent(w, r, info.Name(), info.ModTime(), f)
+		return
+	}
+	data, err := os.ReadFile(path)
+	if kind == "diff" && err == nil {
+		shot, e := os.ReadFile(mustShotPath(project, digest))
+		if e != nil {
+			err = e
+		} else {
+			data, _, err = diff.PNG(data, shot)
+		}
 	}
 	if err != nil {
 		http.NotFound(w, r)
@@ -733,8 +816,12 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 }
 
 func mustShotPath(project, digest string) string { p, _ := store.ShotPath(project, digest); return p }
-func mediaURL(kind, project, digest string) string {
-	return "/media/" + kind + "/" + project + "/" + strings.TrimPrefix(digest, "sha256:")
+func mediaURL(kind, project, digest, media string) string {
+	path := "/media/" + kind + "/" + project + "/" + strings.TrimPrefix(digest, "sha256:")
+	if media != "" && media != "image/png" {
+		path += "?media=" + url.QueryEscape(media)
+	}
+	return path
 }
 
 func variantWarning(project, key, variant string) string {
@@ -783,10 +870,44 @@ func (s *Server) publish(item Item) {
 	}
 }
 
-func decode(r io.Reader, dst any) error {
-	d := json.NewDecoder(io.LimitReader(r, 20<<20))
+func matchesMedia(media string, data []byte) bool {
+	switch media {
+	case "", "image/png":
+		return bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n"))
+	case "video/mp4":
+		return len(data) >= 8 && string(data[4:8]) == "ftyp"
+	case "video/webm":
+		return bytes.HasPrefix(data, []byte("\x1a\x45\xdf\xa3"))
+	default:
+		return false
+	}
+}
+
+func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
+	// ponytail: Base64 leaves about 15 MB for video; upgrade to a raw, streamed upload endpoint for longer recordings.
+	const requestCap = 20 << 20
+	r.Body = http.MaxBytesReader(w, r.Body, requestCap)
+	d := json.NewDecoder(r.Body)
 	d.DisallowUnknownFields()
-	return d.Decode(dst)
+	err := d.Decode(dst)
+	if err == nil {
+		// Read through trailing whitespace so a complete JSON value cannot hide an oversized body.
+		var extra any
+		err = d.Decode(&extra)
+		if errors.Is(err, io.EOF) {
+			return true
+		}
+		if err == nil {
+			err = errors.New("request must contain one JSON value")
+		}
+	}
+	var over *http.MaxBytesError
+	if errors.As(err, &over) || r.ContentLength > requestCap {
+		problem(w, http.StatusRequestEntityTooLarge, errors.New("file over the 20 MB request cap; record shorter or with --scale 0.5"))
+	} else {
+		problem(w, http.StatusBadRequest, err)
+	}
+	return false
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

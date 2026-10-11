@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -81,6 +82,207 @@ func TestMainUnknownArgument(t *testing.T) {
 	}
 	if stderr.Len() == 0 {
 		t.Fatalf("an unrecognized argument must print a usage message to stderr")
+	}
+}
+
+// Magic bytes and matching labels prevent agents from filing screenshots or the wrong recording.
+func TestReadVideo(t *testing.T) {
+	const refused = "vision add files recorded video (.mp4 or .webm); use vision snap for a screenshot"
+	mp4, webm := []byte("\x00\x00\x00\x18ftypisom"), []byte("\x1a\x45\xdf\xa3recording")
+	for _, tc := range []struct {
+		name, file, media, wantError string
+		data                         []byte
+	}{
+		{"mp4", "flow.mp4", "video/mp4", "", mp4},
+		{"webm", "flow.webm", "video/webm", "", webm},
+		{"uppercase extension", "flow.MP4", "video/mp4", "", mp4},
+		{"PNG", "shot.png", "", refused, []byte("\x89PNG\r\n\x1a\n")},
+		{"PNG labeled MP4", "shot.mp4", "", refused, []byte("\x89PNG\r\n\x1a\n")},
+		{"random", "flow.webm", "", refused, []byte("random bytes")},
+		{"empty", "flow.mp4", "", refused, nil},
+		{"truncated MP4", "flow.mp4", "", refused, []byte("\x00\x00\x00\x18fty")},
+		{"wrong MP4 offset", "flow.mp4", "", refused, []byte("ftypisom")},
+		{"mislabeled MP4", "flow.webm", "", `file extension ".webm" disagrees with video/mp4 bytes (want .mp4); check that you filed the right recording`, mp4},
+		{"mislabeled WebM", "flow.mp4", "", `file extension ".mp4" disagrees with video/webm bytes (want .webm); check that you filed the right recording`, webm},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), tc.file)
+			if err := os.WriteFile(file, tc.data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			data, media, err := readVideo(file)
+			if tc.wantError != "" {
+				if err == nil || err.Error() != tc.wantError || data != nil || media != "" {
+					t.Fatalf("readVideo: data=%q media=%q err=%v, want %q", data, media, err, tc.wantError)
+				}
+			} else if err != nil || media != tc.media || !bytes.Equal(data, tc.data) {
+				t.Fatalf("readVideo: data=%q media=%q err=%v", data, media, err)
+			}
+		})
+	}
+}
+
+// Oversized sparse files must fail before opening, while accepted bytes leave room for the JSON envelope.
+func TestReadVideoSize(t *testing.T) {
+	for _, size := range []int64{maxVideoBytes, maxVideoBytes + 1} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "flow.mp4")
+			f, err := os.Create(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { f.Close() })
+			if _, err := f.Write([]byte("\x00\x00\x00\x18ftyp")); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Truncate(size); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if size > maxVideoBytes {
+				if err := os.Chmod(file, 0); err != nil {
+					t.Fatal(err)
+				}
+			}
+			data, media, err := readVideo(file)
+			if size > maxVideoBytes {
+				if err == nil || err.Error() != "file over the 15 MB limit; record shorter or with --scale 0.5" || data != nil || media != "" {
+					t.Fatalf("oversized file: data length=%d media=%q err=%v", len(data), media, err)
+				}
+				return
+			}
+			if err != nil || int64(len(data)) != size || media != "video/mp4" {
+				t.Fatalf("file at limit: data length=%d media=%q err=%v", len(data), media, err)
+			}
+			if base64.StdEncoding.EncodedLen(len(data)) >= 20<<20 {
+				t.Fatal("file limit leaves no room for JSON under the daemon's request cap")
+			}
+		})
+	}
+}
+
+// Invalid filing arguments must fail locally rather than capture a browser or contact the daemon.
+func TestAddValidation(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{nil, usageText},
+		{[]string{"flow/record"}, usageText},
+		{[]string{"bad-key", "missing.mp4"}, "invalid key"},
+		{[]string{"flow/record", "missing.mp4", "--as", ""}, "invalid variant"},
+		{[]string{"flow/record", "missing.mp4", "--as", "bad/variant"}, "invalid variant"},
+		{[]string{"flow/record", "missing.mp4", "--dim", "vp=mobile"}, usageText},
+		{[]string{"flow/record", "missing.mp4", "--selector", "footer"}, usageText},
+		{[]string{"flow/record", "missing.mp4", "--meta", "ticket"}, usageText},
+		{[]string{"flow/record", "missing.mp4", "extra"}, usageText},
+	} {
+		if err := run(append([]string{"add"}, tc.args...)); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("add %v: err=%v, want %q", tc.args, err, tc.want)
+		}
+	}
+}
+
+// Recorded flows must preserve provenance and bytes while using snap's text and JSON output contract.
+func TestAdd(t *testing.T) {
+	project, err := store.Identify(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, media, variant string
+		data                 []byte
+		queued, asJSON       bool
+	}{
+		{"MP4 queued", "video/mp4", "default", []byte("\x00\x00\x00\x18ftypisom"), true, false},
+		{"WebM JSON", "video/webm", "mobile-dark", []byte("\x1a\x45\xdf\xa3recording"), true, true},
+		{"MP4 unchanged", "video/mp4", "mobile-dark", []byte("\x00\x00\x00\x18ftypisom"), false, false},
+		{"WebM unchanged JSON", "video/webm", "default", []byte("\x1a\x45\xdf\xa3recording"), false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("VISION_STATE_HOME", t.TempDir())
+			t.Setenv("VISION_SESSION_ID", "add-test")
+			if _, err := store.JoinThread(project.ID, "add-test", "a/b c"); err != nil {
+				t.Fatal(err)
+			}
+			ext, err := store.MediaExtension(tc.media)
+			if err != nil {
+				t.Fatal(err)
+			}
+			file := filepath.Join(t.TempDir(), "flow"+ext)
+			if err := os.WriteFile(file, tc.data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			received := make(chan server.SnapRequest, 1)
+			paths := make(chan string, 2)
+			healthTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				paths <- r.Method + " " + r.URL.Path
+				switch r.URL.Path {
+				case "/health":
+					w.WriteHeader(http.StatusOK)
+				case "/api/snap":
+					var req server.SnapRequest
+					if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+						t.Errorf("decode request: %v", err)
+						http.Error(w, "invalid request", http.StatusBadRequest)
+						return
+					}
+					received <- req
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusCreated)
+					fmt.Fprintf(w, `{"schemaVersion":1,"digest":"sha256:test","queued":%t}`, tc.queued)
+				default:
+					t.Errorf("unexpected path: %s", r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			args := []string{"add", "flow/record#2", file, "--meta", "ticket=flow=42", "--meta", "agent=test", "--note", "Recorded checkout flow"}
+			if tc.variant != "default" {
+				args = append(args, "--as", tc.variant)
+			}
+			if tc.asJSON {
+				args = append(args, "--json")
+			}
+			out, err := commandOutput(t, func() error { return run(args) })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(paths) != 2 || <-paths != "GET /health" || <-paths != "POST /api/snap" {
+				t.Fatal("add must check health before posting the video")
+			}
+			select {
+			case req := <-received:
+				data, err := base64.StdEncoding.DecodeString(req.PNG)
+				if err != nil || !bytes.Equal(data, tc.data) || req.Media != tc.media || req.Key != "flow/record#2" || req.Variant != tc.variant {
+					t.Fatalf("lost video bytes or identity: %+v err=%v", req, err)
+				}
+				if req.Project != project || req.Session != "add-test" || req.Thread != "a/b c" || req.Note != "Recorded checkout flow" || !maps.Equal(req.Meta, map[string]string{"ticket": "flow=42", "agent": "test"}) {
+					t.Fatalf("lost video provenance: %+v", req)
+				}
+				if req.Capture != (store.Conditions{}) || len(req.Dims) != 0 || len(req.Elements) != 0 {
+					t.Fatalf("video invented capture conditions: %+v", req)
+				}
+			default:
+				t.Fatal("daemon did not receive a video")
+			}
+			view := galleryURL + "/p/" + project.Name + "/t/a%2Fb%20c"
+			if tc.asJSON {
+				var result map[string]any
+				if err := json.Unmarshal([]byte(out), &result); err != nil || result["url"] != view || result["digest"] != "sha256:test" || result["queued"] != tc.queued || result["schemaVersion"] != float64(1) {
+					t.Fatalf("add JSON=%s err=%v", out, err)
+				}
+			} else {
+				want := "archived unchanged flow/record#2@" + tc.variant + "\n"
+				if tc.queued {
+					want = "queued flow/record#2@" + tc.variant + "\n" + view + "\n"
+				}
+				if out != want {
+					t.Fatalf("add output=%q, want %q", out, want)
+				}
+			}
+		})
 	}
 }
 

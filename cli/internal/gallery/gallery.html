@@ -224,6 +224,30 @@
     pointer-events: none;
   }
   #frame.swipe #divider { display: block; }
+  /* A recorded flow plays in the same frame, so pins, the notes panel and the layer badge
+     work unchanged. Images give way to it with !important because the swipe and peek
+     rules above are just as specific and would otherwise show a stale baseline image. */
+  #vid { position: absolute; top: 0; left: 0; display: none; }
+  #frame.video #vid { display: block; }
+  #frame.video #shot, #frame.video #base { display: none !important; }
+  /* The controls sit under the picture, not over it: over it they would take the bottom of
+     every frame away from pinning, and the pin layer would take the clicks away from them. */
+  #frame.video { --vbar: 34px; }
+  #frame.video #marks { bottom: var(--vbar); }
+  #vbar {
+    position: absolute; left: 0; right: 0; bottom: 0; height: var(--vbar);
+    display: none; align-items: center; gap: 10px; padding: 0 10px;
+    background: var(--bg-raised); border-top: 1px solid var(--line);
+  }
+  #frame.video #vbar { display: flex; }
+  #vplay {
+    flex: none; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 3px;
+    background: none; color: var(--text); font: 12px/1 var(--sans); cursor: pointer;
+  }
+  #vplay:hover { background: var(--line); }
+  #vseek { flex: 1 1 auto; min-width: 0; accent-color: var(--new); cursor: pointer; }
+  #vtime { flex: none; font: 500 11px/1 var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+  #marks .off { display: none; }
 
   /* layer badge, sits on the image corner */
   #layer {
@@ -616,8 +640,14 @@
     <div id="frame">
       <img id="base" alt="">
       <img id="shot" alt="">
+      <video id="vid" muted loop playsinline preload="auto"></video>
       <div id="divider"></div>
       <div id="marks"></div>
+      <div id="vbar">
+        <button type="button" id="vplay" aria-label="play"></button>
+        <input type="range" id="vseek" min="0" max="0" step="0.01" value="0" aria-label="seek">
+        <span id="vtime"></span>
+      </div>
     </div>
     <div id="layer"></div>
     <aside id="notes" aria-label="notes on this shot"></aside>
@@ -636,7 +666,7 @@
     <div class="keys" id="okKey"><kbd class="ok">o</kbd><span class="label" id="okLabel">ok</span></div>
     <div class="keys"><kbd class="ok">a</kbd><span class="label">ok all</span></div>
     <div class="keys" id="flagKey"><kbd class="flag">f</kbd><span class="label" id="flagLabel">flag</span></div>
-    <div class="keys"><kbd>space</kbd><span class="label">compare</span></div>
+    <div class="keys"><kbd>b</kbd><span class="label">baseline</span></div>
     <div class="keys"><kbd>?</kbd></div>
   </footer>
 </div>
@@ -673,15 +703,15 @@
     <dl>
       <dt><kbd>click</kbd></dt>                <dd>pin a note, drag for a box</dd>
       <dt><kbd>j</kbd><kbd>k</kbd></dt>       <dd>next / previous card</dd>
-      <dt><kbd>space</kbd></dt>                <dd>cycle new, swipe, diff (what this card has)</dd>
-      <dt><kbd>b</kbd></dt>                    <dd>hold to peek the baseline</dd>
-      <dt><kbd>s</kbd> <kbd>d</kbd></dt>       <dd>jump to swipe / diff</dd>
+      <dt><kbd>b</kbd></dt>                    <dd>hold to see the baseline, video at the same moment</dd>
+      <dt><kbd>s</kbd> <kbd>d</kbd></dt>       <dd>swipe / diff, press again for new</dd>
       <dt><kbd>o</kbd></dt>                    <dd>ok, and this becomes the baseline</dd>
       <dt><kbd>O</kbd></dt>                    <dd>ok with a note</dd>
       <dt><kbd>a</kbd></dt>                    <dd>ok for every variant of this key</dd>
       <dt><kbd>f</kbd></dt>                    <dd>flag, note required</dd>
       <dt><kbd>u</kbd></dt>                    <dd>undo, while the toast is up</dd>
       <dt><kbd>1</kbd>..<kbd>9</kbd></dt>      <dd>jump to a flow step</dd>
+      <dt><kbd>space</kbd> <kbd>,</kbd> <kbd>.</kbd></dt> <dd>video: play or pause, step back / forward</dd>
       <dt><kbd>g</kbd><kbd>G</kbd></dt>        <dd>first / last card</dd>
       <dt><kbd>p</kbd></dt>                    <dd>projects, on a narrow window</dd>
       <dt><kbd>esc</kbd></dt>                  <dd>close</dd>
@@ -694,7 +724,7 @@
   const $ = s => document.querySelector(s);
   const el = {
     ctx: $('#ctx'), key: $('#key'), variant: $('#variant'), dims: $('#dims'), count: $('#count'),
-    stage: $('#stage'), frame: $('#frame'), base: $('#base'), shot: $('#shot'),
+    stage: $('#stage'), frame: $('#frame'), base: $('#base'), shot: $('#shot'), vid: $('#vid'), vbar: $('#vbar'), vplay: $('#vplay'), vseek: $('#vseek'), vtime: $('#vtime'),
     marks: $('#marks'), notes: $('#notes'), composer: $('#composer'), composerText: $('#composerText'),
     flowAll: $('#flowAll'), flowAllBox: $('#flowAllBox'),
     okKey: $('#okKey'), okLabel: $('#okLabel'), flagKey: $('#flagKey'), flagLabel: $('#flagLabel'),
@@ -769,7 +799,7 @@
   /* ---------- data ---------- */
 
   async function load() {
-    if (mock) { all = mockQueue(); refilter(); return render(); }
+    if (mock) { all = mockQueue(); refilter(); render(); return mockVideo(); }
     try {
       const r = await fetch('/api/queue');
       all = (await r.json()) || [];
@@ -982,7 +1012,11 @@
 
   // Only the layers this card actually has. A layer that silently fell back to the shot
   // read as "the baseline is identical" when there was no baseline at all.
+  const isVideo = it => Boolean(it && it.media && it.media.startsWith('video/'));
+  // Two recordings never line up frame for frame, so a video has no swipe and no diff:
+  // its only comparison is holding b to play the approved recording at the same moment.
   const modes = it => {
+    if (isVideo(it)) return ['NEW'];
     const m = ['NEW'];
     if (it && it.baselineUrl && !it.incomparable) m.push('SWIPE');
     if (it && it.diffUrl) m.push('DIFF');
@@ -992,7 +1026,8 @@
   function setMode(name) {
     const i = modes(current()).indexOf(name);
     if (i < 0) return;
-    layer = i;
+    // Pressing the mode you are in goes back to NEW, so each compare key undoes itself.
+    layer = layer === i ? 0 : i;
     paint();
   }
 
@@ -1034,6 +1069,30 @@
     const peek = peeking && Boolean(it.baselineUrl);
     const name = peek ? 'BASELINE' : list[layer];
 
+    const video = isVideo(it);
+    el.frame.classList.toggle('video', video);
+    if (video) {
+      const src = name === 'BASELINE' ? it.baselineUrl : it.shotUrl;
+      if (el.vid.getAttribute('src') !== src) {
+        // Switching between the new recording and the baseline keeps the moment and whether
+        // it was playing, so a paused frame compares against the same paused frame.
+        const same = el.vid.dataset.card === rid(it);
+        const playing = !same || !el.vid.paused;
+        seekTo = same ? el.vid.currentTime : 0;
+        el.vid.dataset.card = rid(it);
+        el.vid.src = src;
+        if (playing) el.vid.play().catch(() => {});
+      }
+      el.shot.removeAttribute('src');
+      el.base.removeAttribute('src');
+      el.frame.classList.remove('swipe');
+      el.frame.classList.toggle('peek', name === 'BASELINE');
+      el.layer.dataset.layer = name;
+      el.layer.textContent = name;
+      el.layer.classList.toggle('show', name !== 'NEW');
+      return fit();
+    }
+    if (el.vid.getAttribute('src')) { el.vid.pause(); el.vid.removeAttribute('src'); el.vid.load(); delete el.vid.dataset.card; }
     const shotSrc = name === 'DIFF' ? it.diffUrl : it.shotUrl;
     const baseSrc = it.baselineUrl || '';
     if (el.shot.getAttribute('src') !== shotSrc) el.shot.src = shotSrc;
@@ -1058,26 +1117,27 @@
   // so baseline and shot line up pixel for pixel even when the page grew. Never upscale:
   // a blown-up screenshot invents softness that is not in the render.
   function fit() {
-    const showBase = el.frame.classList.contains('swipe') || el.frame.classList.contains('peek');
-    const imgs = [el.shot, ...(showBase ? [el.base] : [])].filter(i => i.naturalWidth);
-    if (!imgs.length) return;
-    const w = Math.max(...imgs.map(i => i.naturalWidth));
-    const h = Math.max(...imgs.map(i => i.naturalHeight));
+    const { w, h } = mediaSize();
+    if (!w) return;
     const cs = getComputedStyle(el.stage);
     // The notes panel takes its width out of the room instead of covering the shot: a note
     // is useless if it hides the thing it is about.
     const panel = el.notes.classList.contains('show') ? el.notes.offsetWidth + 16 : 0;
+    // The video controls hang under the picture inside the frame, so they come out of the
+    // height the picture may use. CSS owns their height; 0 when they are hidden.
+    const bar = el.vbar.offsetHeight;
     const room = {
       w: el.stage.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) - panel,
-      h: el.stage.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom),
+      h: el.stage.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom) - bar,
     };
     const scale = Math.min(room.w / w, room.h / h, 1);
     shown = scale;
     el.frame.style.width = `${Math.round(w * scale)}px`;
-    el.frame.style.height = `${Math.round(h * scale)}px`;
+    el.frame.style.height = `${Math.round(h * scale) + bar}px`;
     for (const i of [el.shot, el.base]) {
       if (i.naturalWidth) i.style.width = `${i.naturalWidth * scale}px`;
     }
+    if (el.vid.videoWidth) el.vid.style.width = `${el.vid.videoWidth * scale}px`;
     const fw = w * scale;
     if (cut === null || cut > fw) cut = fw / 2;
     el.frame.style.setProperty('--cut', `${cut}px`);
@@ -1085,6 +1145,48 @@
     drawMarks();
   }
 
+  // The pixels marks are measured in: the video's own frame size, or the larger of shot and
+  // baseline when both are visible, so an image note lands on the same spot at any size.
+  function mediaSize() {
+    if (el.frame.classList.contains('video')) return { w: el.vid.videoWidth, h: el.vid.videoHeight };
+    const showBase = el.frame.classList.contains('swipe') || el.frame.classList.contains('peek');
+    const imgs = [el.shot, ...(showBase ? [el.base] : [])].filter(i => i.naturalWidth);
+    if (!imgs.length) return { w: 0, h: 0 };
+    return { w: Math.max(...imgs.map(i => i.naturalWidth)), h: Math.max(...imgs.map(i => i.naturalHeight)) };
+  }
+
+  let seekTo = 0;
+  const clock = t => `${Math.floor(t / 60)}:${(t % 60).toFixed(1).padStart(4, '0')}`;
+  el.vid.addEventListener('loadedmetadata', () => {
+    el.vid.currentTime = Math.min(seekTo, el.vid.duration || 0);
+    fit();
+  });
+  // A pin belongs to the moment it was placed. Showing every pin over a moving picture
+  // points at things that are no longer there, so only the ones near the current frame
+  // show. Class-only, like hover, so nothing replays its entrance animation.
+  function syncTime() {
+    const now = el.vid.currentTime;
+    // A recording without a duration in its header (MediaRecorder's webm, as in the mock)
+    // reports Infinity until it has played through once; durationchange repaints it then.
+    const dur = Number.isFinite(el.vid.duration) ? el.vid.duration : 0;
+    el.vtime.textContent = `${clock(now)} / ${clock(dur)}`;
+    el.vplay.textContent = el.vid.paused ? '▶' : '❚❚';
+    el.vplay.setAttribute('aria-label', el.vid.paused ? 'play' : 'pause');
+    el.vseek.max = dur;
+    el.vseek.value = now;
+    const list = notesOf(current());
+    for (const node of el.marks.children) {
+      const n = list[Number(node.dataset.i)];
+      if (n) node.classList.toggle('off', n.t != null && Math.abs(n.t - now) > 0.25);
+    }
+  }
+  ['timeupdate', 'seeked', 'play', 'pause', 'durationchange'].forEach(ev => el.vid.addEventListener(ev, syncTime));
+  const togglePlay = () => (el.vid.paused ? el.vid.play().catch(() => {}) : el.vid.pause());
+  // Both give focus back to the page once used: a focused button would take the next space
+  // as its own click, and a focused slider would take j and k's arrow twins as seeks.
+  el.vplay.onclick = () => { togglePlay(); el.vplay.blur(); };
+  el.vseek.oninput = () => { el.vid.currentTime = Number(el.vseek.value); };
+  el.vseek.onchange = () => el.vseek.blur();
   el.shot.addEventListener('load', fit);
   el.base.addEventListener('load', fit);
   addEventListener('resize', fit);
@@ -1125,8 +1227,8 @@
     const r = el.marks.getBoundingClientRect();
     const clamp = (v, max) => Math.max(0, Math.min(max, v));
     return {
-      x: Math.round(clamp((e.clientX - r.left) / shown, el.shot.naturalWidth)),
-      y: Math.round(clamp((e.clientY - r.top) / shown, el.shot.naturalHeight)),
+      x: Math.round(clamp((e.clientX - r.left) / shown, mediaSize().w)),
+      y: Math.round(clamp((e.clientY - r.top) / shown, mediaSize().h)),
     };
   };
 
@@ -1159,6 +1261,7 @@
     });
     if (drawing && drawing.box) kids.push(drawing.box);
     el.marks.replaceChildren(...kids);
+    if (isVideo(it)) syncTime();
     drawList(it);
     list.forEach(n => entering.delete(n));
   }
@@ -1185,7 +1288,9 @@
     if (!has) {
       const hint = document.createElement('p');
       hint.className = 'empty-hint';
-      hint.textContent = 'Click the shot to pin a note, drag for a box. Issues request changes, praise approves.';
+      hint.textContent = isVideo(it)
+        ? 'Pause where something is wrong (space), then click to pin a note at that moment, drag for a box.'
+        : 'Click the shot to pin a note, drag for a box. Issues request changes, praise approves.';
       el.notes.replaceChildren(hint);
       if (had !== el.notes.classList.contains('show')) fit();
       return;
@@ -1205,6 +1310,7 @@
       const meta = document.createElement('span');
       meta.className = 'meta';
       meta.textContent = carriedFrom ? `${n.tone}, from step ${carriedFrom}` : n.flow ? `${n.tone}, every step` : n.tone;
+      if (n.t != null) meta.textContent = `${clock(n.t)}, ${meta.textContent}`;
       body.append(meta);
       row.append(num, body);
       if (!carriedFrom) {
@@ -1244,6 +1350,9 @@
     if (e.button !== 0 || !current()) return;
     if (draft) return closeComposer(true);
     e.preventDefault();
+    // A mark is drawn on a still frame: the moment the pointer went down is the one the
+    // reviewer meant, and a box dragged over a moving picture would describe nothing.
+    if (isVideo(current())) el.vid.pause();
     try { el.marks.setPointerCapture(e.pointerId); } catch {}
     const p = toImage(e);
     drawing = { x0: p.x, y0: p.y, cx: e.clientX, cy: e.clientY, box: null };
@@ -1273,6 +1382,7 @@
     const n = drawing.rect && drawing.rect.w > 4 && drawing.rect.h > 4
       ? { ...drawing.rect, text: '', flow: false }
       : { x: drawing.x0, y: drawing.y0, w: 0, h: 0, tone: 'issue', text: '', flow: false };
+    if (isVideo(it)) n.t = Math.round(el.vid.currentTime * 10) / 10;
     drawing = null;
     if (!notesBy.has(rid(it))) notesBy.set(rid(it), []);
     notesBy.get(rid(it)).push(n);
@@ -1291,6 +1401,7 @@
   function edit(it, note, fresh) {
     if (draft && draft.note !== note) closeComposer(true);
     draft = { it, note, fresh };
+    if (isVideo(it) && note.t != null && !fresh) { el.vid.pause(); el.vid.currentTime = note.t; }
     hot = notesOf(it).indexOf(note);
     drawMarks();
     el.composerText.value = note.text;
@@ -1377,7 +1488,7 @@
     sibs.forEach((s, i) => {
       const b = document.createElement('button');
       b.textContent = i + 1;
-      if (s.thumbUrl) b.style.backgroundImage = `url(${s.thumbUrl})`;
+      if (s.thumbUrl && !(s.media || '').startsWith('video/')) b.style.backgroundImage = `url(${s.thumbUrl})`;
       b.className = s.key === it.key && s.digest === it.digest ? 'on' : '';
       b.onclick = () => { const j = queue.findIndex(q => q.key === s.key && q.digest === s.digest && q.variant === it.variant); if (j >= 0) go(j); };
       el.strip.append(b);
@@ -1457,7 +1568,7 @@
           // reads, so only the marks travel. Picked field by field because the daemon
           // rejects unknown fields, and a carried flow copy holds display-only ones.
           regions: notesOf(item).filter(n => n.text)
-            .map(({ x, y, w, h, tone, text, flow }) => ({ x, y, w, h, tone, text, flow })),
+            .map(({ x, y, w, h, tone, text, flow, t }) => ({ x, y, w, h, tone, text, flow, ...(t != null ? { t } : {}) })),
         }),
       }).catch(() => {
         // Never lose the reviewer's words: put the card back and say so.
@@ -1540,7 +1651,9 @@
       case 'j': case 'ArrowDown': case 'ArrowRight': return go(at + 1);
       case 'k': case 'ArrowUp':   case 'ArrowLeft':  return go(at - 1);
       case 'G': return go(queue.length - 1);
-      case ' ': e.preventDefault(); layer = (layer + 1) % modes(current()).length; return paint();
+      // Space plays a video, the way every player does. Compare has its own keys (b, s, d),
+      // so on an image space does nothing rather than a second way to reach them.
+      case ' ': e.preventDefault(); if (isVideo(current())) togglePlay(); return;
       case 's': return setMode('SWIPE');
       case 'd': return setMode('DIFF');
       case 'b': if (!peeking) { peeking = true; paint(); } return;
@@ -1556,6 +1669,9 @@
       // Notes already say what is wrong, so a flag with notes needs no second note.
       case 'f': case 'x': e.preventDefault(); return notesOf(current()).length ? verdict('flag', '') : openNote('flag');
       case 'u': return undo();
+      case ',': case '.':
+        if (isVideo(current())) { el.vid.pause(); el.vid.currentTime = Math.max(0, el.vid.currentTime + (e.key === '.' ? 0.1 : -0.1)); }
+        return;
       case 'p': return el.side.classList.toggle('open');
     }
     if (/^[1-9]$/.test(k)) {
@@ -1665,6 +1781,41 @@
       { project: 'shop', branch: 'feat/checkout', key: 'checkout/happy-path#3', variant: 'desktop-light',
         digest: 'd6', status: 'new', shotUrl: flow[2].thumbUrl, steps: flow },
     ]);
+  }
+
+  // A recorded flow for the mock, made in the browser so the repo carries no binary: a box
+  // sliding across, recorded twice with the baseline's box another color, so `b` shows a
+  // change at the same moment. It lands at the end once recorded, the way a live snap does.
+  async function mockVideo() {
+    if (!window.MediaRecorder || !HTMLCanvasElement.prototype.captureStream) return;
+    const record = color => new Promise(resolve => {
+      const c = Object.assign(document.createElement('canvas'), { width: 640, height: 360 });
+      const g = c.getContext('2d');
+      const rec = new MediaRecorder(c.captureStream(30));
+      const parts = [];
+      rec.ondataavailable = e => parts.push(e.data);
+      rec.onstop = () => resolve({ url: URL.createObjectURL(new Blob(parts, { type: rec.mimeType })), media: rec.mimeType });
+      const t0 = performance.now();
+      // setInterval, not requestAnimationFrame: a hidden tab never runs frames, so the
+      // recording would never stop.
+      const tick = setInterval(() => {
+        const t = Math.min((performance.now() - t0) / 2000, 1);
+        g.fillStyle = '#18181b'; g.fillRect(0, 0, 640, 360);
+        g.fillStyle = color; g.fillRect(40 + t * 480, 140, 80, 80);
+        if (t === 1) { clearInterval(tick); rec.stop(); }
+      }, 33);
+      rec.start();
+    });
+    const [shot, base] = await Promise.all([record('#22c55e'), record('#6366f1')]);
+    const was = current() && rid(current());
+    all.push({ project: 'shop', projectId: 'shop', branch: 'feat/checkout', thread: 'a1b2c3d4-shop',
+      ts: new Date().toISOString(), key: 'checkout/confirm-anim', variant: 'desktop-dark',
+      digest: 'v1', status: 'changed', media: shot.media || 'video/webm',
+      shotUrl: shot.url, baselineUrl: base.url });
+    refilter();
+    const keep = queue.findIndex(q => rid(q) === was);
+    if (keep >= 0) at = keep;
+    render();
   }
 
   load();
