@@ -113,22 +113,45 @@
     min-height: 0;
     overflow: hidden;
   }
-  #shot, #empty { grid-area: 1 / 1; }
+  #frame, #empty { grid-area: 1 / 1; }
 
-  #shot {
-    width: auto;
-    height: auto;
-    max-width: 100%;
-    max-height: 100%;
-    /* contain, never fill: a screenshot shown at the wrong aspect ratio is a lie about
-       the thing being reviewed. No background either, so if the element box ever ends up
-       a different shape than the image, you see nothing rather than false letterboxing. */
-    object-fit: contain;
+  /* The frame is sized in JS from the images' natural pixels (fit()), never by CSS
+     max-width/max-height on the img. Swipe stacks baseline and shot, and when a page grew
+     they differ in size: both must share one scale and one top-left origin or the
+     divider compares misaligned pixels, which is the fake diff vision exists to refuse.
+     The server pads the diff image the same way, top-left. */
+  #frame {
+    position: relative;
+    overflow: hidden;
     border-radius: 4px;
     box-shadow: var(--shadow);
-    transition: opacity .08s linear;
+    cursor: default;
   }
-  #shot.swap { opacity: .55; }
+  #frame img {
+    position: absolute;
+    top: 0; left: 0;
+    display: block;
+    transition: opacity .08s linear;
+    user-select: none;
+    -webkit-user-drag: none;
+  }
+  #base { display: none; }
+  #frame.swipe #base, #frame.peek #base { display: block; }
+  #frame.peek #shot { opacity: 0; }
+  #frame.swipe { cursor: ew-resize; }
+  #frame.swipe #shot { clip-path: inset(0 0 0 var(--cut, 50%)); }
+  #divider {
+    position: absolute;
+    top: 0; bottom: 0;
+    left: var(--cut, 50%);
+    width: 2px;
+    margin-left: -1px;
+    background: var(--text);
+    box-shadow: 0 0 0 1px rgba(0,0,0,.5);
+    display: none;
+    pointer-events: none;
+  }
+  #frame.swipe #divider { display: block; }
 
   /* layer badge, sits on the image corner */
   #layer {
@@ -151,6 +174,9 @@
   #layer.show { opacity: 1; }
   #layer[data-layer="BASELINE"] { color: var(--warn); }
   #layer[data-layer="DIFF"]     { color: var(--flag); }
+  #layer[data-layer="SWIPE"]    { color: var(--text); }
+  #layer .side { color: var(--warn); }
+  #layer .side + .side { color: var(--text); margin-left: 10px; }
 
   /* ---------- filmstrip ---------- */
 
@@ -185,6 +211,23 @@
   }
   .stat.new  { color: var(--new); }
   .stat.warn { color: var(--warn); }
+  .stat { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 0 1 auto; }
+
+  /* What drifted without blocking the diff: the page grew, or the URL moved. Said beside
+     the percentage because "4% changed" from 400 new rows of page reads very differently
+     from 4% of a fixed viewport. */
+  #changes { display: flex; gap: 6px; min-width: 0; overflow: hidden; flex: 0 1 auto; }
+  #changes span {
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--warn) 12%, transparent);
+    color: var(--warn);
+    font: 500 11px/1.45 var(--mono);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 46ch;
+  }
 
   .keys { display: flex; align-items: center; gap: 6px; }
   .keys + .keys { margin-left: 14px; }
@@ -344,7 +387,11 @@
   </header>
 
   <div id="stage">
-    <img id="shot" alt="">
+    <div id="frame">
+      <img id="base" alt="">
+      <img id="shot" alt="">
+      <div id="divider"></div>
+    </div>
     <div id="layer"></div>
     <div id="empty">
       <div class="big">Nothing waiting.</div>
@@ -356,6 +403,7 @@
 
   <footer>
     <div class="stat" id="stat"></div>
+    <div id="changes"></div>
     <div class="spacer"></div>
     <div class="keys"><kbd class="ok">o</kbd><span class="label">ok</span></div>
     <div class="keys"><kbd class="ok">a</kbd><span class="label">ok all</span></div>
@@ -382,8 +430,9 @@
     <h2>KEYS</h2>
     <dl>
       <dt><kbd>j</kbd><kbd>k</kbd></dt>       <dd>next / previous card</dd>
-      <dt><kbd>space</kbd></dt>                <dd>cycle new, baseline, diff</dd>
+      <dt><kbd>space</kbd></dt>                <dd>cycle new, swipe, diff (what this card has)</dd>
       <dt><kbd>b</kbd></dt>                    <dd>hold to peek the baseline</dd>
+      <dt><kbd>s</kbd> <kbd>d</kbd></dt>       <dd>jump to swipe / diff</dd>
       <dt><kbd>o</kbd></dt>                    <dd>ok, and this becomes the baseline</dd>
       <dt><kbd>O</kbd></dt>                    <dd>ok with a note</dd>
       <dt><kbd>a</kbd></dt>                    <dd>ok for every variant of this key</dd>
@@ -401,19 +450,20 @@
   const $ = s => document.querySelector(s);
   const el = {
     ctx: $('#ctx'), key: $('#key'), variant: $('#variant'), dims: $('#dims'), count: $('#count'),
-    shot: $('#shot'), layer: $('#layer'), stat: $('#stat'), strip: $('#strip'),
+    stage: $('#stage'), frame: $('#frame'), base: $('#base'), shot: $('#shot'),
+    layer: $('#layer'), stat: $('#stat'), changes: $('#changes'), strip: $('#strip'),
     empty: $('#empty'), emptySub: $('#emptySub'),
     note: $('#note'), noteTag: $('#noteTag'), noteInput: $('#noteInput'),
     toast: $('#toast'), toastWhat: $('#toastWhat'), help: $('#help'),
   };
 
   const UNDO_MS = 4000;
-  const LAYERS = ['NEW', 'BASELINE', 'DIFF'];
 
   let queue = [];          // pending items, newest first
   let at = 0;              // cursor into queue
-  let layer = 0;           // index into LAYERS
+  let layer = 0;           // index into modes(current())
   let peeking = false;     // `b` held
+  let cut = null;          // swipe divider, CSS px from the frame's left edge
   let pendingVerdict = null; // {timer, item, verdict, note}
   let doneCount = 0;
 
@@ -465,10 +515,11 @@
     const has = Boolean(it);
 
     el.empty.classList.toggle('show', !has);
-    el.shot.style.display = has ? '' : 'none';
+    el.frame.style.display = has ? '' : 'none';
     if (!has) {
       el.ctx.textContent = el.key.textContent = el.variant.textContent = '';
       el.dims.replaceChildren();
+      el.changes.replaceChildren();
       el.count.textContent = '';
       el.stat.textContent = '';
       el.strip.classList.remove('show');
@@ -491,11 +542,14 @@
       ? `${here + 1} of ${rows.length} · ${at + 1} / ${queue.length}`
       : `${at + 1} / ${queue.length}`;
 
-    // A resize makes a pixel diff meaningless, so the tool refuses to compute one.
-    // Say that plainly instead of showing a screen of red.
+    // A different width, pixel ratio, scheme or element makes a pixel diff meaningless,
+    // so the server refuses one. Say that plainly, and point at the one comparison still
+    // honest: looking at the baseline yourself.
+    el.stat.title = '';
     if (it.incomparable) {
       el.stat.className = 'stat warn';
-      el.stat.textContent = it.incomparable;
+      el.stat.textContent = `no diff: ${it.incomparable.replace(/^baseline and this shot differ in /, '').replace(/\. Not comparable\.$/, '')}${it.baselineUrl ? ', hold b for the baseline' : ''}`;
+      el.stat.title = it.incomparable;
     } else if (it.status === 'new') {
       el.stat.className = 'stat new';
       el.stat.textContent = 'new, no baseline yet';
@@ -503,9 +557,31 @@
       el.stat.className = 'stat';
       el.stat.textContent = `${fmtPct(it.changedFraction)} changed`;
     }
+    el.changes.replaceChildren(...(it.changes || []).map(text => {
+      const chip = document.createElement('span');
+      chip.textContent = text;
+      chip.title = text;
+      return chip;
+    }));
 
     paint();
     filmstrip(it);
+  }
+
+  // Only the layers this card actually has. A layer that silently fell back to the shot
+  // read as "the baseline is identical" when there was no baseline at all.
+  const modes = it => {
+    const m = ['NEW'];
+    if (it && it.baselineUrl && !it.incomparable) m.push('SWIPE');
+    if (it && it.diffUrl) m.push('DIFF');
+    return m;
+  };
+
+  function setMode(name) {
+    const i = modes(current()).indexOf(name);
+    if (i < 0) return;
+    layer = i;
+    paint();
   }
 
   // What the shot is comes before how it was rendered: a reviewer looking at a wall of
@@ -541,18 +617,68 @@
   function paint() {
     const it = current();
     if (!it) return;
-    const name = peeking ? 'BASELINE' : LAYERS[layer];
-    const src = name === 'BASELINE' ? it.baselineUrl
-              : name === 'DIFF'     ? it.diffUrl
-              : it.shotUrl;
+    const list = modes(it);
+    if (layer >= list.length) layer = 0;
+    const peek = peeking && Boolean(it.baselineUrl);
+    const name = peek ? 'BASELINE' : list[layer];
 
-    // Fall back to the shot when a layer does not exist for this item.
-    el.shot.src = src || it.shotUrl;
-    el.shot.alt = `${it.key} at ${it.variant}, ${name.toLowerCase()}`;
+    const shotSrc = name === 'DIFF' ? it.diffUrl : it.shotUrl;
+    const baseSrc = it.baselineUrl || '';
+    if (el.shot.getAttribute('src') !== shotSrc) el.shot.src = shotSrc;
+    if (baseSrc && el.base.getAttribute('src') !== baseSrc) el.base.src = baseSrc;
+    if (!baseSrc) el.base.removeAttribute('src');
+    el.shot.alt = `${it.key} at ${it.variant}, ${name === 'DIFF' ? 'diff' : 'new'}`;
+    el.base.alt = `${it.key} at ${it.variant}, baseline`;
+
+    el.frame.classList.toggle('swipe', name === 'SWIPE');
+    el.frame.classList.toggle('peek', peek);
     el.layer.dataset.layer = name;
-    el.layer.textContent = name;
+    if (name === 'SWIPE') {
+      el.layer.innerHTML = '<span class="side">BASELINE</span><span class="side">NEW</span>';
+    } else {
+      el.layer.textContent = name;
+    }
     el.layer.classList.toggle('show', name !== 'NEW');
+    fit();
   }
+
+  // Scale every visible image by one factor from its natural pixels, anchored top-left,
+  // so baseline and shot line up pixel for pixel even when the page grew. Never upscale:
+  // a blown-up screenshot invents softness that is not in the render.
+  function fit() {
+    const showBase = el.frame.classList.contains('swipe') || el.frame.classList.contains('peek');
+    const imgs = [el.shot, ...(showBase ? [el.base] : [])].filter(i => i.naturalWidth);
+    if (!imgs.length) return;
+    const w = Math.max(...imgs.map(i => i.naturalWidth));
+    const h = Math.max(...imgs.map(i => i.naturalHeight));
+    const cs = getComputedStyle(el.stage);
+    const room = {
+      w: el.stage.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight),
+      h: el.stage.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom),
+    };
+    const scale = Math.min(room.w / w, room.h / h, 1);
+    el.frame.style.width = `${Math.round(w * scale)}px`;
+    el.frame.style.height = `${Math.round(h * scale)}px`;
+    for (const i of [el.shot, el.base]) {
+      if (i.naturalWidth) i.style.width = `${i.naturalWidth * scale}px`;
+    }
+    const fw = w * scale;
+    if (cut === null || cut > fw) cut = fw / 2;
+    el.frame.style.setProperty('--cut', `${cut}px`);
+  }
+
+  el.shot.addEventListener('load', fit);
+  el.base.addEventListener('load', fit);
+  addEventListener('resize', fit);
+
+  // The divider follows the pointer, no drag: comparing is scrubbing back and forth, and
+  // a grab handle turns every pass into two extra motions.
+  el.frame.addEventListener('pointermove', e => {
+    if (!el.frame.classList.contains('swipe')) return;
+    const r = el.frame.getBoundingClientRect();
+    cut = Math.max(0, Math.min(r.width, e.clientX - r.left));
+    el.frame.style.setProperty('--cut', `${cut}px`);
+  });
 
   function filmstrip(it) {
     const sibs = it.steps || [];
@@ -717,8 +843,10 @@
       case 'j': case 'ArrowDown': case 'ArrowRight': return go(at + 1);
       case 'k': case 'ArrowUp':   case 'ArrowLeft':  return go(at - 1);
       case 'G': return go(queue.length - 1);
-      case ' ': e.preventDefault(); layer = (layer + 1) % LAYERS.length; return paint();
-      case 'b': if (!peeking) { peeking = true; el.shot.classList.add('swap'); paint(); } return;
+      case ' ': e.preventDefault(); layer = (layer + 1) % modes(current()).length; return paint();
+      case 's': return setMode('SWIPE');
+      case 'd': return setMode('DIFF');
+      case 'b': if (!peeking) { peeking = true; paint(); } return;
       case 'o': return verdict('ok', '');
       // One CSS change flips every variant of a key at once. Reviewing that as four
       // separate decisions is four chances to accept three and get bored before the
@@ -739,7 +867,7 @@
   });
 
   addEventListener('keyup', e => {
-    if (e.key === 'b' && peeking) { peeking = false; el.shot.classList.remove('swap'); paint(); }
+    if (e.key === 'b' && peeking) { peeking = false; paint(); }
   });
 
   // Send anything still in flight before the tab dies.
@@ -787,13 +915,21 @@
         shotUrl: px(375, 812, '#18181b', '#3f3f46'),
         baselineUrl: px(375, 812, '#18181b', '#6366f1'),
         diffUrl: px(375, 812, '#1c1917', '#f43f5e') },
+      // The page grew: the server pads top-left and diffs anyway, and says so beside the
+      // percentage. Swipe has to keep both images on one scale for this card to read right.
+      { project: 'shop', branch: 'feat/checkout', key: 'orders/list', variant: 'desktop-dark',
+        digest: 'g1', status: 'changed', changedFraction: 0.21,
+        changes: ['size 900x560 to 900x700', 'url http://localhost:3000/orders?page=1 to http://localhost:3000/orders?page=2'],
+        shotUrl: px(900, 700, '#18181b', '#22c55e'),
+        baselineUrl: px(900, 560, '#18181b', '#22c55e'),
+        diffUrl: px(900, 700, '#1c1917', '#fbbf24') },
       { project: 'shop', branch: 'feat/checkout', key: 'settings/danger-zone', variant: 'desktop-light',
         digest: 'b2', status: 'changed', changedFraction: 0.0007,
         shotUrl: px(900, 560, '#fafafa', '#ef4444'),
         baselineUrl: px(900, 560, '#fafafa', '#a1a1aa'),
         diffUrl: px(900, 560, '#fafafa', '#f43f5e') },
       { project: 'dashboard', branch: 'main', key: 'billing/plan-picker', variant: 'desktop-dark',
-        digest: 'c3', status: 'changed', incomparable: 'baseline and this shot differ in size 1440x900 @2x vs 1280x800 @2x. Not comparable.',
+        digest: 'c3', status: 'changed', incomparable: 'baseline and this shot differ in viewport width 1440 vs 1280. Not comparable.',
         shotUrl: px(1280, 800, '#0c0a09', '#22c55e'),
         baselineUrl: px(1440, 900, '#0c0a09', '#22c55e') },
       { project: 'shop', branch: 'feat/checkout', key: 'checkout/happy-path#1', variant: 'desktop-light',
