@@ -893,7 +893,12 @@
 
     const rows = [link({}, 'All projects', live.length)];
     for (const [name, items] of projects) {
-      rows.push(link({ project: name }, name, items.length, logo(items[0] || { project: name })));
+      // The logo is fetched by projectId, which only a shot carries. Once every shot is
+      // judged none is live, so take it from a judged one rather than drop to the letter.
+      // ponytail: a fresh load with nothing pending has no shot at all and still shows the
+      // letter; the fix is the server sending projectIds for the projects it knows.
+      const face = items[0] || all.find(q => q.project === name) || { project: name };
+      rows.push(link({ project: name }, name, items.length, logo(face)));
       if (view.project !== name) continue;
       const sub = document.createElement('div');
       sub.className = 'sub';
