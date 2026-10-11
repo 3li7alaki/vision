@@ -576,6 +576,9 @@
   #empty.show { display: grid; }
   #empty .big { font: 400 17px/1.4 var(--sans); color: var(--muted); }
   #empty .sub { font: 500 12px/1 var(--mono); color: var(--faint); }
+  #emptyNext { color: var(--muted); text-decoration: none; display: flex; align-items: center; gap: 8px; }
+  #emptyNext:hover { color: var(--text); }
+  #emptyNext[hidden] { display: none; }
 
   /* ---------- help ---------- */
 
@@ -654,6 +657,7 @@
     <div id="empty">
       <div class="big">Nothing waiting.</div>
       <div class="sub" id="emptySub"></div>
+      <a class="sub" id="emptyNext" hidden></a>
     </div>
   </div>
 
@@ -714,6 +718,7 @@
       <dt><kbd>space</kbd> <kbd>,</kbd> <kbd>.</kbd></dt> <dd>video: play or pause, step back / forward</dd>
       <dt><kbd>g</kbd><kbd>G</kbd></dt>        <dd>first / last card</dd>
       <dt><kbd>p</kbd></dt>                    <dd>projects, on a narrow window</dd>
+      <dt><kbd>n</kbd></dt>                    <dd>when done here, go where shots still wait</dd>
       <dt><kbd>esc</kbd></dt>                  <dd>close</dd>
     </dl>
   </div>
@@ -729,7 +734,7 @@
     flowAll: $('#flowAll'), flowAllBox: $('#flowAllBox'),
     okKey: $('#okKey'), okLabel: $('#okLabel'), flagKey: $('#flagKey'), flagLabel: $('#flagLabel'),
     layer: $('#layer'), stat: $('#stat'), changes: $('#changes'), strip: $('#strip'),
-    empty: $('#empty'), emptySub: $('#emptySub'),
+    empty: $('#empty'), emptySub: $('#emptySub'), emptyNext: $('#emptyNext'),
     note: $('#note'), noteTag: $('#noteTag'), noteInput: $('#noteInput'),
     toast: $('#toast'), toastWhat: $('#toastWhat'), help: $('#help'), side: $('#side'),
   };
@@ -951,6 +956,22 @@
     return queue.reduce((acc, q, i) => (groupOf(q) === g && acc.push(i), acc), []);
   };
 
+  // The nearest wider view with something left: the rest of this project first, since a
+  // session or branch is usually one slice of the same work, then the busiest project.
+  let elsewhere = null;
+  function nextView() {
+    const live = all.filter(it => !taken.has(rid(it)));
+    if (view.project && (view.branch || view.thread)) {
+      const n = live.filter(it => inView(it, { project: view.project })).length;
+      if (n) return { v: { project: view.project }, n };
+    }
+    const by = new Map();
+    for (const it of live) if (it.project !== view.project) by.set(it.project, (by.get(it.project) || 0) + 1);
+    const [project, n] = [...by].sort((a, b) => b[1] - a[1])[0] || [];
+    return project ? { v: { project }, n } : null;
+  }
+  el.emptyNext.onclick = e => { e.preventDefault(); if (elsewhere) show(elsewhere.v); };
+
   function render() {
     const it = current();
     const has = Boolean(it);
@@ -971,6 +992,16 @@
         : where
           ? `nothing waiting in ${where}`
           : 'shots land here as your agent takes them';
+      // Done here is not done everywhere. Point at the rest instead of moving the reviewer
+      // there: an agent's link landing on an empty view is the proof its work was seen.
+      elsewhere = nextView();
+      el.emptyNext.hidden = !elsewhere;
+      if (elsewhere) {
+        const key = document.createElement('kbd');
+        key.textContent = 'n';
+        el.emptyNext.href = viewPath(elsewhere.v) + (mock ? location.search : '');
+        el.emptyNext.replaceChildren(`${elsewhere.n} waiting in ${elsewhere.v.project} `, key);
+      }
       sidebar();
       return;
     }
@@ -1678,6 +1709,7 @@
         if (isVideo(current())) { el.vid.pause(); el.vid.currentTime = Math.max(0, el.vid.currentTime + (e.key === '.' ? 0.1 : -0.1)); }
         return;
       case 'p': return el.side.classList.toggle('open');
+      case 'n': if (!current() && elsewhere) show(elsewhere.v); return;
     }
     if (/^[1-9]$/.test(k)) {
       const it = current();
