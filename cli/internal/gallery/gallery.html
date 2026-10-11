@@ -836,8 +836,10 @@
 
     const k = e.key;
 
-    if (k === 'g') { gArmed = true; return; }
+    // Disarm first: checking for a bare `g` first re-armed on the second press, so `gg`
+    // never reached the first card.
     if (gArmed) { gArmed = false; if (k === 'g') return go(0); }
+    if (k === 'g') { gArmed = true; return; }
 
     switch (k) {
       case 'j': case 'ArrowDown': case 'ArrowRight': return go(at + 1);
@@ -876,14 +878,31 @@
   /* ---------- mock ---------- */
 
   function mockQueue() {
-    const px = (w, h, bg, bar) =>
+    const svg = (w, h, body) =>
       'data:image/svg+xml;utf8,' + encodeURIComponent(
         // viewBox matters: without one an SVG has no intrinsic aspect ratio and the mock
         // stops being a fair stand-in for a real PNG.
-        `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><rect width="100%" height="100%" fill="${bg}"/>` +
-        `<rect x="24" y="${h - 120}" width="${w - 48}" height="52" rx="8" fill="${bar}"/>` +
-        `<rect x="24" y="60" width="${w * 0.6}" height="18" rx="4" fill="#d4d4d8"/>` +
-        `<rect x="24" y="94" width="${w * 0.4}" height="14" rx="4" fill="#e4e4e7"/></svg>`);
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">${body}</svg>`);
+    const text = (w, ink) =>
+      `<rect x="24" y="60" width="${w * 0.6}" height="18" rx="4" fill="${ink}"/>` +
+      `<rect x="24" y="94" width="${w * 0.4}" height="14" rx="4" fill="${ink}" opacity=".8"/>`;
+    const bar = (w, h, fill) => `<rect x="24" y="${h - 120}" width="${w - 48}" height="52" rx="8" fill="${fill}"/>`;
+    const ink = bg => (bg === '#fafafa' || bg === '#ffffff' ? '#3f3f46' : '#d4d4d8');
+    const px = (w, h, bg, fill) => svg(w, h, `<rect width="100%" height="100%" fill="${bg}"/>${text(w, ink(bg))}${bar(w, h, fill)}`);
+
+    // Drawn the way diff.PNG paints: the shot dimmed to gray for context, changed pixels
+    // red, and rows that exist in only one image amber. A mock diff that is just another
+    // recolored page teaches nothing about what the real one looks like.
+    const diff = (w, h, base) => {
+      const grown = base && base.h < h ? `<rect y="${base.h}" width="${w}" height="${h - base.h}" fill="#fbbf24"/>` : '';
+      return svg(w, h, `<rect width="100%" height="100%" fill="#0d0d0d"/>${text(w, '#4a4a4a')}` +
+        `<rect x="24" y="${h - 120}" width="${w - 48}" height="52" rx="8" fill="#f43f5e"/>${grown}`);
+    };
+
+    // Steps carry thumbnails because the server sends them; without one the filmstrip
+    // shows bare numbers and stops matching what a real flow looks like.
+    const flow = ['#0ea5e9', '#8b5cf6', '#22c55e'].map((c, i) => ({ digest: `d${i + 4}`, thumbUrl: px(900, 560, '#ffffff', c) }));
+
     return [
       // One key shot across three axes, so the mock exercises the chips, the group
       // counter, and `a`. The entries below it keep bare legacy variants on purpose:
@@ -894,56 +913,52 @@
         digest: 'p1', status: 'changed', changedFraction: 0.031,
         shotUrl: px(375, 812, '#18181b', '#22c55e'),
         baselineUrl: px(375, 812, '#18181b', '#6366f1'),
-        diffUrl: px(375, 812, '#1c1917', '#f43f5e') },
+        diffUrl: diff(375, 812) },
       { project: 'shop', branch: 'feat/checkout', key: 'checkout/pay', group: 'shop checkout/pay',
         variant: 'case=declined,flow=payment,scheme=light,vp=mobile',
         dims: { flow: 'payment', case: 'declined', scheme: 'light', vp: 'mobile' },
         digest: 'p2', status: 'changed', changedFraction: 0.029,
         shotUrl: px(375, 812, '#fafafa', '#22c55e'),
         baselineUrl: px(375, 812, '#fafafa', '#6366f1'),
-        diffUrl: px(375, 812, '#fafafa', '#f43f5e') },
+        diffUrl: diff(375, 812) },
       { project: 'shop', branch: 'feat/checkout', key: 'checkout/pay', group: 'shop checkout/pay',
         variant: 'case=declined,flow=payment,scheme=dark,vp=desktop',
         dims: { flow: 'payment', case: 'declined', scheme: 'dark', vp: 'desktop' },
         digest: 'p3', status: 'changed', changedFraction: 0.028,
         shotUrl: px(900, 560, '#18181b', '#22c55e'),
         baselineUrl: px(900, 560, '#18181b', '#6366f1'),
-        diffUrl: px(900, 560, '#1c1917', '#f43f5e') },
-      { project: 'shop', branch: 'feat/checkout', key: 'checkout/empty-cart', variant: 'mobile-dark',
-        group: 'shop checkout/empty-cart',
-        digest: 'a1', status: 'changed', changedFraction: 0.014,
-        shotUrl: px(375, 812, '#18181b', '#3f3f46'),
-        baselineUrl: px(375, 812, '#18181b', '#6366f1'),
-        diffUrl: px(375, 812, '#1c1917', '#f43f5e') },
+        diffUrl: diff(900, 560) },
       // The page grew: the server pads top-left and diffs anyway, and says so beside the
       // percentage. Swipe has to keep both images on one scale for this card to read right.
       { project: 'shop', branch: 'feat/checkout', key: 'orders/list', variant: 'desktop-dark',
         digest: 'g1', status: 'changed', changedFraction: 0.21,
         changes: ['size 900x560 to 900x700', 'url http://localhost:3000/orders?page=1 to http://localhost:3000/orders?page=2'],
         shotUrl: px(900, 700, '#18181b', '#22c55e'),
-        baselineUrl: px(900, 560, '#18181b', '#22c55e'),
-        diffUrl: px(900, 700, '#1c1917', '#fbbf24') },
+        baselineUrl: px(900, 560, '#18181b', '#6366f1'),
+        diffUrl: diff(900, 700, { h: 560 }) },
+      // An element shot (`snap --selector`): small, no viewport around it.
+      { project: 'shop', branch: 'feat/checkout', key: 'orders/card', variant: 'desktop-dark',
+        digest: 'e1', status: 'changed', changedFraction: 0.24,
+        changes: ['size 720x196 to 720x243'],
+        shotUrl: px(720, 243, '#1a1a1f', '#16a34a'),
+        baselineUrl: px(720, 196, '#1a1a1f', '#6366f1'),
+        diffUrl: diff(720, 243, { h: 196 }) },
       { project: 'shop', branch: 'feat/checkout', key: 'settings/danger-zone', variant: 'desktop-light',
         digest: 'b2', status: 'changed', changedFraction: 0.0007,
         shotUrl: px(900, 560, '#fafafa', '#ef4444'),
         baselineUrl: px(900, 560, '#fafafa', '#a1a1aa'),
-        diffUrl: px(900, 560, '#fafafa', '#f43f5e') },
-      { project: 'dashboard', branch: 'main', key: 'billing/plan-picker', variant: 'desktop-dark',
-        digest: 'c3', status: 'changed', incomparable: 'baseline and this shot differ in viewport width 1440 vs 1280. Not comparable.',
-        shotUrl: px(1280, 800, '#0c0a09', '#22c55e'),
-        baselineUrl: px(1440, 900, '#0c0a09', '#22c55e') },
+        diffUrl: diff(900, 560) },
+      // Refused: still shows the baseline under `b`, and offers no swipe or diff.
+      { project: 'dashboard', branch: 'main', key: 'billing/plan-picker', variant: 'desktop',
+        digest: 'c3', status: 'changed', incomparable: 'baseline and this shot differ in scheme "dark" vs "light". Not comparable.',
+        shotUrl: px(1280, 800, '#fafafa', '#22c55e'),
+        baselineUrl: px(1280, 800, '#0c0a09', '#22c55e') },
       { project: 'shop', branch: 'feat/checkout', key: 'checkout/happy-path#1', variant: 'desktop-light',
-        digest: 'd4', status: 'new',
-        shotUrl: px(900, 560, '#ffffff', '#0ea5e9'),
-        steps: [{ digest: 'd4' }, { digest: 'd5' }, { digest: 'd6' }] },
+        digest: 'd4', status: 'new', shotUrl: flow[0].thumbUrl, steps: flow },
       { project: 'shop', branch: 'feat/checkout', key: 'checkout/happy-path#2', variant: 'desktop-light',
-        digest: 'd5', status: 'new',
-        shotUrl: px(900, 560, '#ffffff', '#8b5cf6'),
-        steps: [{ digest: 'd4' }, { digest: 'd5' }, { digest: 'd6' }] },
+        digest: 'd5', status: 'new', shotUrl: flow[1].thumbUrl, steps: flow },
       { project: 'shop', branch: 'feat/checkout', key: 'checkout/happy-path#3', variant: 'desktop-light',
-        digest: 'd6', status: 'new',
-        shotUrl: px(900, 560, '#ffffff', '#22c55e'),
-        steps: [{ digest: 'd4' }, { digest: 'd5' }, { digest: 'd6' }] },
+        digest: 'd6', status: 'new', shotUrl: flow[2].thumbUrl, steps: flow },
     ];
   }
 
