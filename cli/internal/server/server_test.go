@@ -1,16 +1,110 @@
 package server
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"image"
+	"image/color"
+	"image/png"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"vision/internal/diff"
 	"vision/internal/store"
 )
+
+func TestSnapDiffSurvivesHeightAndURLDrift(t *testing.T) {
+	encode := func(height int, changed bool) []byte {
+		im := image.NewRGBA(image.Rect(0, 0, 2, height))
+		if changed {
+			im.SetRGBA(0, 0, color.RGBA{R: 1, A: 255})
+		}
+		var b bytes.Buffer
+		if err := png.Encode(&b, im); err != nil {
+			t.Fatal(err)
+		}
+		return b.Bytes()
+	}
+	for _, tc := range []struct {
+		name       string
+		baseHeight int
+		height     int
+		url        string
+		want       []string
+		fraction   float64
+	}{
+		{"height grows", 1, 2, "http://x", []string{"size 2x1 to 2x2"}, .75},
+		{"height shrinks", 2, 1, "http://x", []string{"size 2x2 to 2x1"}, .75},
+		{"url drifts", 2, 2, "http://y", []string{"url http://x to http://y"}, .25},
+		{"height and url drift", 1, 2, "http://y", []string{"size 2x1 to 2x2", "url http://x to http://y"}, .75},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("VISION_STATE_HOME", t.TempDir())
+			id := strings.Repeat("a", 64)
+			basePNG := encode(tc.baseHeight, false)
+			base := store.Snap{SchemaVersion: 1, TS: time.Now(), Project: "shop", Key: "checkout/cart", Variant: "default", Digest: diff.Digest(basePNG), Conditions: store.Conditions{Width: 2, Height: tc.baseHeight, DPR: 1, URL: "http://x", Scheme: "dark"}}
+			if err := store.AppendSnap(id, base, basePNG); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.AppendNote(id, store.Note{SchemaVersion: 1, TS: time.Now(), Key: base.Key, Variant: base.Variant, Digest: base.Digest, Verdict: "ok"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CopyBaseline(id, base.Key, base.Variant, base.Digest); err != nil {
+				t.Fatal(err)
+			}
+			conditions := base.Conditions
+			conditions.Height, conditions.URL = tc.height, tc.url
+			body, err := json.Marshal(SnapRequest{Project: store.Project{ID: id, Name: "shop"}, Key: base.Key, Variant: base.Variant, Capture: conditions, PNG: base64.StdEncoding.EncodeToString(encode(tc.height, true))})
+			if err != nil {
+				t.Fatal(err)
+			}
+			handler := New().Handler()
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/snap", bytes.NewReader(body)))
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("snap: status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			var response struct {
+				Queued bool `json:"queued"`
+				Item   Item `json:"item"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			items, err := Queue()
+			if err != nil || len(items) != 1 {
+				t.Fatalf("queue: got %d items err=%v, want 1", len(items), err)
+			}
+			if !response.Queued {
+				t.Fatal("changed shot was not queued")
+			}
+			for _, item := range []Item{response.Item, items[0]} {
+				if item.Status != "changed" || item.DiffURL == "" || item.Incomparable != "" || !slices.Equal(item.Changes, tc.want) || item.ChangedFraction != tc.fraction {
+					t.Fatalf("comparison: got %+v, want changes %v and fraction %v", item, tc.want, tc.fraction)
+				}
+			}
+			rec = httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, response.Item.DiffURL, nil))
+			if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "image/png" {
+				t.Fatalf("diff media: status=%d type=%q", rec.Code, rec.Header().Get("Content-Type"))
+			}
+			im, err := png.Decode(rec.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if im.Bounds() != image.Rect(0, 0, 2, 2) {
+				t.Fatalf("diff media bounds: got %v, want 2x2", im.Bounds())
+			}
+		})
+	}
+}
 
 // PendingCount is the cheap stand-in for Queue that a status line polls, so the number it
 // reports has to be the number the human will actually see. A badge that says 3 over an

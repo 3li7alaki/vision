@@ -17,26 +17,61 @@ func Digest(data []byte) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-// Comparable refuses a diff when two shots were not taken under the same conditions.
-// It names the field that actually differs: the whole struct decides, so reporting only
-// the geometry made a scheme or URL mismatch read as "1536x721 @1x, 1536x721 @1x. Not
-// comparable.", which looks like a bug in the tool rather than a light shot held against
-// a dark baseline.
+// Comparable refuses a diff only when the two shots cannot be laid over each other: a
+// different viewport width reflows the page, a different pixel ratio rescales it, a
+// different scheme repaints it, and an element shot is not the viewport around it. It
+// names each field that differs, because "Not comparable" with no reason reads as a bug
+// in the tool rather than a light shot held against a dark baseline.
+//
+// Height and URL do not refuse. Viewport height drifts with browser chrome, and the same
+// screen lives at many URLs (ids, query strings, ports); refusing on those left half of
+// all real re-snaps with no diff at all. PNG pads the size difference top-left the way
+// Argos and Playwright do, and Changes says what drifted beside the percentage.
+//
+// An unknown scheme refuses even against another unknown: two failed evals can hide a
+// dark shot and a light one, and that is exactly the fake diff this guard exists to stop.
+// It costs little, 9 of the first 738 real snaps had no scheme.
 func Comparable(a, b store.Conditions) error {
-	if a == b {
-		return nil
-	}
 	var reasons []string
-	if a.Width != b.Width || a.Height != b.Height || a.DPR != b.DPR {
-		reasons = append(reasons, fmt.Sprintf("size %dx%d @%gx vs %dx%d @%gx", a.Width, a.Height, a.DPR, b.Width, b.Height, b.DPR))
+	if a.Width != b.Width {
+		reasons = append(reasons, fmt.Sprintf("viewport width %d vs %d", a.Width, b.Width))
 	}
-	if a.URL != b.URL {
-		reasons = append(reasons, fmt.Sprintf("url %q vs %q", a.URL, b.URL))
+	if a.DPR != b.DPR {
+		reasons = append(reasons, fmt.Sprintf("pixel ratio %g vs %g", a.DPR, b.DPR))
 	}
-	if a.Scheme != b.Scheme {
+	if a.Scheme != b.Scheme || a.Scheme == "" || b.Scheme == "" {
 		reasons = append(reasons, fmt.Sprintf("scheme %q vs %q", a.Scheme, b.Scheme))
 	}
+	if a.Selector != b.Selector {
+		old, cur := "whole viewport", "whole viewport"
+		if a.Selector != "" {
+			old = fmt.Sprintf("element %q", a.Selector)
+		}
+		if b.Selector != "" {
+			cur = fmt.Sprintf("element %q", b.Selector)
+		}
+		reasons = append(reasons, old+" vs "+cur)
+	}
+	if len(reasons) == 0 {
+		return nil
+	}
 	return fmt.Errorf("baseline and this shot differ in %s. Not comparable.", strings.Join(reasons, ", "))
+}
+
+// Changes labels what drifted without blocking the diff, so "4% changed" from 140 new
+// rows of page is not mistaken for 4% of a fixed viewport. It reads PNG headers only: a
+// corrupt image is PNG's error to report, not a label's.
+func Changes(base, shot store.Conditions, basePNG, shotPNG []byte) []string {
+	var changes []string
+	old, oldErr := png.DecodeConfig(bytes.NewReader(basePNG))
+	cur, curErr := png.DecodeConfig(bytes.NewReader(shotPNG))
+	if oldErr == nil && curErr == nil && (old.Width != cur.Width || old.Height != cur.Height) {
+		changes = append(changes, fmt.Sprintf("size %dx%d to %dx%d", old.Width, old.Height, cur.Width, cur.Height))
+	}
+	if base.URL != shot.URL {
+		changes = append(changes, fmt.Sprintf("url %s to %s", base.URL, shot.URL))
+	}
+	return changes
 }
 
 func PNG(a, b []byte) ([]byte, float64, error) {
@@ -48,13 +83,18 @@ func PNG(a, b []byte) ([]byte, float64, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	if old.Bounds() != cur.Bounds() {
-		return nil, 0, fmt.Errorf("image dimensions differ: %v and %v", old.Bounds(), cur.Bounds())
-	}
-	out := image.NewRGBA(cur.Bounds())
+	oldBounds, curBounds := old.Bounds(), cur.Bounds()
+	out := image.NewRGBA(image.Rect(0, 0, max(oldBounds.Dx(), curBounds.Dx()), max(oldBounds.Dy(), curBounds.Dy())))
 	changed := 0
-	for y := cur.Bounds().Min.Y; y < cur.Bounds().Max.Y; y++ {
-		for x := cur.Bounds().Min.X; x < cur.Bounds().Max.X; x++ {
+	for y := 0; y < out.Bounds().Max.Y; y++ {
+		for x := 0; x < out.Bounds().Max.X; x++ {
+			// Missing pixels mark growth or shrinkage even when the other image is transparent.
+			p := image.Pt(x, y)
+			if p.In(oldBounds) != p.In(curBounds) {
+				changed++
+				out.SetRGBA(x, y, color.RGBA{R: 251, G: 191, B: 36, A: 255})
+				continue
+			}
 			ca, cb := color.RGBAModel.Convert(old.At(x, y)).(color.RGBA), color.RGBAModel.Convert(cur.At(x, y)).(color.RGBA)
 			if ca != cb {
 				changed++
@@ -69,6 +109,6 @@ func PNG(a, b []byte) ([]byte, float64, error) {
 	if err := png.Encode(&encoded, out); err != nil {
 		return nil, 0, err
 	}
-	total := cur.Bounds().Dx() * cur.Bounds().Dy()
+	total := out.Bounds().Dx() * out.Bounds().Dy()
 	return encoded.Bytes(), float64(changed) / float64(total), nil
 }

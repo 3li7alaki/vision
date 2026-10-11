@@ -62,6 +62,7 @@ type Item struct {
 	Status          string            `json:"status"`
 	ChangedFraction float64           `json:"changedFraction,omitempty"`
 	Incomparable    string            `json:"incomparable,omitempty"`
+	Changes         []string          `json:"changes,omitempty"`
 	ShotURL         string            `json:"shotUrl"`
 	BaselineURL     string            `json:"baselineUrl,omitempty"`
 	DiffURL         string            `json:"diffUrl,omitempty"`
@@ -389,6 +390,11 @@ func makeItem(project, name string, snap store.Snap) (Item, bool, error) {
 	if err != nil {
 		item.Incomparable = err.Error()
 		return item, true, nil
+	}
+	if ok {
+		item.Changes = diff.Changes(baseSnap.Conditions, snap.Conditions, b, shot)
+	} else {
+		item.Changes = diff.Changes(store.Conditions{}, store.Conditions{}, b, shot)
 	}
 	item.ChangedFraction = fraction
 	item.DiffURL = mediaURL("diff", project, snap.Digest) + query
