@@ -17,6 +17,7 @@ import (
 	"time"
 	"vision/internal/diff"
 	"vision/internal/gallery"
+	"vision/internal/icon"
 	"vision/internal/store"
 )
 
@@ -53,6 +54,7 @@ type Item struct {
 	Project         string            `json:"project"`
 	ProjectID       string            `json:"projectId"`
 	Branch          string            `json:"branch"`
+	Thread          string            `json:"thread,omitempty"`
 	Key             string            `json:"key"`
 	Variant         string            `json:"variant"`
 	Dims            map[string]string `json:"dims,omitempty"`
@@ -66,7 +68,7 @@ type Item struct {
 	ShotURL         string            `json:"shotUrl"`
 	BaselineURL     string            `json:"baselineUrl,omitempty"`
 	DiffURL         string            `json:"diffUrl,omitempty"`
-	TS              time.Time         `json:"-"`
+	TS              time.Time         `json:"ts"`
 	Steps           []Step            `json:"steps,omitempty"`
 }
 
@@ -84,12 +86,16 @@ func New() *Server { return &Server{clients: make(map[chan Item]struct{})} }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /", s.gallery)
+	mux.HandleFunc("GET /{$}", s.gallery)
+	mux.HandleFunc("GET /p/{project}", s.gallery)
+	mux.HandleFunc("GET /p/{project}/b/{branch...}", s.gallery)
+	mux.HandleFunc("GET /p/{project}/t/{thread}", s.gallery)
 	mux.HandleFunc("GET /health", s.health)
 	mux.HandleFunc("GET /api/queue", s.queue)
 	mux.HandleFunc("POST /api/snap", s.snap)
 	mux.HandleFunc("POST /api/verdict", s.verdict)
 	mux.HandleFunc("GET /media/{kind}/{project}/{digest}", s.media)
+	mux.HandleFunc("GET /media/icon/{project}", s.projectIcon)
 	mux.HandleFunc("GET /events", s.events)
 	return mux
 }
@@ -124,11 +130,7 @@ func (s *Server) ListenAndServe() error {
 	return http.ListenAndServe(Address, s.Handler())
 }
 
-func (s *Server) gallery(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
+func (s *Server) gallery(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write(gallery.HTML)
 }
@@ -360,7 +362,7 @@ func makeItem(project, name string, snap store.Snap) (Item, bool, error) {
 	// the two are identical by construction. The variant is what actually chose the baseline
 	// this shot is measured against, so anything else on screen would let a reviewer read one
 	// set of dimensions while the comparison used another.
-	item := Item{Project: name, ProjectID: project, Branch: snap.Branch, Key: snap.Key, Variant: snap.Variant, Dims: store.DecodeVariant(snap.Variant), Meta: snap.Meta, Group: project + "/" + snap.Key, Digest: snap.Digest, Status: "new", ShotURL: mediaURL("shot", project, snap.Digest), TS: snap.TS}
+	item := Item{Project: name, ProjectID: project, Branch: snap.Branch, Thread: snap.ThreadID(), Key: snap.Key, Variant: snap.Variant, Dims: store.DecodeVariant(snap.Variant), Meta: snap.Meta, Group: project + "/" + snap.Key, Digest: snap.Digest, Status: "new", ShotURL: mediaURL("shot", project, snap.Digest), TS: snap.TS}
 	baseline, _ := store.BaselinePath(project, snap.Key, snap.Variant)
 	b, err := os.ReadFile(baseline)
 	if errors.Is(err, os.ErrNotExist) {
@@ -427,6 +429,73 @@ func attachSteps(items []Item) {
 			}
 		}
 	}
+}
+
+func (s *Server) projectIcon(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "max-age=300")
+	// SVGs can also be opened as documents, so sandbox them on the gallery's origin.
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox")
+	project := r.PathValue("project")
+	if !projectIDPattern.MatchString(project) {
+		http.NotFound(w, r)
+		return
+	}
+	snaps, err := store.Snaps(project)
+	if err != nil || len(snaps) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	sort.SliceStable(snaps, func(i, j int) bool { return snaps[i].TS.After(snaps[j].TS) })
+	name := ""
+	var worktrees []string
+	seen := make(map[string]bool)
+	for _, snap := range snaps {
+		if name == "" && snap.Project != "" {
+			name = snap.Project
+		}
+		if snap.Worktree != "" && !seen[snap.Worktree] {
+			seen[snap.Worktree] = true
+			worktrees = append(worktrees, snap.Worktree)
+		}
+	}
+	if name == "" {
+		http.NotFound(w, r)
+		return
+	}
+	path, err := icon.Resolve(name, worktrees)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "vision: project icon:", err)
+	}
+	contentType := ""
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".svg":
+		contentType = "image/svg+xml"
+	case ".ico":
+		contentType = "image/x-icon"
+	case ".png":
+		contentType = "image/png"
+	case ".jpg", ".jpeg":
+		contentType = "image/jpeg"
+	case ".webp":
+		contentType = "image/webp"
+	default:
+		http.NotFound(w, r)
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
+	http.ServeContent(w, r, info.Name(), info.ModTime(), f)
 }
 
 func (s *Server) media(w http.ResponseWriter, r *http.Request) {

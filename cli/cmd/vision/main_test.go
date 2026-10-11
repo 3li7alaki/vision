@@ -21,6 +21,22 @@ import (
 	"vision/internal/store"
 )
 
+func TestViewURL(t *testing.T) {
+	for _, tc := range []struct {
+		project, thread, want string
+	}{
+		{"", "", galleryURL},
+		{"shop", "", galleryURL + "/p/shop"},
+		{"shop", "abc", galleryURL + "/p/shop/t/abc"},
+		{"odd/project name", "a/b c", galleryURL + "/p/odd%2Fproject%20name/t/a%2Fb%20c"},
+		{"shop", "a?#%", galleryURL + "/p/shop/t/a%3F%23%25"},
+	} {
+		if got := viewURL(tc.project, tc.thread); got != tc.want {
+			t.Errorf("viewURL(%q, %q) = %q, want %q", tc.project, tc.thread, got, tc.want)
+		}
+	}
+}
+
 func TestMainHelp(t *testing.T) {
 	bin := buildBin(t)
 	for _, spelling := range []string{"-h", "--help", "help"} {
@@ -184,6 +200,13 @@ func TestSelectorValidation(t *testing.T) {
 func TestSnapChecksViewportBeforePosting(t *testing.T) {
 	t.Setenv("VISION_STATE_HOME", t.TempDir())
 	t.Setenv("VISION_SESSION_ID", "snap-test")
+	project, err := store.Identify(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.JoinThread(project.ID, "snap-test", "a/b c"); err != nil {
+		t.Fatal(err)
+	}
 	dir := t.TempDir()
 	var data bytes.Buffer
 	if err := png.Encode(&data, image.NewRGBA(image.Rect(0, 0, 1440, 900))); err != nil {
@@ -208,27 +231,44 @@ func TestSnapChecksViewportBeforePosting(t *testing.T) {
 		{[]string{"--dim", "vp=mobile"}, false},
 		{[]string{"--as", "mobile-dark", "--selector", "footer"}, false},
 		{[]string{"--dim", "flow=payment", "--selector", "footer"}, true},
+		{[]string{"--dim", "flow=payment", "--selector", "footer", "--json"}, true},
 	} {
 		posts := 0
 		http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			body := `{}`
 			if r.Method == http.MethodPost {
 				posts++
 				var req server.SnapRequest
 				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 					t.Fatal(err)
 				}
-				if req.Dims["vp"] != "desktop" || req.Capture.Selector != "footer" {
+				if req.Dims["vp"] != "desktop" || req.Capture.Selector != "footer" || req.Thread != "a/b c" {
 					t.Errorf("lost derived viewport or selector: %#v", req)
 				}
+				body = `{"schemaVersion":1,"digest":"sha256:test","queued":true}`
 			}
-			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{}`)), Header: make(http.Header)}, nil
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
 		})
-		_, err := commandOutput(t, func() error { return snap(append([]string{"capture/footer"}, tc.args...)) })
+		out, err := commandOutput(t, func() error { return snap(append([]string{"capture/footer"}, tc.args...)) })
 		if (posts == 1) != tc.wantPost || (err == nil) != tc.wantPost {
 			t.Fatalf("snap %v: posts=%d err=%v", tc.args, posts, err)
 		}
 		if !tc.wantPost && !strings.Contains(err.Error(), "variant says mobile") {
 			t.Fatalf("snap failed before the mismatch check: %v", err)
+		}
+		if tc.wantPost {
+			want := galleryURL + "/p/" + project.Name + "/t/a%2Fb%20c"
+			if slices.Contains(tc.args, "--json") {
+				var result map[string]any
+				if err := json.Unmarshal([]byte(out), &result); err != nil {
+					t.Fatal(err)
+				}
+				if result["url"] != want || result["digest"] != "sha256:test" || result["queued"] != true {
+					t.Errorf("snap JSON lost result fields or thread URL: %s", out)
+				}
+			} else if !strings.HasPrefix(out, "queued capture/footer@") || !strings.HasSuffix(out, "\n"+want+"\n") {
+				t.Errorf("queued snap lost thread URL: %q", out)
+			}
 		}
 	}
 }
@@ -339,6 +379,12 @@ func TestStatusSession(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if _, err := store.JoinThread(project.ID, "mine", "a/b c"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendSnap(project.ID, store.Snap{Digest: "thread", Session: "mine", Thread: "a/b c"}, nil); err != nil {
+		t.Fatal(err)
+	}
 	original := http.DefaultTransport
 	t.Cleanup(func() { http.DefaultTransport = original })
 	for _, running := range []bool{true, false} {
@@ -359,6 +405,7 @@ func TestStatusSession(t *testing.T) {
 		var result struct {
 			Running             bool
 			Session             string
+			URL                 string
 			Pending, PendingAll int
 		}
 		if err := json.Unmarshal([]byte(out), &result); err != nil {
@@ -374,6 +421,46 @@ func TestStatusSession(t *testing.T) {
 		if result.Session != "mine" || result.Running != running || result.Pending != want {
 			t.Errorf("unexpected status: %s", out)
 		}
+		if want := galleryURL + "/p/" + project.Name + "/t/a%2Fb%20c"; result.URL != want {
+			t.Errorf("status url=%q, want %q", result.URL, want)
+		}
+	}
+}
+
+func TestStatusProjectAndGlobalURLs(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	project, err := store.Identify(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = original })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"pending":0}`)), Header: make(http.Header)}, nil
+	})
+	for _, tc := range []struct {
+		name, dir, want string
+	}{
+		{"project", "", galleryURL + "/p/" + project.Name},
+		{"outside project", t.TempDir(), galleryURL},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.dir != "" {
+				t.Chdir(tc.dir)
+			}
+			out, err := commandOutput(t, func() error { return status([]string{"--json"}) })
+			if err != nil {
+				t.Fatal(err)
+			}
+			var result struct{ URL string }
+			if err := json.Unmarshal([]byte(out), &result); err != nil || result.URL != tc.want {
+				t.Fatalf("status JSON: %s err=%v, want url %q", out, err, tc.want)
+			}
+			out, err = commandOutput(t, func() error { return status(nil) })
+			if err != nil || out != "vision on at "+tc.want+"\n" {
+				t.Fatalf("status output=%q err=%v", out, err)
+			}
+		})
 	}
 }
 

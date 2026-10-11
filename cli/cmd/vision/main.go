@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,6 +24,18 @@ import (
 )
 
 const endpoint = "http://127.0.0.1:4747"
+const galleryURL = "http://vision.test:4747"
+
+func viewURL(project, thread string) string {
+	if project == "" {
+		return galleryURL
+	}
+	view := galleryURL + "/p/" + url.PathEscape(project)
+	if thread != "" {
+		view += "/t/" + url.PathEscape(thread)
+	}
+	return view
+}
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -317,6 +330,7 @@ func snap(args []string) error {
 	if err := post("/api/snap", req, &result); err != nil {
 		return err
 	}
+	result["url"] = viewURL(project.Name, thread)
 	if *asJSON {
 		return printJSON(result)
 	}
@@ -326,6 +340,7 @@ func snap(args []string) error {
 	queued, _ := result["queued"].(bool)
 	if queued {
 		fmt.Printf("queued %s@%s\n", key, *variant)
+		fmt.Println(viewURL(project.Name, thread))
 	} else {
 		fmt.Printf("archived unchanged %s@%s\n", key, *variant)
 	}
@@ -447,7 +462,7 @@ func on(args []string) error {
 		return err
 	}
 	if asJSON {
-		out := map[string]any{"schemaVersion": 1, "running": true, "url": "http://vision.test:4747"}
+		out := map[string]any{"schemaVersion": 1, "running": true, "url": galleryURL}
 		if warning != "" {
 			out["warning"] = warning
 		}
@@ -456,7 +471,7 @@ func on(args []string) error {
 	if warning != "" {
 		fmt.Fprintln(os.Stderr, "vision:", warning)
 	}
-	fmt.Println("vision on at http://vision.test:4747")
+	fmt.Println("vision on at", galleryURL)
 	return nil
 }
 
@@ -484,15 +499,20 @@ func status(args []string) error {
 		return usage()
 	}
 	openFlags := 0
+	view := galleryURL
+	project, projectErr := store.Identify(".")
+	if projectErr == nil {
+		view = viewURL(project.Name, "")
+	}
 	if *session != "" {
-		project, err := store.Identify(".")
-		if err != nil {
-			return err
+		if projectErr != nil {
+			return projectErr
 		}
 		thread, err := store.ActiveThreadFor(project.ID, *session)
 		if err != nil {
 			return err
 		}
+		view = viewURL(project.Name, thread)
 		flags, err := store.OpenFlags(project.ID, thread)
 		if err != nil {
 			return err
@@ -505,7 +525,7 @@ func status(args []string) error {
 	resp, err := client.Get(endpoint + "/health")
 	if err != nil {
 		if *asJSON {
-			out := map[string]any{"schemaVersion": 1, "running": false, "pending": 0}
+			out := map[string]any{"schemaVersion": 1, "running": false, "pending": 0, "url": view}
 			if *session != "" {
 				out["session"] = *session
 				out["openFlags"] = openFlags
@@ -513,7 +533,7 @@ func status(args []string) error {
 			_ = printJSON(out)
 			return errors.New("daemon unavailable, run `vision on`")
 		}
-		fmt.Println("vision off")
+		fmt.Println("vision off at", view)
 		return errors.New("daemon unavailable, run `vision on`")
 	}
 	defer resp.Body.Close()
@@ -528,18 +548,15 @@ func status(args []string) error {
 	// is that project's count and the daemon-wide figure moves to `pendingAll`; outside one
 	// there is nothing to scope to, so `pending` stays the daemon-wide total.
 	pending, scope := health.Pending, ""
-	if project, err := store.Identify("."); err == nil {
+	if projectErr == nil {
 		if n, err := server.PendingCountForSession(project.ID, *session); err == nil {
 			pending, scope = n, project.Name
 		} else if *session != "" {
 			return err
 		}
-	} else if *session != "" {
-		// A requested session scope must never silently fall back to everybody's count.
-		return err
 	}
 	if *asJSON {
-		out := map[string]any{"schemaVersion": 1, "running": true, "pending": pending, "pendingAll": health.Pending, "url": "http://vision.test:4747"}
+		out := map[string]any{"schemaVersion": 1, "running": true, "pending": pending, "pendingAll": health.Pending, "url": view}
 		if *session != "" {
 			out["session"] = *session
 			out["openFlags"] = openFlags
@@ -551,11 +568,11 @@ func status(args []string) error {
 	}
 	switch {
 	case pending > 0 && scope != "":
-		fmt.Printf("vision on at http://vision.test:4747, %d pending in %s\n", pending, scope)
+		fmt.Printf("vision on at %s, %d pending in %s\n", view, pending, scope)
 	case pending > 0:
-		fmt.Printf("vision on at http://vision.test:4747, %d pending\n", pending)
+		fmt.Printf("vision on at %s, %d pending\n", view, pending)
 	default:
-		fmt.Println("vision on at http://vision.test:4747")
+		fmt.Println("vision on at", view)
 	}
 	return nil
 }

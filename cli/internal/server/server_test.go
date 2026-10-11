@@ -17,8 +17,104 @@ import (
 	"time"
 
 	"vision/internal/diff"
+	"vision/internal/gallery"
 	"vision/internal/store"
 )
+
+func TestGalleryRoutes(t *testing.T) {
+	handler := New().Handler()
+	for _, path := range []string{"/", "/p/x", "/p/x/b/feat/a", "/p/x/t/abc", "/p/odd%20project/t/a%2Fb%20c"} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), gallery.HTML) {
+			t.Errorf("GET %s: status=%d, want embedded gallery", path, rec.Code)
+		}
+	}
+	for _, path := range []string{"/nope", "/p/x/nope", "/p/x/t/abc/extra"} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("GET %s: status=%d, want 404", path, rec.Code)
+		}
+	}
+}
+
+func TestProjectIcon(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	dir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "vision")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	svg := `<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>`
+	if err := os.WriteFile(filepath.Join(dir, "shop.svg"), []byte(svg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "private.txt"), []byte("private"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config := `{"projects":{"shop":{"logo":"shop.svg"},"unsupported":{"logo":"private.txt"}}}`
+	if err := os.WriteFile(filepath.Join(dir, "projects.json"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	id, noIcon, unsupported := strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64)
+	for project, name := range map[string]string{id: "shop", noIcon: "no-icon-" + t.Name(), unsupported: "unsupported"} {
+		if err := store.AppendSnap(project, store.Snap{Project: name, TS: time.Now(), Digest: project}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	handler := New().Handler()
+	for _, tc := range []struct {
+		id     string
+		status int
+	}{
+		{id, http.StatusOK}, {"bad-id", http.StatusNotFound}, {noIcon, http.StatusNotFound},
+		{strings.Repeat("d", 64), http.StatusNotFound}, {unsupported, http.StatusNotFound},
+	} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/media/icon/"+tc.id, nil))
+		if rec.Code != tc.status {
+			t.Errorf("icon %s: status=%d, want %d", tc.id, rec.Code, tc.status)
+		}
+		if rec.Header().Get("X-Content-Type-Options") != "nosniff" || rec.Header().Get("Cache-Control") != "max-age=300" || rec.Header().Get("Content-Security-Policy") != "default-src 'none'; style-src 'unsafe-inline'; sandbox" {
+			t.Errorf("icon headers: %v", rec.Header())
+		}
+		if tc.status == http.StatusOK && (rec.Header().Get("Content-Type") != "image/svg+xml" || rec.Body.String() != svg) {
+			t.Errorf("svg response: type=%q body=%q", rec.Header().Get("Content-Type"), rec.Body.String())
+		}
+	}
+}
+
+func TestQueueItemThreadAndTimestamp(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	id := strings.Repeat("a", 64)
+	now := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
+	for i, snap := range []store.Snap{
+		{Session: "successor", Thread: "predecessor"}, {Session: "legacy"}, {},
+	} {
+		snap.Project, snap.Key, snap.Variant, snap.TS = "shop", "cart/empty", "default", now
+		snap.Digest = "sha256:" + strings.Repeat(string(rune('b'+i)), 64)
+		if err := store.AppendSnap(id, snap, []byte(snap.Digest)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec := httptest.NewRecorder()
+	New().Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/queue", nil))
+	var items []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &items); err != nil || rec.Code != http.StatusOK || len(items) != 3 {
+		t.Fatalf("queue: status=%d body=%s err=%v", rec.Code, rec.Body.String(), err)
+	}
+	for i, item := range items {
+		if item["ts"] != now.Format(time.RFC3339) {
+			t.Errorf("item %d ts=%v", i, item["ts"])
+		}
+		want := []string{"predecessor", "legacy", ""}[i]
+		thread, present := item["thread"]
+		if (want == "" && present) || (want != "" && thread != want) {
+			t.Errorf("item %d thread=%v, want %q", i, thread, want)
+		}
+	}
+}
 
 func TestSnapDiffSurvivesHeightAndURLDrift(t *testing.T) {
 	encode := func(height int, changed bool) []byte {
