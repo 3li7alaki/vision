@@ -325,7 +325,7 @@ func snap(args []string) error {
 			return err
 		}
 	}
-	req := server.SnapRequest{Project: project, Key: key, Variant: *variant, Dims: dims, Meta: meta, Note: *note, Session: id, Thread: thread, PNG: base64.StdEncoding.EncodeToString(shot.PNG), Capture: shot.Conditions}
+	req := server.SnapRequest{Project: project, Key: key, Variant: *variant, Dims: dims, Meta: meta, Note: *note, Session: id, Thread: thread, PNG: base64.StdEncoding.EncodeToString(shot.PNG), Capture: shot.Conditions, Elements: shot.Elements}
 	var result map[string]any
 	if err := post("/api/snap", req, &result); err != nil {
 		return err
@@ -419,7 +419,7 @@ func notes(args []string) error {
 	for _, n := range values {
 		fmt.Printf("%s %s@%s: %s", n.Verdict, n.Key, n.Variant, n.Digest)
 		if n.Note != "" {
-			fmt.Printf(" %s", n.Note)
+			fmt.Printf(" %s", strings.ReplaceAll(n.Note, "\n", "\n    "))
 		}
 		fmt.Println()
 	}

@@ -19,6 +19,7 @@ type Result struct {
 	PNG        []byte
 	Conditions store.Conditions
 	Raw        map[string]any
+	Elements   []store.Element
 }
 
 // pinchtab prefixes an argument list with the server this process was told to talk to.
@@ -38,7 +39,9 @@ func pinchtab(args ...string) []string {
 }
 
 func captureArgs(path, selector string) []string {
-	args := []string{"capture", "--json", "--beyond-viewport", "-o", path, "--format", "png"}
+	// The paired snapshot comes from the same DOM epoch as the image; a separate snapshot
+	// call could describe a different moment.
+	args := []string{"capture", "--json", "--beyond-viewport", "-o", path, "--format", "png", "--filter", "all"}
 	if selector != "" {
 		args = append(args, "-s", selector)
 	}
@@ -87,7 +90,45 @@ func Take(ctx context.Context, selector string) (Result, error) {
 	if c.Scheme == "" {
 		c.Scheme = scheme(ctx, text(raw["tabId"]))
 	}
-	return Result{PNG: pngData, Conditions: c, Raw: raw}, nil
+	return Result{PNG: pngData, Conditions: c, Raw: raw, Elements: elements(raw)}, nil
+}
+
+// Document boxes need the crop's scroll offset, while PinchTab already makes clip boxes
+// relative to the image. Keeping CSS pixels preserves fractional boxes until DPR scaling.
+func elements(raw map[string]any) []store.Element {
+	image := object(raw, "image")
+	viewport := object(image, "viewport")
+	bounds := viewport
+	var offsetX, offsetY float64
+	switch text(image["coordinateSpace"]) {
+	case "document":
+		offsetX, offsetY = number(viewport["scrollX"]), number(viewport["scrollY"])
+	case "clip":
+		bounds = object(image, "clip")
+	}
+	width := number(first(bounds["w"], bounds["width"]))
+	height := number(first(bounds["h"], bounds["height"]))
+	if width <= 0 || height <= 0 {
+		return nil
+	}
+	nodes, _ := object(raw, "snapshot")["nodes"].([]any)
+	var out []store.Element
+	for _, value := range nodes {
+		node, _ := value.(map[string]any)
+		box := object(node, "boundingBox")
+		w, h := number(box["w"]), number(box["h"])
+		role, name := text(node["role"]), strings.TrimSpace(text(node["name"]))
+		// Text runs repeat their parent's name and would beat the control in a smallest-box lookup.
+		if !(w > 0 && h > 0) || node["visible"] == false || role == "StaticText" || role == "InlineTextBox" || name == "" {
+			continue
+		}
+		x, y := number(box["x"])-offsetX, number(box["y"])-offsetY
+		if !(x < width && y < height && x+w > 0 && y+h > 0) {
+			continue
+		}
+		out = append(out, store.Element{Role: role, Name: name, Depth: integer(node["depth"]), X: x, Y: y, W: w, H: h})
+	}
+	return out
 }
 
 // PinchTab clips element shots itself, so viewport cropping would discard the element or

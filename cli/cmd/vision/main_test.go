@@ -364,6 +364,28 @@ func TestNotesSessionFilters(t *testing.T) {
 	}
 }
 
+// Indented continuation lines keep region annotations inside their verdict's visual block.
+func TestNotesIndentContinuationLines(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	project, err := store.Identify(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, note := range []store.Note{
+		{Key: "checkout/cart", Variant: "default", Digest: "sha256:cccc", Verdict: "flag", Note: "Review this\n[1] question at 12,40: final copy?\n    Keep this line together"},
+		{Key: "checkout/done", Variant: "default", Digest: "sha256:dddd", Verdict: "ok"},
+	} {
+		if err := store.AppendNote(project.ID, note); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := commandOutput(t, func() error { return notes(nil) })
+	want := "flag checkout/cart@default: sha256:cccc Review this\n    [1] question at 12,40: final copy?\n        Keep this line together\nok checkout/done@default: sha256:dddd\n"
+	if err != nil || out != want {
+		t.Fatalf("notes output=%q err=%v, want %q", out, err, want)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

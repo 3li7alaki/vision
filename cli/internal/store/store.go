@@ -67,6 +67,31 @@ type Snap struct {
 	Conditions    Conditions        `json:"conditions"`
 }
 
+// Element is one accessibility node of a shot, in CSS pixels relative to the stored
+// image's top-left corner. Multiply by the snap's Conditions.DPR to get image pixels.
+type Element struct {
+	Role  string  `json:"role"`
+	Name  string  `json:"name"`
+	Depth int     `json:"depth"`
+	X     float64 `json:"x"`
+	Y     float64 `json:"y"`
+	W     float64 `json:"w"`
+	H     float64 `json:"h"`
+}
+
+// Region is one mark a human drew on a shot in the gallery, in image pixels. Element is
+// filled by the daemon, never trusted from the client.
+type Region struct {
+	X       int    `json:"x"`
+	Y       int    `json:"y"`
+	W       int    `json:"w"`
+	H       int    `json:"h"`
+	Tone    string `json:"tone"`
+	Text    string `json:"text"`
+	Flow    bool   `json:"flow,omitempty"`
+	Element string `json:"element,omitempty"`
+}
+
 type Note struct {
 	SchemaVersion int       `json:"schemaVersion"`
 	TS            time.Time `json:"ts"`
@@ -75,6 +100,7 @@ type Note struct {
 	Digest        string    `json:"digest"`
 	Verdict       string    `json:"verdict"`
 	Note          string    `json:"note,omitempty"`
+	Regions       []Region  `json:"regions,omitempty"`
 }
 
 type Project struct {
@@ -269,6 +295,14 @@ func ShotPath(project, digest string) (string, error) {
 	return filepath.Join(dir, "shots", strings.TrimPrefix(digest, "sha256:")+".png"), nil
 }
 
+func ElementsPath(project, digest string) (string, error) {
+	path, err := ShotPath(project, digest)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(path, ".png") + ".json", nil
+}
+
 func BaselinePath(project, key, variant string) (string, error) {
 	dir, err := ProjectDir(project)
 	if err != nil {
@@ -311,6 +345,54 @@ func AppendSnap(project string, snap Snap, png []byte) error {
 	}
 	dir, _ := ProjectDir(project)
 	return appendJSON(filepath.Join(dir, "index.jsonl"), snap)
+}
+
+func WriteElements(project, digest string, elements []Element) error {
+	if len(elements) == 0 {
+		return nil
+	}
+	path, err := ElementsPath(project, digest)
+	if err != nil {
+		return err
+	}
+	b, err := json.Marshal(elements)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if errors.Is(err, os.ErrExist) {
+		// Identical pixels keep the first DOM, so later captures cannot rewrite the snapshot.
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if _, err = f.Write(b); err == nil {
+		err = f.Sync()
+	}
+	return errors.Join(err, f.Close())
+}
+
+func ReadElements(project, digest string) ([]Element, error) {
+	path, err := ElementsPath(project, digest)
+	if err != nil {
+		return nil, err
+	}
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var elements []Element
+	if err := json.Unmarshal(b, &elements); err != nil {
+		return nil, err
+	}
+	return elements, nil
 }
 
 func AppendNote(project string, note Note) error {
@@ -478,14 +560,15 @@ const KeepSuperseded = 2
 // anything a human would notice as wasted disk.
 const pruneGrace = time.Minute
 
-// Prune deletes shot files that no longer serve anyone: not pending, not the current
-// baseline, and older than the last KeepSuperseded decided shots for their key and variant.
+// Prune deletes shot PNGs and their element snapshots that no longer serve anyone: not
+// pending, not the current baseline, and older than the last KeepSuperseded decided shots
+// for their key and variant. Both file types use the same digest and grace window.
 //
 // It never touches index.jsonl or notes.jsonl. Those are the record of what was shot and
 // what the human said about it, they are tiny, and they stay append-only forever. This is
 // why pruning does not weaken the append-only invariant: a pruned shot still appears in the
 // index, and a flag still appears in the notes, so no queue can be made to look clean. Only
-// the picture is reclaimed, never the fact that it existed.
+// the picture and its element snapshot are reclaimed, never the fact that it existed.
 func Prune(project string) error {
 	snaps, err := Snaps(project)
 	if err != nil {
@@ -539,10 +622,11 @@ func Prune(project string) error {
 	}
 	for _, e := range entries {
 		name := e.Name()
-		if e.IsDir() || !strings.HasSuffix(name, ".png") {
+		ext := filepath.Ext(name)
+		if e.IsDir() || (ext != ".png" && ext != ".json") {
 			continue
 		}
-		if keep["sha256:"+strings.TrimSuffix(name, ".png")] {
+		if keep["sha256:"+strings.TrimSuffix(name, ext)] {
 			continue
 		}
 		if info, err := e.Info(); err != nil || time.Since(info.ModTime()) < pruneGrace {

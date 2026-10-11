@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 	"vision/internal/diff"
 	"vision/internal/gallery"
 	"vision/internal/icon"
@@ -27,27 +28,30 @@ const Address = "127.0.0.1:4747"
 // verdict handler may ever join onto a store path. The gallery sends the human-readable
 // name back as project, so without this guard a path-traversal body writes outside it.
 var projectIDPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]+$`)
 
 type SnapRequest struct {
-	Project store.Project     `json:"project"`
-	Key     string            `json:"key"`
-	Variant string            `json:"variant"`
-	Dims    map[string]string `json:"dims,omitempty"`
-	Meta    map[string]string `json:"meta,omitempty"`
-	Note    string            `json:"note,omitempty"`
-	Session string            `json:"session,omitempty"`
-	Thread  string            `json:"thread,omitempty"`
-	PNG     string            `json:"png"`
-	Capture store.Conditions  `json:"conditions"`
+	Project  store.Project     `json:"project"`
+	Key      string            `json:"key"`
+	Variant  string            `json:"variant"`
+	Dims     map[string]string `json:"dims,omitempty"`
+	Meta     map[string]string `json:"meta,omitempty"`
+	Note     string            `json:"note,omitempty"`
+	Session  string            `json:"session,omitempty"`
+	Thread   string            `json:"thread,omitempty"`
+	PNG      string            `json:"png"`
+	Capture  store.Conditions  `json:"conditions"`
+	Elements []store.Element   `json:"elements,omitempty"`
 }
 
 type VerdictRequest struct {
-	Project string `json:"project"`
-	Key     string `json:"key"`
-	Variant string `json:"variant"`
-	Digest  string `json:"digest"`
-	Verdict string `json:"verdict"`
-	Note    string `json:"note"`
+	Project string         `json:"project"`
+	Key     string         `json:"key"`
+	Variant string         `json:"variant"`
+	Digest  string         `json:"digest"`
+	Verdict string         `json:"verdict"`
+	Note    string         `json:"note"`
+	Regions []store.Region `json:"regions,omitempty"`
 }
 
 type Item struct {
@@ -156,6 +160,10 @@ func (s *Server) snap(w http.ResponseWriter, r *http.Request) {
 	}
 	digest := diff.Digest(pngData)
 	record := store.Snap{SchemaVersion: store.SchemaVersion, TS: time.Now().UTC(), Project: req.Project.Name, Key: req.Key, Variant: req.Variant, Dims: req.Dims, Meta: req.Meta, Digest: digest, Branch: req.Project.Branch, SHA: req.Project.SHA, Dirty: req.Project.Dirty, Worktree: req.Project.Worktree, Session: req.Session, Thread: req.Thread, Note: req.Note, Conditions: req.Capture}
+	if err := store.WriteElements(req.Project.ID, digest, req.Elements); err != nil {
+		problem(w, http.StatusInternalServerError, err)
+		return
+	}
 	if err := store.AppendSnap(req.Project.ID, record, pngData); err != nil {
 		problem(w, http.StatusInternalServerError, err)
 		return
@@ -181,15 +189,63 @@ func (s *Server) verdict(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusBadRequest, errors.New("invalid project id"))
 		return
 	}
+	// ReadElements opens shots/<digest>.json, and CopyBaseline also opens a file by digest.
+	// An unchecked digest permits path traversal on this unauthenticated endpoint.
+	if !digestPattern.MatchString(req.Digest) {
+		problem(w, http.StatusBadRequest, errors.New("invalid digest"))
+		return
+	}
+	// These are trust-boundary caps on an unauthenticated local endpoint, not product limits.
+	if len(req.Regions) > 50 {
+		problem(w, http.StatusBadRequest, errors.New("at most 50 regions are allowed"))
+		return
+	}
+	for i := range req.Regions {
+		region := &req.Regions[i]
+		if region.Tone != "issue" && region.Tone != "praise" && region.Tone != "question" {
+			problem(w, http.StatusBadRequest, errors.New("region tone must be issue, praise or question"))
+			return
+		}
+		region.Text = strings.TrimSpace(region.Text)
+		if region.Text == "" || utf8.RuneCountInString(region.Text) > 2000 {
+			problem(w, http.StatusBadRequest, errors.New("region text must be non-empty and at most 2000 runes"))
+			return
+		}
+		if region.X < 0 || region.Y < 0 || region.W < 0 || region.H < 0 {
+			problem(w, http.StatusBadRequest, errors.New("region coordinates and dimensions must be non-negative"))
+			return
+		}
+		region.Element = ""
+	}
 	if req.Verdict != "ok" && req.Verdict != "flag" {
 		problem(w, http.StatusBadRequest, errors.New("verdict must be ok or flag"))
 		return
 	}
-	if req.Verdict == "flag" && strings.TrimSpace(req.Note) == "" {
+	// Naming a mark is optional context, so a missing or unreadable snapshot must never
+	// fail a verdict the human already gave.
+	if len(req.Regions) > 0 {
+		elements, err := store.ReadElements(req.Project, req.Digest)
+		if err == nil {
+			snaps, err := store.Snaps(req.Project)
+			if err == nil {
+				for i := len(snaps) - 1; i >= 0; i-- {
+					if snaps[i].Digest != req.Digest {
+						continue
+					}
+					for j := range req.Regions {
+						req.Regions[j].Element = resolve(elements, req.Regions[j], snaps[i].Conditions.DPR)
+					}
+					break
+				}
+			}
+		}
+	}
+	rendered := render(strings.TrimSpace(req.Note), req.Regions)
+	if req.Verdict == "flag" && rendered == "" {
 		problem(w, http.StatusBadRequest, errors.New("flag requires a note"))
 		return
 	}
-	note := store.Note{SchemaVersion: store.SchemaVersion, TS: time.Now().UTC(), Key: req.Key, Variant: req.Variant, Digest: req.Digest, Verdict: req.Verdict, Note: strings.TrimSpace(req.Note)}
+	note := store.Note{SchemaVersion: store.SchemaVersion, TS: time.Now().UTC(), Key: req.Key, Variant: req.Variant, Digest: req.Digest, Verdict: req.Verdict, Note: rendered, Regions: req.Regions}
 	if err := store.AppendNote(req.Project, note); err != nil {
 		problem(w, http.StatusInternalServerError, err)
 		return
@@ -205,6 +261,54 @@ func (s *Server) verdict(w http.ResponseWriter, r *http.Request) {
 	// never fail a verdict the human already gave.
 	_ = store.Prune(req.Project)
 	writeJSON(w, http.StatusCreated, note)
+}
+
+// ponytail: A loose box resolves by its center rather than overlap. Upgrade to
+// overlap-weighted scoring if real annotations show misses.
+func resolve(elements []store.Element, r store.Region, dpr float64) string {
+	if dpr <= 0 {
+		dpr = 1
+	}
+	cx, cy := (float64(r.X)+float64(r.W)/2)/dpr, (float64(r.Y)+float64(r.H)/2)/dpr
+	var best *store.Element
+	for i := range elements {
+		e := &elements[i]
+		if !(e.X <= cx && cx < e.X+e.W && e.Y <= cy && cy < e.Y+e.H) {
+			continue
+		}
+		if best == nil || e.W*e.H < best.W*best.H || (e.W*e.H == best.W*best.H && e.Depth > best.Depth) {
+			best = e
+		}
+	}
+	if best == nil {
+		return ""
+	}
+	name := []rune(best.Name)
+	if len(name) > 60 {
+		name = append(name[:60], '.', '.', '.')
+	}
+	return fmt.Sprintf("%s %q", best.Role, string(name))
+}
+
+func render(free string, regions []store.Region) string {
+	var lines []string
+	if free != "" {
+		lines = append(lines, free)
+	}
+	for i, r := range regions {
+		tone := r.Tone
+		if r.Flow {
+			tone += " (every step)"
+		}
+		where := fmt.Sprintf("at %d,%d", r.X, r.Y)
+		if r.Element != "" {
+			where = "on " + r.Element
+		} else if r.W != 0 || r.H != 0 {
+			where = fmt.Sprintf("box %d,%d %dx%d", r.X, r.Y, r.W, r.H)
+		}
+		lines = append(lines, fmt.Sprintf("[%d] %s %s: %s", i+1, tone, where, strings.ReplaceAll(r.Text, "\n", "\n    ")))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {

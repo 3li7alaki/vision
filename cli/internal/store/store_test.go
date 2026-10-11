@@ -2,10 +2,12 @@ package store
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -14,13 +16,16 @@ import (
 
 // Pruning is the one thing here that deletes, so it gets the sharpest test: the shot the
 // human has not judged yet must survive, and the record of every shot must survive whether
-// its picture did or not.
+// its picture did or not. Element snapshots must follow the picture's retention decision.
 func TestPruneKeepsPendingBaselineAndRecent(t *testing.T) {
 	t.Setenv("VISION_STATE_HOME", t.TempDir())
 	shot := func(n int) string {
 		digest := "sha256:" + strings.Repeat(string(rune('a'+n)), 8)
 		snap := Snap{SchemaVersion: 1, TS: time.Now(), Key: "checkout/cart", Variant: "default", Digest: digest}
 		if err := AppendSnap("p", snap, []byte{byte(n)}); err != nil {
+			t.Fatal(err)
+		}
+		if err := WriteElements("p", digest, []Element{{Role: "button", Name: "Withdraw", W: 120, H: 40}}); err != nil {
 			t.Fatal(err)
 		}
 		return digest
@@ -36,12 +41,15 @@ func TestPruneKeepsPendingBaselineAndRecent(t *testing.T) {
 		approve(d)
 	}
 	pending := shot(4)
-	// Age every picture past the grace window, which is covered by its own test below.
+	// Age both files past the grace window, which is covered by its own test below.
 	old := time.Now().Add(-2 * pruneGrace)
 	for _, d := range []string{oldest, superseded, previous, baseline, pending} {
 		p, _ := ShotPath("p", d)
-		if err := os.Chtimes(p, old, old); err != nil {
-			t.Fatal(err)
+		snapshot, _ := ElementsPath("p", d)
+		for _, path := range []string{p, snapshot} {
+			if err := os.Chtimes(path, old, old); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 
@@ -53,9 +61,15 @@ func TestPruneKeepsPendingBaselineAndRecent(t *testing.T) {
 		if !exists(keep) {
 			t.Errorf("pruned a shot it must keep: %s", keep)
 		}
+		if elements, err := ReadElements("p", keep); err != nil || len(elements) != 1 {
+			t.Errorf("pruned a snapshot it must keep: %s: %#v %v", keep, elements, err)
+		}
 	}
 	if exists(oldest) {
 		t.Errorf("kept a shot past the retention window: %s", oldest)
+	}
+	if elements, err := ReadElements("p", oldest); err != nil || elements != nil {
+		t.Errorf("kept a snapshot past the retention window: %#v %v", elements, err)
 	}
 	// The ledger is untouched: every shot still has its record, picture or not.
 	snaps, err := Snaps("p")
@@ -68,7 +82,7 @@ func TestPruneKeepsPendingBaselineAndRecent(t *testing.T) {
 }
 
 // A snap writes its picture before its index line. A Prune that lands in between sees a
-// picture with no record, and must not delete a shot nobody has reviewed yet.
+// picture or snapshot with no record, and must not delete evidence nobody has reviewed yet.
 func TestPruneSparesAFreshPictureWithNoRecordYet(t *testing.T) {
 	t.Setenv("VISION_STATE_HOME", t.TempDir())
 	if err := AppendSnap("p", Snap{SchemaVersion: 1, TS: time.Now(), Key: "a/b", Variant: "default", Digest: "sha256:aaaa"}, []byte{1}); err != nil {
@@ -78,11 +92,96 @@ func TestPruneSparesAFreshPictureWithNoRecordYet(t *testing.T) {
 	if err := os.WriteFile(p, []byte{2}, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := WriteElements("p", "sha256:bbbb", []Element{{Name: "Fresh", W: 10, H: 10}}); err != nil {
+		t.Fatal(err)
+	}
 	if err := Prune("p"); err != nil {
 		t.Fatal(err)
 	}
 	if !HasShot("p", "sha256:bbbb") {
 		t.Fatal("pruned a picture written moments ago, before its record landed")
+	}
+	if elements, err := ReadElements("p", "sha256:bbbb"); err != nil || len(elements) != 1 {
+		t.Fatalf("pruned a snapshot written moments ago, before its record landed: %#v %v", elements, err)
+	}
+}
+
+// Pixel-identical captures share one digest, so the first snapshot must survive later DOM changes.
+func TestElementsStorage(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	const digest = "sha256:0123456789abcdef"
+	path, err := ElementsPath("p", digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shot, err := ShotPath("p", digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != strings.TrimSuffix(shot, ".png")+".json" {
+		t.Fatalf("snapshot path %q does not match picture %q", path, shot)
+	}
+	if got, err := ReadElements("p", digest); err != nil || got != nil {
+		t.Fatalf("missing snapshot: %#v %v", got, err)
+	}
+	for _, empty := range [][]Element{nil, {}} {
+		if err := WriteElements("p", digest, empty); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("empty elements created a file: %v", err)
+		}
+	}
+	want := []Element{{Role: "button", Name: "Withdraw", Depth: 3, X: 150.25, Y: 260.5, W: 120.75, H: 40}}
+	if err := WriteElements("p", digest, want); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ReadElements("p", digest); err != nil || !slices.Equal(got, want) {
+		t.Fatalf("round trip: got %#v %v, want %#v", got, err, want)
+	}
+	if err := WriteElements("p", digest, []Element{{Role: "link", Name: "Changed", W: 10, H: 10}}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ReadElements("p", digest); err != nil || !slices.Equal(got, want) {
+		t.Fatalf("later write replaced the first DOM: %#v %v", got, err)
+	}
+}
+
+// Regions are additive to schema 1, so old verdict lines must decode alongside marked verdicts.
+func TestNoteRegionsBackwardCompatible(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	dir, err := ProjectDir("p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	line := `{"schemaVersion":1,"ts":"2026-10-11T10:00:00Z","key":"checkout/cart","variant":"default","digest":"sha256:old","verdict":"flag","note":"CTA under the fold"}`
+	if err := os.WriteFile(filepath.Join(dir, "notes.jsonl"), []byte(line+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	legacy := Note{SchemaVersion: 1, TS: time.Date(2026, 10, 11, 10, 0, 0, 0, time.UTC), Key: "checkout/cart", Variant: "default", Digest: "sha256:old", Verdict: "flag", Note: "CTA under the fold"}
+	marked := Note{SchemaVersion: 1, TS: legacy.TS, Key: legacy.Key, Variant: legacy.Variant, Digest: "sha256:new", Verdict: "flag", Note: "Move the CTA", Regions: []Region{
+		{X: 300, Y: 520, W: 240, H: 80, Tone: "bad", Text: "Move this", Flow: true, Element: "button Withdraw"},
+		{X: 20, Y: 40, W: 0, H: 0, Tone: "good", Text: "Keep this"},
+	}}
+	if err := AppendNote("p", marked); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := Notes("p"); err != nil || !reflect.DeepEqual(got, []Note{legacy, marked}) {
+		t.Fatalf("notes: got %#v %v, want legacy and marked verdicts", got, err)
+	}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := fields["regions"]; exists {
+		t.Fatalf("empty regions changed the legacy JSON shape: %s", data)
 	}
 }
 

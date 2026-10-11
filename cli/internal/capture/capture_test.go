@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"vision/internal/store"
 )
 
 // The --server flag has to come before the subcommand, because it is a global flag: put it
@@ -36,11 +37,12 @@ func TestPinchtabScopesToServer(t *testing.T) {
 	}
 }
 
+// Capture must pair the image with its complete snapshot without losing server or selector scoping.
 func TestCaptureArgs(t *testing.T) {
 	for _, server := range []string{"", "http://127.0.0.1:9999"} {
 		t.Setenv("PINCHTAB_SERVER", server)
 		for _, selector := range []string{"", `footer [data-role="card"]`} {
-			want := []string{"capture", "--json", "--beyond-viewport", "-o", "shot.png", "--format", "png"}
+			want := []string{"capture", "--json", "--beyond-viewport", "-o", "shot.png", "--format", "png", "--filter", "all"}
 			if selector != "" {
 				want = append(want, "-s", selector)
 			}
@@ -50,6 +52,110 @@ func TestCaptureArgs(t *testing.T) {
 			if got := captureArgs("shot.png", selector); !slices.Equal(got, want) {
 				t.Errorf("server=%q selector=%q: got %v, want %v", server, selector, got, want)
 			}
+		}
+	}
+}
+
+// A mark must resolve against the stored crop, so document offsets and clip-relative boxes differ.
+func TestElementsCoordinates(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want store.Element
+	}{
+		{
+			name: "document",
+			body: `{"image":{"coordinateSpace":"document","clip":null,"viewport":{"h":700,"scrollX":0,"scrollY":300,"w":1000}},"snapshot":{"nodes":[{"role":"button","name":"Withdraw","depth":3,"visible":true,"boundingBox":{"h":40,"w":120,"x":150,"y":560}},{"role":"StaticText","name":"Withdraw","depth":4,"visible":true,"boundingBox":{"h":15,"w":55.5625,"x":182.21875,"y":572.5}}]}}`,
+			want: store.Element{Role: "button", Name: "Withdraw", Depth: 3, X: 150, Y: 260, W: 120, H: 40},
+		},
+		{
+			name: "clip",
+			body: `{"image":{"coordinateSpace":"clip","clip":{"h":200,"w":400,"x":100,"y":500},"viewport":{"h":700,"scrollX":0,"scrollY":300,"w":1000}},"snapshot":{"nodes":[{"role":"button","name":"Withdraw","depth":3,"visible":true,"boundingBox":{"h":40,"w":120,"x":50,"y":60}}]}}`,
+			want: store.Element{Role: "button", Name: "Withdraw", Depth: 3, X: 50, Y: 60, W: 120, H: 40},
+		},
+		{
+			name: "horizontal scroll and fractional boxes",
+			body: `{"image":{"coordinateSpace":"document","viewport":{"h":700,"scrollX":100,"scrollY":300,"w":1000}},"snapshot":{"nodes":[{"role":"button","name":" Withdraw ","depth":3,"boundingBox":{"h":40.5,"w":120.25,"x":150.75,"y":560.5}}]}}`,
+			want: store.Element{Role: "button", Name: "Withdraw", Depth: 3, X: 50.75, Y: 260.5, W: 120.25, H: 40.5},
+		},
+		{
+			name: "viewport",
+			body: `{"image":{"coordinateSpace":"viewport","viewport":{"h":700,"scrollX":100,"scrollY":300,"w":1000}},"snapshot":{"nodes":[{"role":"button","name":"Withdraw","depth":3,"boundingBox":{"h":40,"w":120,"x":50,"y":60}}]}}`,
+			want: store.Element{Role: "button", Name: "Withdraw", Depth: 3, X: 50, Y: 60, W: 120, H: 40},
+		},
+		{
+			name: "unknown space",
+			body: `{"image":{"coordinateSpace":"other","viewport":{"h":700,"scrollX":100,"scrollY":300,"w":1000}},"snapshot":{"nodes":[{"role":"button","name":"Withdraw","depth":3,"boundingBox":{"h":40,"w":120,"x":50,"y":60}}]}}`,
+			want: store.Element{Role: "button", Name: "Withdraw", Depth: 3, X: 50, Y: 60, W: 120, H: 40},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var raw map[string]any
+			if err := json.Unmarshal([]byte(tc.body), &raw); err != nil {
+				t.Fatal(err)
+			}
+			if got := elements(raw); !slices.Equal(got, []store.Element{tc.want}) {
+				t.Fatalf("elements = %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Invisible, unnamed, off-image and text-run nodes cannot identify the control under a mark.
+func TestElementsFiltersNodes(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		space string
+		node  string
+		keep  bool
+	}{
+		{"scrolled out", "document", `{"role":"button","name":"Withdraw","boundingBox":{"x":150,"y":200,"w":120,"h":40}}`, false},
+		{"right edge", "viewport", `{"name":"Outside","boundingBox":{"x":1000,"y":0,"w":10,"h":10}}`, false},
+		{"bottom edge", "viewport", `{"name":"Outside","boundingBox":{"x":0,"y":700,"w":10,"h":10}}`, false},
+		{"left edge", "viewport", `{"name":"Outside","boundingBox":{"x":-10,"y":0,"w":10,"h":10}}`, false},
+		{"top edge", "viewport", `{"name":"Outside","boundingBox":{"x":0,"y":-10,"w":10,"h":10}}`, false},
+		{"partly visible", "viewport", `{"name":"Partly visible","boundingBox":{"x":-5,"y":-5,"w":10,"h":10}}`, true},
+		{"outside clip", "clip", `{"name":"Outside","boundingBox":{"x":400,"y":0,"w":10,"h":10}}`, false},
+		{"hidden", "viewport", `{"name":"Hidden","visible":false,"boundingBox":{"x":0,"y":0,"w":10,"h":10}}`, false},
+		{"missing box", "viewport", `{"name":"Missing"}`, false},
+		{"zero width", "viewport", `{"name":"Empty","boundingBox":{"x":0,"y":0,"w":0,"h":10}}`, false},
+		{"negative height", "viewport", `{"name":"Empty","boundingBox":{"x":0,"y":0,"w":10,"h":-10}}`, false},
+		{"blank name", "viewport", `{"name":" \t ","boundingBox":{"x":0,"y":0,"w":10,"h":10}}`, false},
+		{"static text", "viewport", `{"role":"StaticText","name":"Withdraw","boundingBox":{"x":0,"y":0,"w":10,"h":10}}`, false},
+		{"inline text", "viewport", `{"role":"InlineTextBox","name":"Withdraw","boundingBox":{"x":0,"y":0,"w":10,"h":10}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var raw map[string]any
+			body := `{"image":{"coordinateSpace":"` + tc.space + `","viewport":{"w":1000,"h":700,"scrollY":300},"clip":{"x":100,"y":500,"w":400,"h":200}},"snapshot":{"nodes":[` + tc.node + `]}}`
+			if err := json.Unmarshal([]byte(body), &raw); err != nil {
+				t.Fatal(err)
+			}
+			got := elements(raw)
+			if tc.keep {
+				if len(got) != 1 || got[0].X != -5 || got[0].Y != -5 || got[0].W != 10 || got[0].H != 10 {
+					t.Fatalf("partly visible box was lost or clipped: %#v", got)
+				}
+			} else if got != nil {
+				t.Fatalf("kept an unusable node: %#v", got)
+			}
+		})
+	}
+}
+
+// Older captures without accessibility data must still return their picture successfully.
+func TestElementsMissingSnapshot(t *testing.T) {
+	for _, body := range []string{
+		`{"image":{"viewport":{"w":1000,"h":700}}}`,
+		`{"image":{"viewport":{"w":1000,"h":700}},"snapshot":{}}`,
+		`{"image":{"viewport":{"w":1000,"h":700}},"snapshot":{"nodes":null}}`,
+		`{"image":{"viewport":{"w":1000,"h":700}},"snapshot":{"nodes":[]}}`,
+	} {
+		var raw map[string]any
+		if err := json.Unmarshal([]byte(body), &raw); err != nil {
+			t.Fatal(err)
+		}
+		if got := elements(raw); got != nil {
+			t.Fatalf("elements(%s) = %#v, want nil", body, got)
 		}
 	}
 }
@@ -220,7 +326,8 @@ func TestCaptureErrorWedgeGuidance(t *testing.T) {
 func TestTakeCutsTheViewportOutOfTheDocument(t *testing.T) {
 	argsPath := fakePinchtab(t, positional(40, 100))
 	t.Setenv("VISION_TEST_CAPTURE", `{"url":"http://localhost:3000/cart","colorScheme":"light",
-	  "image":{"coordinateSpace":"document","devicePixelRatio":1,"viewport":{"w":30,"h":20,"scrollX":5,"scrollY":50}}}`)
+	  "image":{"coordinateSpace":"document","devicePixelRatio":1,"viewport":{"w":30,"h":20,"scrollX":5,"scrollY":50}},
+	  "snapshot":{"nodes":[{"role":"button","name":"Withdraw","depth":3,"visible":true,"boundingBox":{"x":8,"y":55,"w":12,"h":4}}]}}`)
 	shot, err := Take(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
@@ -228,6 +335,12 @@ func TestTakeCutsTheViewportOutOfTheDocument(t *testing.T) {
 	args, _ := os.ReadFile(argsPath)
 	if !strings.Contains(string(args), "capture --json --beyond-viewport") {
 		t.Fatalf("capture did not ask for a whole-document render: %s", args)
+	}
+	if !strings.Contains(string(args), "--filter all") {
+		t.Fatalf("capture did not ask for the paired snapshot: %s", args)
+	}
+	if want := []store.Element{{Role: "button", Name: "Withdraw", Depth: 3, X: 3, Y: 5, W: 12, H: 4}}; !slices.Equal(shot.Elements, want) {
+		t.Fatalf("Take lost the crop-relative snapshot: %#v", shot.Elements)
 	}
 	img, err := png.Decode(bytes.NewReader(shot.PNG))
 	if err != nil {

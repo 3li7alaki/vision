@@ -316,6 +316,224 @@ func TestVerdictLandsUnderHashedProjectID(t *testing.T) {
 	}
 }
 
+// Small controls must win over their containers, and image pixels must map back to CSS pixels.
+func TestResolveRegions(t *testing.T) {
+	card := store.Element{Role: "group", Name: "Account", Depth: 1, W: 100, H: 100}
+	button := store.Element{Role: "button", Name: "Withdraw", Depth: 2, X: 10, Y: 20, W: 20, H: 10}
+	for _, tc := range []struct {
+		name     string
+		elements []store.Element
+		region   store.Region
+		dpr      float64
+		want     string
+	}{
+		{"button over card", []store.Element{card, button}, store.Region{X: 11, Y: 21, W: 5, H: 5}, 1, `button "Withdraw"`},
+		{"dpr two", []store.Element{button}, store.Region{X: 22, Y: 42, W: 10, H: 10}, 2, `button "Withdraw"`},
+		{"fractional center", []store.Element{{Role: "button", Name: "Small", X: 1.2, Y: 1.2, W: .1, H: .1}}, store.Region{X: 2, Y: 2, W: 1, H: 1}, 2, `button "Small"`},
+		{"empty space", []store.Element{card, button}, store.Region{X: 200, Y: 200}, 1, ""},
+		{"left top included", []store.Element{button}, store.Region{X: 10, Y: 20}, 1, `button "Withdraw"`},
+		{"right excluded", []store.Element{button}, store.Region{X: 30, Y: 25}, 1, ""},
+		{"bottom excluded", []store.Element{button}, store.Region{X: 20, Y: 30}, 1, ""},
+		{"deeper tie", []store.Element{{Role: "group", Name: "Shallow", Depth: 1, W: 100, H: 100}, {Role: "button", Name: "Deep", Depth: 3, W: 100, H: 100}}, store.Region{X: 10, Y: 10}, 1, `button "Deep"`},
+		{"first equal tie", []store.Element{{Role: "button", Name: "First", Depth: 3, W: 100, H: 100}, {Role: "button", Name: "Second", Depth: 3, W: 100, H: 100}}, store.Region{X: 10, Y: 10}, 1, `button "First"`},
+		{"long unicode name", []store.Element{{Role: "button", Name: strings.Repeat("界", 61), W: 100, H: 100}}, store.Region{X: 10, Y: 10}, 1, `button "` + strings.Repeat("界", 60) + `..."`},
+		{"sixty runes unchanged", []store.Element{{Role: "button", Name: strings.Repeat("界", 60), W: 100, H: 100}}, store.Region{X: 10, Y: 10}, 1, `button "` + strings.Repeat("界", 60) + `"`},
+		{"missing dpr", []store.Element{button}, store.Region{X: 11, Y: 21}, 0, `button "Withdraw"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolve(tc.elements, tc.region, tc.dpr); got != tc.want {
+				t.Fatalf("resolve = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// Rendering keeps each human mark recognizable in plain text, including continuation lines.
+func TestRenderRegions(t *testing.T) {
+	regions := []store.Region{
+		{Tone: "issue", Text: "too close to the edge", Element: `button "Withdraw"`},
+		{Tone: "praise", Flow: true, X: 30, Y: 380, W: 270, H: 60, Text: "nice spacing"},
+		{Tone: "question", X: 12, Y: 40, Text: "is this the final copy?"},
+	}
+	examples := "[1] issue on button \"Withdraw\": too close to the edge\n[2] praise (every step) box 30,380 270x60: nice spacing\n[3] question at 12,40: is this the final copy?"
+	for _, tc := range []struct {
+		name, free string
+		regions    []store.Region
+		want       string
+	}{
+		{"examples", "", regions, examples},
+		{"free text first", "Review this layout", regions, "Review this layout\n" + examples},
+		{"multiline mark", "", []store.Region{{Tone: "issue", Text: "first\n[2] still the first mark"}}, "[1] issue at 0,0: first\n    [2] still the first mark"},
+		{"free text only", "Review this layout", nil, "Review this layout"},
+		{"empty", "", nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := render(tc.free, tc.regions); got != tc.want {
+				t.Fatalf("render = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// The HTTP round trip must retain human marks and replace client names with captured elements.
+func TestVerdictRegionsRoundTrip(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	id := strings.Repeat("a", 64)
+	var pngData bytes.Buffer
+	if err := png.Encode(&pngData, image.NewRGBA(image.Rect(0, 0, 4, 4))); err != nil {
+		t.Fatal(err)
+	}
+	handler := New().Handler()
+	post := func(path string, body any) *httptest.ResponseRecorder {
+		t.Helper()
+		data, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, bytes.NewReader(data)))
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("POST %s: status=%d body=%s", path, rec.Code, rec.Body.String())
+		}
+		return rec
+	}
+	req := SnapRequest{Project: store.Project{ID: id, Name: "shop"}, Key: "checkout/cart", Variant: "default", PNG: base64.StdEncoding.EncodeToString(pngData.Bytes()), Capture: store.Conditions{DPR: 1}, Elements: []store.Element{
+		{Role: "group", Name: "Account", W: 2, H: 2},
+		{Role: "button", Name: "Withdraw", Depth: 2, X: 1, Y: 1, W: 1, H: 1},
+	}}
+	post("/api/snap", req)
+	req.Capture.DPR = 2
+	post("/api/snap", req)
+	digest := diff.Digest(pngData.Bytes())
+	rec := post("/api/verdict", VerdictRequest{Project: id, Key: req.Key, Variant: req.Variant, Digest: digest, Verdict: "flag", Regions: []store.Region{
+		{X: 2, Y: 2, W: 1, H: 1, Tone: "issue", Text: "  too close to the edge  ", Element: "client lie"},
+		{X: 2, Y: 2, Tone: "praise", Text: "nice spacing", Flow: true},
+	}})
+	notes, err := store.Notes(id)
+	if err != nil || len(notes) != 1 {
+		t.Fatalf("notes=%v err=%v, want one verdict", notes, err)
+	}
+	wantRegions := []store.Region{
+		{X: 2, Y: 2, W: 1, H: 1, Tone: "issue", Text: "too close to the edge", Element: `button "Withdraw"`},
+		{X: 2, Y: 2, Tone: "praise", Text: "nice spacing", Flow: true, Element: `button "Withdraw"`},
+	}
+	wantText := "[1] issue on button \"Withdraw\": too close to the edge\n[2] praise (every step) on button \"Withdraw\": nice spacing"
+	var response store.Note
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	for _, note := range []store.Note{notes[0], response} {
+		if note.Note != wantText || !slices.Equal(note.Regions, wantRegions) {
+			t.Fatalf("note=%+v, want text %q and regions %+v", note, wantText, wantRegions)
+		}
+	}
+}
+
+// Invalid input must be rejected before this unauthenticated endpoint writes a verdict.
+func TestVerdictRegionValidation(t *testing.T) {
+	valid := store.Region{Tone: "issue", Text: "edge"}
+	many := make([]store.Region, 51)
+	for i := range many {
+		many[i] = valid
+	}
+	for _, tc := range []struct {
+		name, digest, note string
+		regions            []store.Region
+		status             int
+	}{
+		{"bad tone", "sha256:cccc", "", []store.Region{{Tone: "bad", Text: "edge"}}, http.StatusBadRequest},
+		{"empty text", "sha256:cccc", "", []store.Region{{Tone: "issue", Text: " \n\t "}}, http.StatusBadRequest},
+		{"too many regions", "sha256:cccc", "", many, http.StatusBadRequest},
+		{"digest traversal", "sha256:../x", "edge", nil, http.StatusBadRequest},
+		{"empty digest", "", "edge", nil, http.StatusBadRequest},
+		{"nonhex digest", "sha256:gggg", "edge", nil, http.StatusBadRequest},
+		{"empty flag", "sha256:cccc", " \n\t ", nil, http.StatusBadRequest},
+		{"negative x", "sha256:cccc", "", []store.Region{{Tone: "issue", Text: "edge", X: -1}}, http.StatusBadRequest},
+		{"negative y", "sha256:cccc", "", []store.Region{{Tone: "issue", Text: "edge", Y: -1}}, http.StatusBadRequest},
+		{"negative width", "sha256:cccc", "", []store.Region{{Tone: "issue", Text: "edge", W: -1}}, http.StatusBadRequest},
+		{"negative height", "sha256:cccc", "", []store.Region{{Tone: "issue", Text: "edge", H: -1}}, http.StatusBadRequest},
+		{"text exceeds rune cap", "sha256:cccc", "", []store.Region{{Tone: "issue", Text: strings.Repeat("界", 2001)}}, http.StatusBadRequest},
+		{"rune cap accepts unicode", "sha256:cccc", "", []store.Region{{Tone: "issue", Text: " " + strings.Repeat("界", 2000) + " "}}, http.StatusCreated},
+		{"fifty regions accepted", "sha256:cccc", "", many[:50], http.StatusCreated},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("VISION_STATE_HOME", t.TempDir())
+			id := strings.Repeat("a", 64)
+			data, err := json.Marshal(VerdictRequest{Project: id, Key: "checkout/cart", Variant: "default", Digest: tc.digest, Verdict: "flag", Note: tc.note, Regions: tc.regions})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := httptest.NewRecorder()
+			New().Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/verdict", bytes.NewReader(data)))
+			if rec.Code != tc.status {
+				t.Fatalf("status=%d body=%s, want %d", rec.Code, rec.Body.String(), tc.status)
+			}
+			if tc.status == http.StatusBadRequest {
+				notes, err := store.Notes(id)
+				if err != nil || len(notes) != 0 {
+					t.Fatalf("rejected request wrote notes=%v err=%v", notes, err)
+				}
+			}
+		})
+	}
+}
+
+// Snapshot failures must drop optional element names without losing the human's verdict.
+func TestVerdictRegionsSnapshotFallback(t *testing.T) {
+	for _, mode := range []string{"missing elements", "missing snap", "unreadable elements", "unreadable index", "zero dpr"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("VISION_STATE_HOME", t.TempDir())
+			id, digest := strings.Repeat("a", 64), "sha256:cccc"
+			if mode != "missing elements" {
+				if err := store.WriteElements(id, digest, []store.Element{{Role: "button", Name: "Withdraw", W: 10, H: 10}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode != "missing snap" {
+				if err := store.AppendSnap(id, store.Snap{Digest: digest}, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode == "unreadable elements" || mode == "unreadable index" {
+				path, err := store.ElementsPath(id, digest)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if mode == "unreadable index" {
+					dir, err := store.ProjectDir(id)
+					if err != nil {
+						t.Fatal(err)
+					}
+					path = filepath.Join(dir, "index.jsonl")
+				}
+				if err := os.WriteFile(path, []byte("bad json"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			data, err := json.Marshal(VerdictRequest{Project: id, Key: "checkout/cart", Variant: "default", Digest: digest, Verdict: "flag", Note: "  Review this  ", Regions: []store.Region{{X: 1, Y: 1, Tone: "question", Text: "  final?  ", Element: "client lie"}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := httptest.NewRecorder()
+			New().Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/verdict", bytes.NewReader(data)))
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("status=%d body=%s, want 201", rec.Code, rec.Body.String())
+			}
+			notes, err := store.Notes(id)
+			if err != nil || len(notes) != 1 || len(notes[0].Regions) != 1 {
+				t.Fatalf("notes=%v err=%v, want one mark", notes, err)
+			}
+			wantElement, wantText := "", "Review this\n[1] question at 1,1: final?"
+			if mode == "zero dpr" {
+				wantElement, wantText = `button "Withdraw"`, "Review this\n[1] question on button \"Withdraw\": final?"
+			}
+			if notes[0].Regions[0].Element != wantElement || notes[0].Regions[0].Text != "final?" || notes[0].Note != wantText {
+				t.Fatalf("note=%+v, want element %q and text %q", notes[0], wantElement, wantText)
+			}
+		})
+	}
+}
+
 // The status line asks "what is waiting for me here", so a shot queued in another repo
 // must not appear in this one's count. Only the daemon-wide total sees both.
 func TestPendingCountForScopesToOneProject(t *testing.T) {

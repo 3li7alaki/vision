@@ -250,6 +250,158 @@
   #layer .side { color: var(--warn); }
   #layer .side + .side { color: var(--text); margin-left: 10px; }
 
+  /* ---------- annotations ---------- */
+
+  /* Notes sit on the picture: click drops a pin, a drag draws a box. Each carries a tone,
+     because a review is not only complaints: "keep this" is as useful to an agent as
+     "fix this", and the verdict follows from the tones instead of a second question. */
+  :root { --issue: var(--flag); --praise: var(--ok); --question: var(--new); }
+  #marks { position: absolute; inset: 0; z-index: 2; cursor: crosshair; touch-action: none; }
+  #frame.swipe #marks, #frame.peek #marks { display: none; }
+  .box {
+    position: absolute;
+    border: 2px solid var(--tone);
+    border-radius: 5px;
+    background: color-mix(in srgb, var(--tone) 9%, transparent);
+    box-shadow: 0 0 0 1px rgba(0,0,0,.35);
+    transition: background .14s ease, box-shadow .14s ease;
+    pointer-events: none;
+  }
+  .box.drawing { border-style: dashed; transition: none; will-change: left, top, width, height; }
+  .box.hot {
+    background: color-mix(in srgb, var(--tone) 20%, transparent);
+    box-shadow: 0 0 0 1px rgba(0,0,0,.35), 0 0 0 5px color-mix(in srgb, var(--tone) 28%, transparent);
+  }
+  .pin {
+    position: absolute;
+    width: 26px; height: 26px;
+    margin: -26px 0 0 0;
+    display: grid;
+    place-items: center;
+    border-radius: 13px 13px 13px 3px;
+    background: var(--tone);
+    color: #0a0a0b;
+    font: 700 12px/1 var(--sans);
+    box-shadow: 0 0 0 2px rgba(255,255,255,.92), 0 6px 16px -4px rgba(0,0,0,.7);
+    cursor: pointer;
+    transform-origin: 0 100%;
+    transition: transform .12s ease;
+  }
+  /* Only a pin that was just placed animates, Agentation's 250ms out of scale .3. Redraws
+     never replay it: a pop on every hover or drag frame is what read as lag. */
+  .pin.enter { animation: pop .25s cubic-bezier(.22,1,.36,1); }
+  .pin:hover, .pin.hot { transform: scale(1.14); }
+  @keyframes pop { from { transform: scale(.3); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+  /* A saved note squishes once, so the eye catches which pin just took the text. */
+  .pin.saved { animation: squish .32s ease; }
+  @keyframes squish { 30% { transform: scale(.94); } 65% { transform: scale(1.06); } }
+
+  #composer {
+    position: fixed;
+    z-index: 8;
+    width: 300px;
+    display: none;
+    flex-direction: column;
+    gap: 10px;
+    padding: 12px;
+    border-radius: 10px;
+    background: var(--bg-raised);
+    border: 1px solid var(--line);
+    box-shadow: var(--shadow);
+    opacity: 0;
+    transform: scale(.95) translateY(4px);
+    transform-origin: top left;
+    transition: opacity .15s ease-in, transform .15s ease-in;
+  }
+  #composer.show { display: flex; }
+  #composer.in { transition: opacity .2s ease, transform .2s cubic-bezier(.34,1.56,.64,1); }
+  #composer.in { opacity: 1; transform: none; }
+  .tones { display: flex; gap: 6px; }
+  .tones button {
+    flex: 1;
+    padding: 6px 0;
+    border-radius: 6px;
+    border: 1px solid var(--line);
+    background: none;
+    color: var(--muted);
+    font: 600 11px/1 var(--sans);
+    cursor: pointer;
+    transition: background .12s, color .12s, border-color .12s;
+  }
+  .tones button.on {
+    color: var(--tone);
+    border-color: color-mix(in srgb, var(--tone) 45%, var(--line));
+    background: color-mix(in srgb, var(--tone) 12%, transparent);
+  }
+  #composer textarea {
+    resize: none;
+    min-height: 38px;
+    max-height: 180px;
+    padding: 9px 10px;
+    border-radius: 7px;
+    border: 1px solid var(--line);
+    background: var(--bg);
+    color: var(--text);
+    font: 400 14px/1.45 var(--sans);
+    outline: none;
+  }
+  #composer textarea:focus { border-color: color-mix(in srgb, var(--tone) 55%, var(--line)); }
+  #composer .foot { display: flex; align-items: center; gap: 8px; font: 500 11px/1.3 var(--sans); color: var(--faint); }
+  #composer label { display: flex; align-items: center; gap: 6px; color: var(--muted); cursor: pointer; }
+  #composer .foot .hint { margin-left: auto; font-family: var(--mono); }
+
+  #notes {
+    position: absolute;
+    top: 4px; right: 16px; bottom: 12px;
+    width: 280px;
+    display: none;
+    flex-direction: column;
+    gap: 6px;
+    overflow-y: auto;
+    padding: 2px;
+  }
+  #notes.show { display: flex; }
+  #notes h3 { font: 600 10px/1 var(--mono); letter-spacing: .1em; color: var(--faint); margin: 6px 4px 2px; }
+  .note {
+    display: grid;
+    grid-template-columns: 22px 1fr auto;
+    gap: 10px;
+    align-items: start;
+    padding: 10px;
+    border-radius: 8px;
+    background: var(--bg-raised);
+    border: 1px solid var(--line);
+    cursor: pointer;
+    transition: border-color .12s, transform .12s;
+  }
+  .note.enter { animation: slide .18s ease; }
+  #notes .empty-hint { margin: 8px 6px; font: 400 12px/1.5 var(--sans); color: var(--faint); }
+  .note:hover, .note.hot { border-color: color-mix(in srgb, var(--tone) 50%, var(--line)); }
+  .note.carried { cursor: default; opacity: .75; border-style: dashed; }
+  .note .num {
+    width: 22px; height: 22px;
+    display: grid; place-items: center;
+    border-radius: 11px 11px 11px 3px;
+    background: var(--tone);
+    color: #0a0a0b;
+    font: 700 11px/1 var(--sans);
+  }
+  .note .body { font: 400 13px/1.45 var(--sans); color: var(--text); overflow-wrap: anywhere; }
+  .note .meta { display: block; margin-top: 4px; font: 500 11px/1 var(--mono); color: var(--tone); }
+  .note .del {
+    border: 0; background: none; color: var(--faint); font: 400 16px/1 var(--sans);
+    cursor: pointer; padding: 0 2px; opacity: 0; transition: opacity .12s;
+  }
+  .note:hover .del { opacity: 1; }
+  @keyframes slide { from { opacity: 0; transform: translateX(8px); } to { opacity: 1; transform: none; } }
+
+  @media (prefers-reduced-motion: reduce) {
+    .pin.enter, .pin.saved, .note.enter { animation: none; }
+    #composer, #composer.in, .box, .pin { transition: none; }
+  }
+
+  .keys.suggest kbd { box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 22%, transparent); }
+
   /* ---------- filmstrip ---------- */
 
   #strip {
@@ -465,8 +617,10 @@
       <img id="base" alt="">
       <img id="shot" alt="">
       <div id="divider"></div>
+      <div id="marks"></div>
     </div>
     <div id="layer"></div>
+    <aside id="notes" aria-label="notes on this shot"></aside>
     <div id="empty">
       <div class="big">Nothing waiting.</div>
       <div class="sub" id="emptySub"></div>
@@ -479,9 +633,9 @@
     <div class="stat" id="stat"></div>
     <div id="changes"></div>
     <div class="spacer"></div>
-    <div class="keys"><kbd class="ok">o</kbd><span class="label">ok</span></div>
+    <div class="keys" id="okKey"><kbd class="ok">o</kbd><span class="label" id="okLabel">ok</span></div>
     <div class="keys"><kbd class="ok">a</kbd><span class="label">ok all</span></div>
-    <div class="keys"><kbd class="flag">f</kbd><span class="label">flag</span></div>
+    <div class="keys" id="flagKey"><kbd class="flag">f</kbd><span class="label" id="flagLabel">flag</span></div>
     <div class="keys"><kbd>space</kbd><span class="label">compare</span></div>
     <div class="keys"><kbd>?</kbd></div>
   </footer>
@@ -494,6 +648,19 @@
   <span class="hint"><kbd>enter</kbd> save &nbsp; <kbd>esc</kbd> cancel</span>
 </div>
 
+<div id="composer" role="dialog" aria-label="note">
+  <div class="tones">
+    <button type="button" data-tone="issue">Issue</button>
+    <button type="button" data-tone="praise">Praise</button>
+    <button type="button" data-tone="question">Question</button>
+  </div>
+  <textarea id="composerText" rows="1" spellcheck="true"></textarea>
+  <div class="foot">
+    <label id="flowAll"><input type="checkbox" id="flowAllBox"> every step of this flow</label>
+    <span class="hint">enter · tab tone · esc</span>
+  </div>
+</div>
+
 <div id="toast">
   <span class="what" id="toastWhat"></span>
   <span class="bar"><i></i></span>
@@ -504,6 +671,7 @@
   <div class="panel">
     <h2>KEYS</h2>
     <dl>
+      <dt><kbd>click</kbd></dt>                <dd>pin a note, drag for a box</dd>
       <dt><kbd>j</kbd><kbd>k</kbd></dt>       <dd>next / previous card</dd>
       <dt><kbd>space</kbd></dt>                <dd>cycle new, swipe, diff (what this card has)</dd>
       <dt><kbd>b</kbd></dt>                    <dd>hold to peek the baseline</dd>
@@ -527,6 +695,9 @@
   const el = {
     ctx: $('#ctx'), key: $('#key'), variant: $('#variant'), dims: $('#dims'), count: $('#count'),
     stage: $('#stage'), frame: $('#frame'), base: $('#base'), shot: $('#shot'),
+    marks: $('#marks'), notes: $('#notes'), composer: $('#composer'), composerText: $('#composerText'),
+    flowAll: $('#flowAll'), flowAllBox: $('#flowAllBox'),
+    okKey: $('#okKey'), okLabel: $('#okLabel'), flagKey: $('#flagKey'), flagLabel: $('#flagLabel'),
     layer: $('#layer'), stat: $('#stat'), changes: $('#changes'), strip: $('#strip'),
     empty: $('#empty'), emptySub: $('#emptySub'),
     note: $('#note'), noteTag: $('#noteTag'), noteInput: $('#noteInput'),
@@ -739,6 +910,7 @@
       el.ctx.textContent = el.key.textContent = el.variant.textContent = '';
       el.dims.replaceChildren();
       el.changes.replaceChildren();
+      el.notes.classList.remove('show');
       el.count.textContent = '';
       el.stat.textContent = '';
       el.strip.classList.remove('show');
@@ -876,11 +1048,15 @@
     const w = Math.max(...imgs.map(i => i.naturalWidth));
     const h = Math.max(...imgs.map(i => i.naturalHeight));
     const cs = getComputedStyle(el.stage);
+    // The notes panel takes its width out of the room instead of covering the shot: a note
+    // is useless if it hides the thing it is about.
+    const panel = el.notes.classList.contains('show') ? el.notes.offsetWidth + 16 : 0;
     const room = {
-      w: el.stage.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight),
+      w: el.stage.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) - panel,
       h: el.stage.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom),
     };
     const scale = Math.min(room.w / w, room.h / h, 1);
+    shown = scale;
     el.frame.style.width = `${Math.round(w * scale)}px`;
     el.frame.style.height = `${Math.round(h * scale)}px`;
     for (const i of [el.shot, el.base]) {
@@ -889,11 +1065,284 @@
     const fw = w * scale;
     if (cut === null || cut > fw) cut = fw / 2;
     el.frame.style.setProperty('--cut', `${cut}px`);
+    el.frame.style.marginRight = `${panel}px`;
+    drawMarks();
   }
 
   el.shot.addEventListener('load', fit);
   el.base.addEventListener('load', fit);
   addEventListener('resize', fit);
+
+  /* ---------- annotations ---------- */
+
+  // Coordinates are kept in the shot's own pixels, never CSS pixels, so a note lands on the
+  // same spot at any window size and can travel to the agent as an image region.
+  // Conventional Comments' vocabulary, the one reviewers already know from code review.
+  const TONES = ['issue', 'praise', 'question'];
+  const PROMPT = { issue: 'What should change?', praise: 'What is right here? (keep it)', question: 'What do you want to know?' };
+  const notesBy = new Map();   // digest -> [{x, y, w, h, tone, text, flow}]
+  let shown = 1;               // CSS px per image px, set by fit()
+  let draft = null;            // {it, note, fresh} while the composer is open
+  let drawing = null;          // {x0, y0, box} while a drag is in progress
+  let hot = -1;                // note index under the pointer, mirrored in marks and list
+  const entering = new WeakSet(); // notes placed since the last draw, the only ones that animate
+
+  const notesOf = it => (it && notesBy.get(it.digest)) || [];
+  const toneVar = t => `var(--${t})`;
+  const flowBase = it => (it.key.includes('#') ? `${it.projectId} ${it.key.split('#')[0]} ${it.variant}` : '');
+
+  // A flow-wide note is written once, on the step where it was seen, and shown on every
+  // other step of that flow as carried. It is not re-pinned: the same element sits
+  // somewhere else on each screen, so copied coordinates would point at the wrong thing.
+  function carried(it) {
+    const base = flowBase(it);
+    if (!base) return [];
+    const out = [];
+    for (const q of all) {
+      if (q.digest === it.digest || flowBase(q) !== base) continue;
+      notesOf(q).forEach((n, i) => n.flow && out.push({ ...n, from: q.key.split('#')[1], index: i }));
+    }
+    return out;
+  }
+
+  const toImage = e => {
+    const r = el.marks.getBoundingClientRect();
+    const clamp = (v, max) => Math.max(0, Math.min(max, v));
+    return {
+      x: Math.round(clamp((e.clientX - r.left) / shown, el.shot.naturalWidth)),
+      y: Math.round(clamp((e.clientY - r.top) / shown, el.shot.naturalHeight)),
+    };
+  };
+
+  function boxEl(n, extra) {
+    const b = document.createElement('div');
+    b.className = `box ${extra || ''}`;
+    b.style.setProperty('--tone', toneVar(n.tone));
+    Object.assign(b.style, { left: `${n.x * shown}px`, top: `${n.y * shown}px`, width: `${n.w * shown}px`, height: `${n.h * shown}px` });
+    return b;
+  }
+
+  function drawMarks() {
+    const it = current();
+    const list = notesOf(it);
+    const kids = [];
+    list.forEach((n, i) => {
+      if (n.w && n.h) { const b = boxEl(n, i === hot ? 'hot' : ''); b.dataset.i = i; kids.push(b); }
+      const pin = document.createElement('div');
+      pin.className = `pin${i === hot ? ' hot' : ''}${entering.has(n) ? ' enter' : ''}`;
+      pin.dataset.i = i;
+      pin.style.setProperty('--tone', toneVar(n.tone));
+      pin.style.left = `${n.x * shown}px`;
+      pin.style.top = `${n.y * shown}px`;
+      pin.textContent = i + 1;
+      pin.onpointerdown = e => e.stopPropagation();
+      pin.onclick = e => { e.stopPropagation(); edit(it, list[i], false); };
+      pin.onpointerenter = () => setHot(i);
+      pin.onpointerleave = () => setHot(-1);
+      kids.push(pin);
+    });
+    if (drawing && drawing.box) kids.push(drawing.box);
+    el.marks.replaceChildren(...kids);
+    drawList(it);
+    list.forEach(n => entering.delete(n));
+  }
+
+  // Hover only moves a class. Rebuilding the marks here replayed every animation.
+  function setHot(i) {
+    if (hot === i) return;
+    hot = i;
+    for (const node of [...el.marks.children, ...el.notes.children]) {
+      if (node.dataset.i !== undefined) node.classList.toggle('hot', Number(node.dataset.i) === i);
+    }
+  }
+
+  function drawList(it) {
+    const list = notesOf(it);
+    const from = it ? carried(it) : [];
+    const had = el.notes.classList.contains('show');
+    const has = list.length + from.length > 0;
+    // On a wide window the panel's room is reserved even when empty, so the first note does
+    // not shrink and shift the shot under the pin that was just placed.
+    const wide = matchMedia('(min-width: 1000px)').matches;
+    el.notes.classList.toggle('show', has || (wide && Boolean(it)));
+    verdictHint(it);
+    if (!has) {
+      const hint = document.createElement('p');
+      hint.className = 'empty-hint';
+      hint.textContent = 'Click the shot to pin a note, drag for a box. Issues request changes, praise approves.';
+      el.notes.replaceChildren(hint);
+      if (had !== el.notes.classList.contains('show')) fit();
+      return;
+    }
+    const item = (n, i, carriedFrom) => {
+      const row = document.createElement('div');
+      row.className = `note${i === hot && !carriedFrom ? ' hot' : ''}${carriedFrom ? ' carried' : ''}${!carriedFrom && entering.has(n) ? ' enter' : ''}`;
+      if (!carriedFrom) row.dataset.i = i;
+      row.style.setProperty('--tone', toneVar(n.tone));
+      const num = document.createElement('span');
+      num.className = 'num';
+      num.textContent = carriedFrom ? `#${carriedFrom}` : i + 1;
+      const body = document.createElement('div');
+      body.className = 'body';
+      body.textContent = n.text || 'writing…';
+      if (!n.text) body.style.color = 'var(--faint)';
+      const meta = document.createElement('span');
+      meta.className = 'meta';
+      meta.textContent = carriedFrom ? `${n.tone}, from step ${carriedFrom}` : n.flow ? `${n.tone}, every step` : n.tone;
+      body.append(meta);
+      row.append(num, body);
+      if (!carriedFrom) {
+        const del = document.createElement('button');
+        del.className = 'del';
+        del.title = 'delete';
+        del.textContent = '×';
+        del.onclick = e => { e.stopPropagation(); list.splice(i, 1); hot = -1; drawMarks(); };
+        row.append(del);
+        row.onclick = () => edit(it, n, false);
+        row.onpointerenter = () => setHot(i);
+        row.onpointerleave = () => setHot(-1);
+      }
+      return row;
+    };
+    const head = text => { const h = document.createElement('h3'); h.textContent = text; return h; };
+    const rows = [];
+    if (list.length) rows.push(head(`NOTES ${list.length}`), ...list.map((n, i) => item(n, i)));
+    if (from.length) rows.push(head('FROM THIS FLOW'), ...from.map(n => item(n, n.index, n.from)));
+    el.notes.replaceChildren(...rows);
+    if (!had) fit();
+  }
+  addEventListener('resize', () => drawList(current()));
+
+  // The verdict follows the notes (GitHub's review model): any issue means request changes, praise and questions
+  // alone mean approve. Both keys still work; the suggested one just glows.
+  function verdictHint(it) {
+    const list = notesOf(it);
+    const issues = list.filter(n => n.tone === 'issue').length;
+    el.okLabel.textContent = list.length ? 'approve with notes' : 'ok';
+    el.flagLabel.textContent = list.length ? 'request changes' : 'flag';
+    el.okKey.classList.toggle('suggest', list.length > 0 && !issues);
+    el.flagKey.classList.toggle('suggest', issues > 0);
+  }
+
+  el.marks.addEventListener('pointerdown', e => {
+    if (e.button !== 0 || !current()) return;
+    if (draft) return closeComposer(true);
+    e.preventDefault();
+    try { el.marks.setPointerCapture(e.pointerId); } catch {}
+    const p = toImage(e);
+    drawing = { x0: p.x, y0: p.y, cx: e.clientX, cy: e.clientY, box: null };
+  });
+
+  el.marks.addEventListener('pointermove', e => {
+    if (!drawing) return;
+    // Under 5px of travel it is a click that wobbled, not a box.
+    if (!drawing.box && Math.hypot(e.clientX - drawing.cx, e.clientY - drawing.cy) < 5) return;
+    const p = toImage(e);
+    const n = {
+      x: Math.min(drawing.x0, p.x), y: Math.min(drawing.y0, p.y),
+      w: Math.abs(p.x - drawing.x0), h: Math.abs(p.y - drawing.y0), tone: 'issue',
+    };
+    drawing.rect = n;
+    if (!drawing.box) {
+      drawing.box = boxEl(n, 'drawing');
+      el.marks.append(drawing.box);
+      return;
+    }
+    Object.assign(drawing.box.style, { left: `${n.x * shown}px`, top: `${n.y * shown}px`, width: `${n.w * shown}px`, height: `${n.h * shown}px` });
+  });
+
+  el.marks.addEventListener('pointerup', () => {
+    if (!drawing) return;
+    const it = current();
+    const n = drawing.rect && drawing.rect.w > 4 && drawing.rect.h > 4
+      ? { ...drawing.rect, text: '', flow: false }
+      : { x: drawing.x0, y: drawing.y0, w: 0, h: 0, tone: 'issue', text: '', flow: false };
+    drawing = null;
+    if (!notesBy.has(it.digest)) notesBy.set(it.digest, []);
+    notesBy.get(it.digest).push(n);
+    entering.add(n);
+    edit(it, n, true);
+  });
+
+  function setTone(t) {
+    draft.note.tone = t;
+    el.composer.style.setProperty('--tone', toneVar(t));
+    el.composer.querySelectorAll('.tones button').forEach(b => b.classList.toggle('on', b.dataset.tone === t));
+    el.composerText.placeholder = PROMPT[t];
+    drawMarks();
+  }
+
+  function edit(it, note, fresh) {
+    if (draft && draft.note !== note) closeComposer(true);
+    draft = { it, note, fresh };
+    hot = notesOf(it).indexOf(note);
+    drawMarks();
+    el.composerText.value = note.text;
+    el.flowAll.style.display = flowBase(it) ? '' : 'none';
+    el.flowAllBox.checked = Boolean(note.flow);
+    setTone(note.tone);
+    el.composer.classList.add('show');
+    place(note);
+    requestAnimationFrame(() => el.composer.classList.add('in'));
+    autosize();
+    el.composerText.focus();
+  }
+
+  // Beside the mark, never on it: right of the box when there is room, else left, and
+  // kept inside the window.
+  function place(n) {
+    const r = el.marks.getBoundingClientRect();
+    const cw = el.composer.offsetWidth || 300;
+    const ch = el.composer.offsetHeight || 150;
+    const right = r.left + (n.x + n.w) * shown + 14;
+    const left = r.left + n.x * shown - cw - 14;
+    const x = right + cw < innerWidth - 8 ? right : Math.max(8, left);
+    const y = Math.max(8, Math.min(innerHeight - ch - 8, r.top + n.y * shown - 26));
+    Object.assign(el.composer.style, { left: `${x}px`, top: `${y}px` });
+  }
+
+  function autosize() {
+    el.composerText.style.height = 'auto';
+    el.composerText.style.height = `${el.composerText.scrollHeight + 2}px`;
+  }
+
+  // Saving keeps text; an empty note is dropped rather than left as a blank pin.
+  function closeComposer(save) {
+    if (!draft) return;
+    const { it, note, fresh } = draft;
+    const text = el.composerText.value.trim();
+    const list = notesOf(it);
+    let saved = -1;
+    if (save && text) {
+      note.text = text;
+      note.flow = el.flowAllBox.checked && Boolean(flowBase(it));
+      saved = list.indexOf(note);
+    } else if (fresh || (save && !text)) {
+      list.splice(list.indexOf(note), 1);
+    }
+    draft = null;
+    hot = -1;
+    el.composer.classList.remove('in', 'show');
+    el.composerText.blur();
+    drawMarks();
+    if (saved >= 0) el.marks.querySelectorAll('.pin')[saved]?.classList.add('saved');
+  }
+
+  el.composer.querySelectorAll('.tones button').forEach(b => {
+    b.onclick = () => { setTone(b.dataset.tone); el.composerText.focus(); };
+  });
+  el.composerText.addEventListener('input', autosize);
+  el.composerText.addEventListener('keydown', e => {
+    e.stopPropagation();
+    if (e.key === 'Escape') return closeComposer(false);
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      const i = TONES.indexOf(draft.note.tone);
+      return setTone(TONES[(i + (e.shiftKey ? TONES.length - 1 : 1)) % TONES.length]);
+    }
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); closeComposer(true); }
+  });
+  addEventListener('resize', () => draft && place(draft.note));
 
   // The divider follows the pointer, no drag: comparing is scrubbing back and forth, and
   // a grab handle turns every pass into two extra motions.
@@ -929,6 +1378,8 @@
 
   function go(i) {
     if (!queue.length) return;
+    if (draft) closeComposer(true);
+    hot = -1;
     at = Math.max(0, Math.min(queue.length - 1, i));
     layer = 0;
     render();
@@ -941,7 +1392,7 @@
   function verdict(kind, note, whole) {
     const it = current();
     if (!it) return;
-    if (kind === 'flag' && !note) return openNote('flag');
+    if (kind === 'flag' && !note && !notesOf(it).length) return openNote('flag');
     flushVerdict();
 
     // Ascending index order throughout, and removal walks it backwards, so undo can put
@@ -986,6 +1437,11 @@
         body: JSON.stringify({
           project: item.projectId, key: item.key, variant: item.variant,
           digest: item.digest, verdict: p.verdict, note: p.note,
+          // The daemon names the element under each mark and writes the text the agent
+          // reads, so only the marks travel. Picked field by field because the daemon
+          // rejects unknown fields, and a carried flow copy holds display-only ones.
+          regions: notesOf(item).filter(n => n.text)
+            .map(({ x, y, w, h, tone, text, flow }) => ({ x, y, w, h, tone, text, flow })),
         }),
       }).catch(() => {
         // Never lose the reviewer's words: put the card back and say so.
@@ -1048,7 +1504,7 @@
 
   addEventListener('keydown', e => {
     if (e.metaKey || e.ctrlKey || e.altKey) return;
-    if (el.note.classList.contains('show')) return;
+    if (el.note.classList.contains('show') || draft) return;
 
     if (e.key === 'Escape') {
       if (el.help.classList.contains('show')) return el.help.classList.remove('show');
@@ -1081,7 +1537,8 @@
       // delivers this same keystroke to the field it just focused, so pressing f to
       // flag leaves an "f" to delete before you can type.
       case 'O': e.preventDefault(); return openNote('ok');
-      case 'f': case 'x': e.preventDefault(); return openNote('flag');
+      // Notes already say what is wrong, so a flag with notes needs no second note.
+      case 'f': case 'x': e.preventDefault(); return notesOf(current()).length ? verdict('flag', '') : openNote('flag');
       case 'u': return undo();
       case 'p': return el.side.classList.toggle('open');
     }
