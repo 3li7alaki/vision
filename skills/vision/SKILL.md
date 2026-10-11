@@ -21,17 +21,38 @@ navigates, never clicks, never seeds, never logs in. Then:
 vision snap checkout/empty-cart --as mobile-dark
 ```
 
-That is the whole surface for capture. The shot is filed, compared against what the human last
+That is the whole surface for a still. The shot is filed, compared against what the human last
 approved, and pushed live to the gallery. If it is byte-identical to the approved baseline it is
 archived silently and never bothers anyone.
 
 Snap after the state is settled, not while something is still loading. `pinchtab capture` waits
 for stability; do not race it.
 
+To review one component rather than the page, clip to it: `vision snap wallet/balance-card
+--selector '[data-testid=balance]'`. An element shot is its own picture and never diffs
+against a viewport shot of the same key, so give it its own key or variant.
+
 Snaps record your session automatically from the first non-empty `VISION_SESSION_ID`,
 `CLAUDE_CODE_SESSION_ID`, or `CODEX_THREAD_ID`. An empty or `about:blank` tab is refused: point
 `PINCHTAB_SERVER` at your own instance and navigate first. `vision snap` captures the browser;
 redirecting a PNG into stdin does not supply a screenshot.
+
+## Record a flow
+
+A still cannot show motion or order: a toast that appears and leaves, a transition, a flow
+whose bug is in the sequence. Record it with PinchTab and hand the file to vision:
+
+```bash
+pinchtab record start /tmp/pay-flow.mp4 --fps 10
+# drive the flow
+pinchtab record stop
+vision add checkout/pay-flow /tmp/pay-flow.mp4 --as desktop-dark
+```
+
+`vision add` takes mp4 or webm up to 15 MB and refuses a PNG: a still comes from `vision snap`.
+A recording is never pixel diffed. A byte-identical one is archived silently like any shot;
+any other reaches the human, who compares it by playing the approved recording at the same
+moment. Keep a recording short and about one thing, because the human watches all of it.
 
 ## Keys and variants
 
@@ -117,12 +138,57 @@ The daemon sweeps session mappings and thread cursors unused for 30 days at star
 touches ledgers, the project cursor, shots or baselines. Missing thread cursors replay from 0;
 open flags remain independent of cursor delivery.
 
+## Wait for the verdict without blocking
+
+```bash
+vision notes --wait 30m        # run it in the background; it exits when the human answers
+```
+
+It returns as soon as a verdict lands on your thread, prints it like `--unread`, and exits
+1 with `no new verdicts after 30m` if nobody answered. Background it and keep working; its
+exit is what tells you the review is in. It shares the unread cursor with `--unread
+--session`, so a verdict is delivered once, by whichever reads first. The ceiling is 24h.
+
+The human can mark the picture instead of writing one note. Each mark comes back as its own
+line naming the element under it, with a tone:
+
+```text
+flag wallet/top-up@desktop: [1] issue on button "Withdraw": too close to the edge
+    [2] question at 120,40: is this the final copy?
+    [3] praise (every step) on heading "Wallet": keep this spacing
+```
+
+`issue` asks for a change, `question` asks you to answer before changing anything, `praise`
+says leave it. `(every step)` means the note applies to every step of that flow, not only
+the one it was written on. With `--json`, the same marks are in `regions` with pixel
+coordinates.
+
+On a recording each mark also names its moment, `[1] issue 0:01.3 at 40,300: box should be
+red`, and `regions` carries it as `t`, in seconds.
+
+## Re-snap freely, withdraw what you abandoned
+
+A new snap of the same key and variant replaces your older pending one: the human only ever
+reviews the latest. Iterate without cleaning up.
+
+A key you abandoned (renamed, deleted, or shot by mistake) does not get replaced, so
+withdraw it:
+
+```bash
+vision discard storefront/category-icon-sample --as scheme=light,vp=desktop
+```
+
+It withdraws only your own thread's shots that nobody has judged yet. It never approves,
+never moves a baseline, and is recorded permanently. A flagged or approved shot cannot be
+withdrawn: fix a flag by re-snapping.
+
 ## Rules
 
 1. Never block a turn waiting for the human to review. Snap and keep going.
 2. Never mark your own work visually approved. The only thing that approves a shot is a human
    pressing ok in the gallery. Do not infer approval from silence.
-3. Never delete or rewrite shots, notes, or baselines to make a queue look clean.
+3. Never delete or rewrite shots, notes, or baselines to make a queue look clean. `discard`
+   is for keys you abandoned, never for a shot you would rather the human did not see.
 4. If `vision snap` reports no daemon, say so and name `vision on`. Do not silently skip the
    capture and claim the UI was checked.
 5. A screenshot proves a render happened, not that the interface is good. Do not cite one as
