@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 	"vision/internal/base"
 	"vision/internal/capture"
 	"vision/internal/server"
@@ -62,7 +63,7 @@ func run(args []string) error {
 	}
 }
 
-const usageText = "usage: vision snap <key> [--as <variant> | --dim k=v...] [--meta k=v...] [--note <text>] [--json] | vision notes [--unread | --since <duration> | --open (requires --session)] [--flagged] [--session <id>] [--json] | vision on | off | vision status [--session <id>] [--json] | vision session join <thread> | vision session thread [--json] | vision --version"
+const usageText = "usage: vision snap <key> [--as <variant> | --dim k=v...] [--selector <css>] [--meta k=v...] [--note <text>] [--json] | vision notes [--unread | --since <duration> | --open (requires --session)] [--flagged] [--session <id>] [--json] | vision on | off | vision status [--session <id>] [--json] | vision session join <thread> | vision session thread [--json] | vision --version"
 
 func usage() error {
 	return errors.New(usageText)
@@ -179,6 +180,54 @@ func deriveDims(dims map[string]string, conditions store.Conditions) {
 	}
 }
 
+func validateSelector(selector string) error {
+	if selector == "" || len(selector) > 500 {
+		return errors.New("selector must be non-empty and at most 500 bytes")
+	}
+	for _, r := range selector {
+		if unicode.IsControl(r) {
+			return errors.New("selector must not contain control characters")
+		}
+	}
+	return nil
+}
+
+func viewportClaim(variant string, dims map[string]string) string {
+	if len(dims) != 0 {
+		return dims["vp"]
+	}
+	claim := ""
+	for _, token := range strings.FieldsFunc(strings.ToLower(variant), func(r rune) bool {
+		return strings.ContainsRune("-_,=@.", r)
+	}) {
+		switch token {
+		case "mobile", "tablet", "desktop":
+			// A label naming multiple classes cannot justify rejecting one viewport class.
+			if claim != "" && claim != token {
+				return ""
+			}
+			claim = token
+		}
+	}
+	return claim
+}
+
+func checkViewportClaim(claim string, conditions store.Conditions) error {
+	if claim == "" || conditions.Width <= 0 {
+		return nil
+	}
+	actual := store.ViewportClass(conditions.Width)
+	if claim == actual {
+		return nil
+	}
+	size := map[string]string{"mobile": "390 844", "tablet": "820 1180", "desktop": "1440 900"}[claim]
+	hint := "set the viewport first"
+	if size != "" {
+		hint += " (pinchtab set viewport " + size + ")"
+	}
+	return fmt.Errorf("variant says %s but the viewport is %dx%d (%s); %s, then snap again", claim, conditions.Width, conditions.Height, actual, hint)
+}
+
 type keyValueFlag map[string]string
 
 func (values keyValueFlag) String() string { return "" }
@@ -204,17 +253,26 @@ func snap(args []string) error {
 	fs.SetOutput(io.Discard)
 	dims, meta := keyValueFlag{}, keyValueFlag{}
 	variant, note, asJSON := fs.String("as", "default", "variant"), fs.String("note", "", "note"), fs.Bool("json", false, "JSON output")
+	selector := fs.String("selector", "", "CSS selector to capture")
 	fs.Var(dims, "dim", "visual dimension k=v")
 	fs.Var(meta, "meta", "provenance k=v")
 	if err := fs.Parse(args[1:]); err != nil || fs.NArg() != 0 {
 		return usage()
 	}
-	asSet := false
+	asSet, selectorSet := false, false
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "as" {
 			asSet = true
 		}
+		if f.Name == "selector" {
+			selectorSet = true
+		}
 	})
+	if selectorSet {
+		if err := validateSelector(*selector); err != nil {
+			return err
+		}
+	}
 	if asSet && len(dims) != 0 {
 		return errors.New("--as and --dim are mutually exclusive")
 	}
@@ -239,8 +297,12 @@ func snap(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	shot, err := capture.Take(ctx)
+	shot, err := capture.Take(ctx, *selector)
 	if err != nil {
+		return err
+	}
+	// Check before deriving dimensions because measured values are not caller claims.
+	if err := checkViewportClaim(viewportClaim(*variant, dims), shot.Conditions); err != nil {
 		return err
 	}
 	if len(dims) != 0 {

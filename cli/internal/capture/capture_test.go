@@ -10,6 +10,7 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -31,6 +32,24 @@ func TestPinchtabScopesToServer(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+}
+
+func TestCaptureArgs(t *testing.T) {
+	for _, server := range []string{"", "http://127.0.0.1:9999"} {
+		t.Setenv("PINCHTAB_SERVER", server)
+		for _, selector := range []string{"", `footer [data-role="card"]`} {
+			want := []string{"capture", "--json", "--beyond-viewport", "-o", "shot.png", "--format", "png"}
+			if selector != "" {
+				want = append(want, "-s", selector)
+			}
+			if server != "" {
+				want = append([]string{"--server", server}, want...)
+			}
+			if got := captureArgs("shot.png", selector); !slices.Equal(got, want) {
+				t.Errorf("server=%q selector=%q: got %v, want %v", server, selector, got, want)
+			}
 		}
 	}
 }
@@ -146,7 +165,7 @@ func TestTakeRefusesBlankTab(t *testing.T) {
 		`{"url":"http://localhost:3000/cart","colorScheme":"light","image":{"viewport":{"w":4,"h":3}}}`,
 	} {
 		t.Setenv("VISION_TEST_CAPTURE", body)
-		shot, err := Take(context.Background())
+		shot, err := Take(context.Background(), "")
 		if strings.Contains(body, "localhost") {
 			if err != nil || shot.Conditions.URL != "http://localhost:3000/cart" {
 				t.Fatalf("valid page rejected: %#v %v", shot, err)
@@ -189,7 +208,7 @@ func TestCaptureErrorWedgeGuidance(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	if _, err := Take(context.Background()); err == nil || !strings.Contains(err.Error(), "browser instance looks wedged") {
+	if _, err := Take(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "browser instance looks wedged") {
 		t.Fatalf("Take lost wedge guidance: %v", err)
 	}
 }
@@ -202,7 +221,7 @@ func TestTakeCutsTheViewportOutOfTheDocument(t *testing.T) {
 	argsPath := fakePinchtab(t, positional(40, 100))
 	t.Setenv("VISION_TEST_CAPTURE", `{"url":"http://localhost:3000/cart","colorScheme":"light",
 	  "image":{"coordinateSpace":"document","devicePixelRatio":1,"viewport":{"w":30,"h":20,"scrollX":5,"scrollY":50}}}`)
-	shot, err := Take(context.Background())
+	shot, err := Take(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,6 +238,64 @@ func TestTakeCutsTheViewportOutOfTheDocument(t *testing.T) {
 	}
 	if r, g, _, _ := img.At(img.Bounds().Min.X, img.Bounds().Min.Y).RGBA(); r>>8 != 5 || g>>8 != 50 {
 		t.Fatalf("shot starts at document (%d,%d), want the scroll offset (5,50)", r>>8, g>>8)
+	}
+}
+
+func TestTakeElementKeepsViewportConditions(t *testing.T) {
+	fakePinchtab(t, positional(8, 4))
+	t.Setenv("VISION_TEST_CAPTURE", `{"url":"http://localhost:3000/cart","colorScheme":"light",
+	  "image":{"coordinateSpace":"clip","devicePixelRatio":1,"clip":{"w":8,"h":4,"x":0,"y":900},
+	  "viewport":{"w":390,"h":844,"scrollX":0,"scrollY":0}}}`)
+	shot, err := Take(context.Background(), "footer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := shot.Conditions; c.Width != 390 || c.Height != 844 || c.Selector != "footer" {
+		t.Fatalf("element changed the viewport conditions or lost its selector: %#v", c)
+	}
+	img, err := png.Decode(bytes.NewReader(shot.PNG))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if img.Bounds() != image.Rect(0, 0, 8, 4) {
+		t.Fatalf("element was cropped to %v", img.Bounds())
+	}
+}
+
+func TestCropCapture(t *testing.T) {
+	var data bytes.Buffer
+	if err := png.Encode(&data, positional(40, 100)); err != nil {
+		t.Fatal(err)
+	}
+	for _, space := range []string{"clip", "viewport", "document", ""} {
+		t.Run(space, func(t *testing.T) {
+			captureImage := map[string]any{
+				"coordinateSpace": space,
+				"viewport": map[string]any{
+					"w": float64(30), "h": float64(20), "scrollX": float64(5), "scrollY": float64(50),
+				},
+			}
+			out, err := cropCapture(data.Bytes(), captureImage, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if space == "clip" {
+				if !bytes.Equal(out, data.Bytes()) {
+					t.Fatal("already clipped element was cropped or re-encoded")
+				}
+				return
+			}
+			img, err := png.Decode(bytes.NewReader(out))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if img.Bounds() != image.Rect(0, 0, 30, 20) {
+				t.Fatalf("shot is %v, want the viewport", img.Bounds())
+			}
+			if r, g, _, _ := img.At(0, 0).RGBA(); r>>8 != 5 || g>>8 != 50 {
+				t.Fatalf("viewport starts at (%d,%d), want (5,50)", r>>8, g>>8)
+			}
+		})
 	}
 }
 

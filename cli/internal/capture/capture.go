@@ -23,9 +23,9 @@ type Result struct {
 
 // pinchtab prefixes an argument list with the server this process was told to talk to.
 //
-// PinchTab's unit of isolation is the browser instance, and the only way to name one is the
-// global --server flag: `capture` has no --tab, so it always acts on its server's current
-// tab. Without this, two agents working at once share one browser and one shot lands in the
+// PinchTab's unit of isolation is the browser instance, named by the global --server flag.
+// vision leaves capture's --tab unset so it photographs the server's current tab. Without
+// server scoping, two agents working at once share one browser and one shot lands in the
 // other's page, which looks like a real regression rather than a mixup. PinchTab has no
 // environment variable of its own for this, so vision reads one and passes the flag.
 //
@@ -37,7 +37,15 @@ func pinchtab(args ...string) []string {
 	return args
 }
 
-func Take(ctx context.Context) (Result, error) {
+func captureArgs(path, selector string) []string {
+	args := []string{"capture", "--json", "--beyond-viewport", "-o", path, "--format", "png"}
+	if selector != "" {
+		args = append(args, "-s", selector)
+	}
+	return pinchtab(args...)
+}
+
+func Take(ctx context.Context, selector string) (Result, error) {
 	f, err := os.CreateTemp("", "vision-*.png")
 	if err != nil {
 		return Result{}, err
@@ -50,9 +58,9 @@ func Take(ctx context.Context) (Result, error) {
 	// 2560x1440, internal/bridge/runtime/init.go in pinchtab 0.15.2) and opens new tabs at
 	// 1280x720, so an emulated 1440x700 viewport is wider than the real window and a plain
 	// capture comes back with the overhang unpainted white. Puppeteer captures this way by
-	// default (captureBeyondViewport) for the same reason. The image is the whole document,
-	// so it is cropped back to the viewport below.
-	cmd := exec.CommandContext(ctx, "pinchtab", pinchtab("capture", "--json", "--beyond-viewport", "-o", path, "--format", "png")...)
+	// default (captureBeyondViewport) for the same reason. Whole-document images are cropped
+	// back to the viewport below; element images are already clipped by PinchTab.
+	cmd := exec.CommandContext(ctx, "pinchtab", captureArgs(path, selector)...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return Result{}, captureError(err, out)
@@ -62,6 +70,7 @@ func Take(ctx context.Context) (Result, error) {
 		return Result{}, fmt.Errorf("decode pinchtab response: %w", err)
 	}
 	c := conditions(raw)
+	c.Selector = selector
 	// A fresh or accidentally shared instance can successfully capture its empty tab. That
 	// is not evidence of the page the caller meant to show, so refuse it before it reaches
 	// the queue. Redirecting a PNG into stdin cannot supply the browser state either.
@@ -72,13 +81,22 @@ func Take(ctx context.Context) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	if pngData, err = cropToViewport(pngData, object(object(raw, "image"), "viewport"), c.DPR); err != nil {
+	if pngData, err = cropCapture(pngData, object(raw, "image"), c.DPR); err != nil {
 		return Result{}, err
 	}
 	if c.Scheme == "" {
 		c.Scheme = scheme(ctx, text(raw["tabId"]))
 	}
 	return Result{PNG: pngData, Conditions: c, Raw: raw}, nil
+}
+
+// PinchTab clips element shots itself, so viewport cropping would discard the element or
+// reject an image smaller than the viewport.
+func cropCapture(data []byte, captureImage map[string]any, dpr float64) ([]byte, error) {
+	if text(captureImage["coordinateSpace"]) == "clip" {
+		return data, nil
+	}
+	return cropToViewport(data, object(captureImage, "viewport"), dpr)
 }
 
 // cropToViewport cuts the viewport the caller was looking at out of a whole-document capture:
