@@ -43,6 +43,9 @@ type Conditions struct {
 	DPR    float64 `json:"dpr"`
 	URL    string  `json:"url"`
 	Scheme string  `json:"scheme"`
+	// Selector is the CSS selector an element shot was clipped to, empty for a viewport
+	// shot. An element and the viewport around it are different pictures, never a diff.
+	Selector string `json:"selector,omitempty"`
 }
 
 type Snap struct {
