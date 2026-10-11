@@ -202,6 +202,139 @@ func TestSnapDiffSurvivesHeightAndURLDrift(t *testing.T) {
 	}
 }
 
+// A project id reaches store paths, so malformed ids must fail before any state is written.
+func TestSnapRejectsInvalidProjectID(t *testing.T) {
+	for _, id := range []string{"../x", "not-a-hash", "", strings.Repeat("a", 63), strings.Repeat("A", 64)} {
+		t.Run(id, func(t *testing.T) {
+			state := t.TempDir()
+			t.Setenv("VISION_STATE_HOME", state)
+			var pngData bytes.Buffer
+			if err := png.Encode(&pngData, image.NewRGBA(image.Rect(0, 0, 1, 1))); err != nil {
+				t.Fatal(err)
+			}
+			body, err := json.Marshal(SnapRequest{Project: store.Project{ID: id}, Key: "orders/list", Variant: "default", PNG: base64.StdEncoding.EncodeToString(pngData.Bytes()), Elements: []store.Element{{Role: "button", Name: "Order", W: 1, H: 1}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := httptest.NewRecorder()
+			New().Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/snap", bytes.NewReader(body)))
+			var response struct {
+				Error string `json:"error"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			if rec.Code != http.StatusBadRequest || response.Error != "invalid project id" {
+				t.Errorf("snap: status=%d body=%s, want 400 invalid project id", rec.Code, rec.Body.String())
+			}
+			if entries, err := os.ReadDir(state); err != nil || len(entries) != 0 {
+				t.Fatalf("rejected snap wrote state: entries=%v err=%v", entries, err)
+			}
+		})
+	}
+}
+
+// Shared pixels save disk, but each project, key and variant still needs its own human review.
+func TestQueueKeepsIdenticalReviewsSeparate(t *testing.T) {
+	for _, tc := range []struct {
+		name, key, variant string
+		otherProject       bool
+	}{
+		{"keys", "orders/theme", "default", false},
+		{"variants", "orders/list", "dark", false},
+		{"projects", "orders/list", "default", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("VISION_STATE_HOME", t.TempDir())
+			id, otherID := strings.Repeat("a", 64), strings.Repeat("a", 64)
+			if tc.otherProject {
+				otherID = strings.Repeat("b", 64)
+			}
+			var pngData bytes.Buffer
+			if err := png.Encode(&pngData, image.NewRGBA(image.Rect(0, 0, 1, 1))); err != nil {
+				t.Fatal(err)
+			}
+			first := store.Snap{SchemaVersion: 1, TS: time.Now(), Key: "orders/list", Variant: "default", Digest: diff.Digest(pngData.Bytes()), Session: "mine"}
+			second := first
+			second.Key, second.Variant = tc.key, tc.variant
+			add := func(project string, snap store.Snap) {
+				t.Helper()
+				if err := store.AppendSnap(project, snap, pngData.Bytes()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			check := func(want int) []Item {
+				t.Helper()
+				items, err := Queue()
+				if err != nil || len(items) != want {
+					t.Fatalf("queue: got %d items err=%v, want %d", len(items), err, want)
+				}
+				if n, err := PendingCount(); err != nil || n != want {
+					t.Fatalf("total: pending=%d err=%v, want %d", n, err, want)
+				}
+				counts := map[string]int{id: want}
+				if tc.otherProject {
+					counts[id], counts[otherID] = want-1, 1
+				}
+				for project, count := range counts {
+					if n, err := PendingCountFor(project); err != nil || n != count {
+						t.Fatalf("project %s: pending=%d err=%v, want %d", project, n, err, count)
+					}
+					if n, err := PendingCountForSession(project, "mine"); err != nil || n != count {
+						t.Fatalf("session in %s: pending=%d err=%v, want %d", project, n, err, count)
+					}
+				}
+				return items
+			}
+			add(id, first)
+			add(id, first)
+			add(otherID, second)
+			check(2)
+			if err := store.AppendNote(id, store.Note{SchemaVersion: 1, TS: time.Now(), Key: first.Key, Variant: first.Variant, Digest: first.Digest, Verdict: "ok"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CopyBaseline(id, first.Key, first.Variant, first.Digest); err != nil {
+				t.Fatal(err)
+			}
+			for _, resnap := range []bool{false, true} {
+				if resnap {
+					add(id, first)
+				}
+				items := check(1)
+				if items[0].ProjectID != otherID || items[0].Key != second.Key || items[0].Variant != second.Variant {
+					t.Fatalf("remaining review: got %+v, want %s/%s@%s", items[0], otherID, second.Key, second.Variant)
+				}
+			}
+		})
+	}
+}
+
+// A later snap with shared pixels must not supply another review's baseline conditions.
+func TestBaselineRecordMatchesReview(t *testing.T) {
+	for _, tc := range []struct{ name, key, variant string }{
+		{"keys", "orders/theme", "default"},
+		{"variants", "orders/list", "dark"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("VISION_STATE_HOME", t.TempDir())
+			base := store.Snap{Key: "orders/list", Variant: "default", Digest: "sha256:aaaa", Conditions: store.Conditions{Width: 1}}
+			other := base
+			other.Key, other.Variant, other.Conditions.Width = tc.key, tc.variant, 2
+			for _, snap := range []store.Snap{base, other} {
+				if err := store.AppendSnap("p", snap, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := store.AppendNote("p", store.Note{Key: base.Key, Variant: base.Variant, Digest: base.Digest, Verdict: "ok"}); err != nil {
+				t.Fatal(err)
+			}
+			if got, ok := baselineRecord("p", base.Key, base.Variant); !ok || got.Key != base.Key || got.Variant != base.Variant || got.Conditions != base.Conditions {
+				t.Fatalf("baseline record: got %+v ok=%v, want %+v", got, ok, base)
+			}
+		})
+	}
+}
+
 // PendingCount is the cheap stand-in for Queue that a status line polls, so the number it
 // reports has to be the number the human will actually see. A badge that says 3 over an
 // empty queue is worse than no badge.
@@ -225,19 +358,19 @@ func TestPendingCountMatchesQueue(t *testing.T) {
 	}
 	add("sha256:aaaa")
 	add("sha256:bbbb")
-	if got := count(); got != 2 {
-		t.Fatalf("two unjudged: got %d, want 2", got)
+	if got := count(); got != 1 {
+		t.Fatalf("newest unjudged: got %d, want 1", got)
 	}
 	// A re-snap of identical content lands on the same digest, so it must not double count.
 	add("sha256:aaaa")
-	if got := count(); got != 2 {
-		t.Fatalf("duplicate digest: got %d, want 2", got)
+	if got := count(); got != 1 {
+		t.Fatalf("return to earlier digest: got %d, want 1", got)
 	}
 	if err := store.AppendNote("p", store.Note{SchemaVersion: 1, TS: time.Now(), Key: "checkout/cart", Variant: "default", Digest: "sha256:aaaa", Verdict: "ok"}); err != nil {
 		t.Fatal(err)
 	}
-	if got := count(); got != 1 {
-		t.Fatalf("after one verdict: got %d, want 1", got)
+	if got := count(); got != 0 {
+		t.Fatalf("after live review's verdict: got %d, want 0", got)
 	}
 }
 
@@ -565,12 +698,14 @@ func TestPendingCountForSession(t *testing.T) {
 		{Session: "mine", Digest: "flag"},
 		{Session: "", Digest: "anonymous"},
 	} {
+		// Give independent reviews separate keys so this fixture tests session deduplication, not supersede.
+		snap.Key, snap.Variant = "session/"+snap.Digest, "default"
 		if err := store.AppendSnap("p", snap, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for _, verdict := range []string{"ok", "flag"} {
-		if err := store.AppendNote("p", store.Note{Digest: verdict, Verdict: verdict}); err != nil {
+		if err := store.AppendNote("p", store.Note{Key: "session/" + verdict, Variant: "default", Digest: verdict, Verdict: verdict}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -626,6 +761,198 @@ func TestQueueItemCarriesHashedProjectID(t *testing.T) {
 	}
 	if items[0].Project != "shop" {
 		t.Fatalf("Project: got %q, want the display name shop", items[0].Project)
+	}
+}
+
+func TestQueueClosesSupersededAndWithdrawn(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	id := strings.Repeat("a", 64)
+	old := store.Snap{Key: "cart/empty", Variant: "default", Digest: "sha256:aaaa", Session: "mine"}
+	live, other := old, old
+	live.Digest, other.Session = "sha256:bbbb", "other"
+	for _, snap := range []store.Snap{old, live, live, other} {
+		if err := store.AppendSnap(id, snap, []byte(snap.Digest)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(want, mine, theirs int) {
+		t.Helper()
+		items, err := Queue()
+		if err != nil || len(items) != want {
+			t.Fatalf("queue=%v err=%v, want %d", items, err, want)
+		}
+		for session, count := range map[string]int{"": want, "mine": mine, "other": theirs} {
+			if n, err := PendingCountForSession(id, session); err != nil || n != count {
+				t.Fatalf("session %q count=%d err=%v, want %d", session, n, err, count)
+			}
+		}
+	}
+	check(2, 1, 1)
+	for i, snap := range []store.Snap{live, other} {
+		if err := store.AppendWithdrawal(id, store.Withdrawal{Key: snap.Key, Variant: snap.Variant, Digest: snap.Digest, Session: snap.Session, Thread: snap.ThreadID()}); err != nil {
+			t.Fatal(err)
+		}
+		check(1-i, 0, 1-i)
+	}
+}
+
+func TestWithdrawPending(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	id := strings.Repeat("a", 64)
+	old := store.Snap{Project: "shop", Key: "cart/empty", Variant: "default", Digest: "sha256:aaaa", Session: "predecessor", Thread: "shared"}
+	live, other := old, old
+	live.Digest, other.Digest, other.Thread = "sha256:bbbb", "sha256:cccc", "other"
+	for _, snap := range []store.Snap{old, live, live, other} {
+		if err := store.AppendSnap(id, snap, []byte(snap.Digest)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := New()
+	events := make(chan Item, 2)
+	s.clients[events] = struct{}{}
+	body, err := json.Marshal(WithdrawRequest{Project: id, Key: old.Key, Variant: old.Variant, Session: "successor", Thread: "shared"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/withdraw", bytes.NewReader(body)))
+		return rec
+	}
+	rec := request()
+	var response struct {
+		SchemaVersion int
+		Withdrawn     []string
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil || rec.Code != http.StatusCreated || response.SchemaVersion != 1 || !slices.Equal(response.Withdrawn, []string{live.Digest}) {
+		t.Fatalf("withdraw response: status=%d body=%s err=%v", rec.Code, rec.Body.String(), err)
+	}
+	withdrawals, err := store.Withdrawals(id)
+	if err != nil || len(withdrawals) != 1 || withdrawals[0].Digest != live.Digest || withdrawals[0].Session != "successor" || withdrawals[0].Thread != "shared" || withdrawals[0].SchemaVersion != 1 || withdrawals[0].TS.IsZero() {
+		t.Fatalf("withdrawals=%v err=%v", withdrawals, err)
+	}
+	dir, _ := store.ProjectDir(id)
+	data, err := os.ReadFile(filepath.Join(dir, "withdrawn.jsonl"))
+	if err != nil || bytes.Count(data, []byte("\n")) != 1 {
+		t.Fatalf("ledger=%q err=%v, want one line", data, err)
+	}
+	items, err := Queue()
+	if err != nil || len(items) != 1 || items[0].Thread != "other" || items[0].Digest != other.Digest {
+		t.Fatalf("queue after withdrawal=%v err=%v", items, err)
+	}
+	if n, err := PendingCountFor(id); err != nil || n != 1 {
+		t.Fatalf("count after withdrawal=%d err=%v", n, err)
+	}
+	select {
+	case event := <-events:
+		if event.ProjectID != id || event.Project != "shop" || event.Thread != "shared" || event.Key != old.Key || event.Variant != old.Variant || event.Digest != live.Digest || event.Status != "withdrawn" {
+			t.Fatalf("withdraw event=%+v", event)
+		}
+	default:
+		t.Fatal("withdrawal did not publish a live event")
+	}
+	if len(events) != 0 {
+		t.Fatal("duplicate snap published duplicate withdrawal")
+	}
+	if notes, err := store.Notes(id); err != nil || len(notes) != 0 {
+		t.Fatalf("withdrawal changed human verdicts: %v %v", notes, err)
+	}
+	baseline, _ := store.BaselinePath(id, old.Key, old.Variant)
+	if _, err := os.Stat(baseline); !os.IsNotExist(err) {
+		t.Fatalf("withdrawal created a baseline: %v", err)
+	}
+	rec = request()
+	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "nothing pending for cart/empty@default on this thread") {
+		t.Fatalf("repeat withdrawal: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWithdrawRefusesClosedOrOtherThread(t *testing.T) {
+	for _, mode := range []string{"flag", "ok", "other thread", "missing"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("VISION_STATE_HOME", t.TempDir())
+			id := strings.Repeat("a", 64)
+			snap := store.Snap{Key: "cart/empty", Variant: "default", Digest: "sha256:aaaa", Session: "mine"}
+			if mode == "other thread" {
+				snap.Thread = "other"
+			}
+			if mode != "missing" {
+				if err := store.AppendSnap(id, snap, []byte("shot")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode == "flag" || mode == "ok" {
+				if err := store.AppendNote(id, store.Note{Key: snap.Key, Variant: snap.Variant, Digest: snap.Digest, Verdict: mode, Note: "reviewed"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			body, _ := json.Marshal(WithdrawRequest{Project: id, Key: snap.Key, Variant: snap.Variant, Session: "mine", Thread: "mine"})
+			rec := httptest.NewRecorder()
+			New().Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/withdraw", bytes.NewReader(body)))
+			if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "nothing pending for cart/empty@default on this thread") {
+				t.Fatalf("refused withdrawal: status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if values, err := store.Withdrawals(id); err != nil || len(values) != 0 {
+				t.Fatalf("refused withdrawal wrote ledger: %v %v", values, err)
+			}
+		})
+	}
+}
+
+func TestWithdrawValidation(t *testing.T) {
+	id := strings.Repeat("a", 64)
+	for _, body := range []string{
+		`{"project":"../../etc","key":"cart/empty","variant":"default","thread":"mine"}`,
+		`{"project":"` + id + `","key":"invalid","variant":"default","thread":"mine"}`,
+		`{"project":"` + id + `","key":"cart/empty","variant":"bad/variant","thread":"mine"}`,
+		`{"project":"` + id + `","key":"cart/empty","variant":"default","thread":""}`,
+		`{"project":"` + id + `","key":"cart/empty","variant":"default","thread":"mine","unknown":true}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			state := t.TempDir()
+			t.Setenv("VISION_STATE_HOME", state)
+			rec := httptest.NewRecorder()
+			New().Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/withdraw", strings.NewReader(body)))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s, want 400", rec.Code, rec.Body.String())
+			}
+			if entries, err := os.ReadDir(state); err != nil || len(entries) != 0 {
+				t.Fatalf("invalid request wrote state: %v %v", entries, err)
+			}
+		})
+	}
+}
+
+func TestSnapDoesNotRequeueClosedReview(t *testing.T) {
+	for _, mode := range []string{"flag", "withdrawn"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("VISION_STATE_HOME", t.TempDir())
+			id := strings.Repeat("a", 64)
+			data := []byte("shot")
+			snap := store.Snap{Key: "cart/empty", Variant: "default", Digest: diff.Digest(data), Session: "mine"}
+			if err := store.AppendSnap(id, snap, data); err != nil {
+				t.Fatal(err)
+			}
+			var err error
+			if mode == "flag" {
+				err = store.AppendNote(id, store.Note{Key: snap.Key, Variant: snap.Variant, Digest: snap.Digest, Verdict: "flag", Note: "fix"})
+			} else {
+				err = store.AppendWithdrawal(id, store.Withdrawal{Key: snap.Key, Variant: snap.Variant, Digest: snap.Digest, Session: "mine", Thread: "mine"})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := New()
+			events := make(chan Item, 1)
+			s.clients[events] = struct{}{}
+			body, _ := json.Marshal(SnapRequest{Project: store.Project{ID: id}, Key: snap.Key, Variant: snap.Variant, Session: "mine", PNG: base64.StdEncoding.EncodeToString(data)})
+			rec := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/snap", bytes.NewReader(body)))
+			var response struct{ Queued bool }
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil || rec.Code != http.StatusCreated || response.Queued || len(events) != 0 {
+				t.Fatalf("closed re-snap: status=%d body=%s events=%d err=%v", rec.Code, rec.Body.String(), len(events), err)
+			}
+		})
 	}
 }
 

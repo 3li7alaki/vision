@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 	"unicode"
@@ -59,6 +60,8 @@ func run(args []string) error {
 	switch args[0] {
 	case "snap":
 		return snap(args[1:])
+	case "discard":
+		return discard(args[1:])
 	case "session":
 		return session(args[1:])
 	case "notes":
@@ -76,7 +79,7 @@ func run(args []string) error {
 	}
 }
 
-const usageText = "usage: vision snap <key> [--as <variant> | --dim k=v...] [--selector <css>] [--meta k=v...] [--note <text>] [--json] | vision notes [--unread | --since <duration> | --open (requires --session)] [--flagged] [--session <id>] [--json] | vision on | off | vision status [--session <id>] [--json] | vision session join <thread> | vision session thread [--json] | vision --version"
+const usageText = "usage: vision snap <key> [--as <variant> | --dim k=v...] [--selector <css>] [--meta k=v...] [--note <text>] [--json] | vision discard <key> [--as <variant>] [--json] | vision notes [--unread | --since <duration> | --open (requires --session) | --wait <duration>] [--flagged] [--session <id>] [--json] | vision on | off | vision status [--session <id>] [--json] | vision session join <thread> | vision session thread [--json] | vision --version"
 
 func usage() error {
 	return errors.New(usageText)
@@ -347,22 +350,84 @@ func snap(args []string) error {
 	return nil
 }
 
+func discard(args []string) error {
+	if len(args) == 0 {
+		return usage()
+	}
+	key := args[0]
+	if err := store.ParseKey(key); err != nil {
+		return err
+	}
+	fs := flag.NewFlagSet("discard", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	variant := fs.String("as", "default", "variant")
+	asJSON := fs.Bool("json", false, "JSON output")
+	if err := fs.Parse(args[1:]); err != nil || fs.NArg() != 0 {
+		return usage()
+	}
+	if err := store.ParseVariant(*variant); err != nil {
+		return err
+	}
+	id := sessionID()
+	if id == "" {
+		return errors.New("no session id; set VISION_SESSION_ID, CLAUDE_CODE_SESSION_ID, or CODEX_THREAD_ID")
+	}
+	project, err := store.Identify(".")
+	if err != nil {
+		return err
+	}
+	thread, err := store.ThreadFor(project.ID, id)
+	if err != nil {
+		return err
+	}
+	if err := healthy(); err != nil {
+		return err
+	}
+	var result struct {
+		SchemaVersion int      `json:"schemaVersion"`
+		Withdrawn     []string `json:"withdrawn"`
+	}
+	if err := post("/api/withdraw", server.WithdrawRequest{Project: project.ID, Key: key, Variant: *variant, Session: id, Thread: thread}, &result); err != nil {
+		return err
+	}
+	if *asJSON {
+		return printJSON(result)
+	}
+	fmt.Printf("withdrew %s@%s (%d shot(s))\n", key, *variant, len(result.Withdrawn))
+	return nil
+}
+
 func notes(args []string) error {
 	fs := flag.NewFlagSet("notes", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	unread, since, flagged, asJSON := fs.Bool("unread", false, "unread notes"), fs.Duration("since", 0, "notes since duration"), fs.Bool("flagged", false, "flagged notes"), fs.Bool("json", false, "JSON output")
 	open := fs.Bool("open", false, "open flags on the session's thread")
+	wait := fs.Duration("wait", 0, "wait for unread verdicts on the session's thread")
 	session := sessionFlag(fs)
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || (*unread && *since != 0) {
 		return usage()
 	}
 	// Even --since=0 names a conflicting mode; checking only its duration loses that.
 	invalid := *open && *session == ""
+	waitSet, otherModeSet := false, false
 	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "wait" {
+			waitSet = true
+		}
+		if f.Name == "unread" || f.Name == "since" || f.Name == "open" {
+			otherModeSet = true
+		}
 		if *open && (f.Name == "since" || f.Name == "unread") {
 			invalid = true
 		}
 	})
+	if waitSet {
+		if *session == "" {
+			*session = sessionID()
+		}
+		// A backgrounded wait that is forgotten must still end.
+		invalid = invalid || otherModeSet || *session == "" || *wait <= 0 || *wait > 24*time.Hour
+	}
 	if invalid {
 		return usage()
 	}
@@ -371,7 +436,9 @@ func notes(args []string) error {
 		return err
 	}
 	var values []store.Note
-	if *open {
+	if waitSet {
+		values, err = waitNotes(project.ID, *session, *wait)
+	} else if *open {
 		thread, resolveErr := store.ActiveThreadFor(project.ID, *session)
 		if resolveErr != nil {
 			return resolveErr
@@ -426,6 +493,41 @@ func notes(args []string) error {
 	return nil
 }
 
+func waitNotes(project, session string, duration time.Duration) ([]store.Note, error) {
+	dir, err := store.ProjectDir(project)
+	if err != nil {
+		return nil, err
+	}
+	deadline := time.NewTimer(duration)
+	defer deadline.Stop()
+	poll := time.NewTicker(time.Second)
+	defer poll.Stop()
+	lastSize := int64(-1)
+	for {
+		size := int64(0)
+		info, err := os.Stat(filepath.Join(dir, "notes.jsonl"))
+		if err == nil {
+			size = info.Size()
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		if size != lastSize {
+			// Wait, --unread --session and the dotfiles hook deliberately share one cursor.
+			// Whichever reads first delivers the verdicts, so later reads do not repeat them.
+			values, err := store.UnreadNotesForSession(project, session)
+			if err != nil || len(values) > 0 {
+				return values, err
+			}
+			lastSize = size
+		}
+		select {
+		case <-deadline.C:
+			return nil, fmt.Errorf("no new verdicts after %s", duration)
+		case <-poll.C:
+		}
+	}
+}
+
 func post(path string, input, output any) error {
 	b, err := json.Marshal(input)
 	if err != nil {
@@ -461,6 +563,14 @@ func on(args []string) error {
 	if err != nil {
 		return err
 	}
+	// Five seconds is a guess above this box's sub-second start; adjust it if measured startup needs more headroom.
+	if err := waitHealthy(endpoint+"/health", 5*time.Second); err != nil {
+		log := "~/Library/Logs/vision.log"
+		if runtime.GOOS == "linux" {
+			log = "journalctl --user -u vision.service"
+		}
+		return fmt.Errorf("%w; check %s", err, log)
+	}
 	if asJSON {
 		out := map[string]any{"schemaVersion": 1, "running": true, "url": galleryURL}
 		if warning != "" {
@@ -482,6 +592,11 @@ func off(args []string) error {
 	}
 	if err := removeService(); err != nil {
 		return err
+	}
+	client := &http.Client{Timeout: 300 * time.Millisecond}
+	if resp, err := client.Get(endpoint + "/health"); err == nil {
+		resp.Body.Close()
+		fmt.Fprintln(os.Stderr, "vision: something still answers on 127.0.0.1:4747 (a hand-started vision _serve?); find it with: lsof -iTCP:4747 -sTCP:LISTEN")
 	}
 	if asJSON {
 		return printJSON(map[string]any{"schemaVersion": 1, "running": false})
@@ -575,6 +690,30 @@ func status(args []string) error {
 		fmt.Println("vision on at", view)
 	}
 	return nil
+}
+
+func waitHealthy(healthURL string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: 300 * time.Millisecond}
+	for ctx.Err() == nil {
+		resp, err := client.Do(req)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	return fmt.Errorf("daemon did not become healthy within %s", timeout)
 }
 
 func healthy() error {

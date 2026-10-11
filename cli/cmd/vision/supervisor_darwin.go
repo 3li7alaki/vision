@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // installService supervises the daemon with launchd. The returned string is a
@@ -35,9 +37,26 @@ func installService(exe string) (string, error) {
 		return "", err
 	}
 	domain := fmt.Sprintf("gui/%d", os.Getuid())
-	exec.Command("launchctl", "bootout", domain+"/dev.vision").Run()
+	target := domain + "/dev.vision"
+	exec.Command("launchctl", "bootout", target).Run()
+	// Bootout is asynchronous, so wait for the old job to disappear before bootstrapping its replacement.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	for exec.CommandContext(ctx, "launchctl", "print", target).Run() == nil {
+		select {
+		case <-ctx.Done():
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("launchctl bootout: timed out waiting for %s to unload: %w", target, err)
+	}
 	if out, err := exec.Command("launchctl", "bootstrap", domain, path).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("launchctl bootstrap: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	// RunAtLoad was seen not to spawn after a bootout/bootstrap pair, so explicitly start the job.
+	if out, err := exec.Command("launchctl", "kickstart", "-k", target).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("launchctl kickstart: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return "", nil
 }

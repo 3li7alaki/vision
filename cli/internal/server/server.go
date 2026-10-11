@@ -24,9 +24,8 @@ import (
 
 const Address = "127.0.0.1:4747"
 
-// projectIDPattern is the SHA-256 hex digest Identify emits, and the only value the
-// verdict handler may ever join onto a store path. The gallery sends the human-readable
-// name back as project, so without this guard a path-traversal body writes outside it.
+// projectIDPattern permits only the SHA-256 hex ids Identify emits because request ids
+// reach store paths. Unchecked ids could otherwise write outside the state directory.
 var projectIDPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]+$`)
 
@@ -54,6 +53,14 @@ type VerdictRequest struct {
 	Regions []store.Region `json:"regions,omitempty"`
 }
 
+type WithdrawRequest struct {
+	Project string `json:"project"`
+	Key     string `json:"key"`
+	Variant string `json:"variant"`
+	Session string `json:"session"`
+	Thread  string `json:"thread"`
+}
+
 type Item struct {
 	Project         string            `json:"project"`
 	ProjectID       string            `json:"projectId"`
@@ -76,12 +83,17 @@ type Item struct {
 	Steps           []Step            `json:"steps,omitempty"`
 }
 
+// Step names its key as well as its digest, because two steps of a flow can show
+// identical pixels and are still two reviews.
 type Step struct {
+	Key      string `json:"key"`
 	Digest   string `json:"digest"`
 	ThumbURL string `json:"thumbUrl,omitempty"`
 }
 
 type Server struct {
+	// Serialize ledger writes so a verdict cannot land between a withdrawal's check and append.
+	ledger  sync.Mutex
 	mux     sync.Mutex
 	clients map[chan Item]struct{}
 }
@@ -98,6 +110,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/queue", s.queue)
 	mux.HandleFunc("POST /api/snap", s.snap)
 	mux.HandleFunc("POST /api/verdict", s.verdict)
+	mux.HandleFunc("POST /api/withdraw", s.withdraw)
 	mux.HandleFunc("GET /media/{kind}/{project}/{digest}", s.media)
 	mux.HandleFunc("GET /media/icon/{project}", s.projectIcon)
 	mux.HandleFunc("GET /events", s.events)
@@ -145,6 +158,10 @@ func (s *Server) snap(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusBadRequest, err)
 		return
 	}
+	if !projectIDPattern.MatchString(req.Project.ID) {
+		problem(w, http.StatusBadRequest, errors.New("invalid project id"))
+		return
+	}
 	if err := store.ParseKey(req.Key); err != nil {
 		problem(w, http.StatusBadRequest, err)
 		return
@@ -159,6 +176,8 @@ func (s *Server) snap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	digest := diff.Digest(pngData)
+	s.ledger.Lock()
+	defer s.ledger.Unlock()
 	record := store.Snap{SchemaVersion: store.SchemaVersion, TS: time.Now().UTC(), Project: req.Project.Name, Key: req.Key, Variant: req.Variant, Dims: req.Dims, Meta: req.Meta, Digest: digest, Branch: req.Project.Branch, SHA: req.Project.SHA, Dirty: req.Project.Dirty, Worktree: req.Project.Worktree, Session: req.Session, Thread: req.Thread, Note: req.Note, Conditions: req.Capture}
 	if err := store.WriteElements(req.Project.ID, digest, req.Elements); err != nil {
 		problem(w, http.StatusInternalServerError, err)
@@ -168,11 +187,22 @@ func (s *Server) snap(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusInternalServerError, err)
 		return
 	}
+	snaps, err := store.Snaps(req.Project.ID)
+	if err != nil {
+		problem(w, http.StatusInternalServerError, err)
+		return
+	}
+	closed, err := store.Closed(req.Project.ID, snaps)
+	if err != nil {
+		problem(w, http.StatusInternalServerError, err)
+		return
+	}
 	item, pending, err := makeItem(req.Project.ID, req.Project.Name, record)
 	if err != nil {
 		problem(w, http.StatusInternalServerError, err)
 		return
 	}
+	pending = pending && !closed[record.Review()]
 	if pending {
 		s.publish(item)
 	}
@@ -221,6 +251,8 @@ func (s *Server) verdict(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusBadRequest, errors.New("verdict must be ok or flag"))
 		return
 	}
+	s.ledger.Lock()
+	defer s.ledger.Unlock()
 	// Naming a mark is optional context, so a missing or unreadable snapshot must never
 	// fail a verdict the human already gave.
 	if len(req.Regions) > 0 {
@@ -261,6 +293,72 @@ func (s *Server) verdict(w http.ResponseWriter, r *http.Request) {
 	// never fail a verdict the human already gave.
 	_ = store.Prune(req.Project)
 	writeJSON(w, http.StatusCreated, note)
+}
+
+func (s *Server) withdraw(w http.ResponseWriter, r *http.Request) {
+	var req WithdrawRequest
+	if err := decode(r.Body, &req); err != nil {
+		problem(w, http.StatusBadRequest, err)
+		return
+	}
+	if !projectIDPattern.MatchString(req.Project) {
+		problem(w, http.StatusBadRequest, errors.New("invalid project id"))
+		return
+	}
+	if err := store.ParseKey(req.Key); err != nil {
+		problem(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := store.ParseVariant(req.Variant); err != nil {
+		problem(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Thread == "" {
+		problem(w, http.StatusBadRequest, errors.New("thread must not be empty"))
+		return
+	}
+	s.ledger.Lock()
+	defer s.ledger.Unlock()
+	snaps, err := store.Snaps(req.Project)
+	if err != nil {
+		problem(w, http.StatusInternalServerError, err)
+		return
+	}
+	closed, err := store.Closed(req.Project, snaps)
+	if err != nil {
+		problem(w, http.StatusInternalServerError, err)
+		return
+	}
+	var pending []store.Snap
+	seen := make(map[string]bool)
+	for _, snap := range snaps {
+		if snap.Key == req.Key && snap.Variant == req.Variant && snap.ThreadID() == req.Thread && !closed[snap.Review()] && !seen[snap.Digest] {
+			pending = append(pending, snap)
+			seen[snap.Digest] = true
+		}
+	}
+	if len(pending) == 0 {
+		problem(w, http.StatusNotFound, fmt.Errorf("nothing pending for %s@%s on this thread", req.Key, req.Variant))
+		return
+	}
+	digests := make([]string, 0, len(pending))
+	for _, snap := range pending {
+		withdrawal := store.Withdrawal{SchemaVersion: store.SchemaVersion, TS: time.Now().UTC(), Key: req.Key, Variant: req.Variant, Digest: snap.Digest, Session: req.Session, Thread: req.Thread}
+		if err := store.AppendWithdrawal(req.Project, withdrawal); err != nil {
+			problem(w, http.StatusInternalServerError, err)
+			return
+		}
+		digests = append(digests, snap.Digest)
+	}
+	_ = store.Prune(req.Project)
+	for _, snap := range pending {
+		name := snap.Project
+		if name == "" {
+			name = ProjectName(req.Project)
+		}
+		s.publish(Item{ProjectID: req.Project, Project: name, Thread: req.Thread, Key: req.Key, Variant: req.Variant, Digest: snap.Digest, Status: "withdrawn"})
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"schemaVersion": store.SchemaVersion, "withdrawn": digests})
 }
 
 // ponytail: A loose box resolves by its center rather than overlap. Upgrade to
@@ -320,13 +418,13 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "pending": pending})
 }
 
-// PendingCount is the cheap half of Queue: it folds notes over the index and counts what
-// nobody has judged, without decoding a single PNG. Queue itself runs a full pixel diff per
+// PendingCount is the cheap half of Queue: it counts live pending reviews without
+// decoding a single PNG. Queue itself runs a full pixel diff per
 // item, which is far too expensive for something a status line polls on a timer.
 //
-// It agrees with Queue because shots are content-addressed. A re-snap that is identical to
-// an approved shot produces the same digest, and verdicts are recorded per digest, so it is
-// already decided and never counted here.
+// It agrees with Queue because decisions belong to key, variant and digest together.
+// Identical content under two keys is two reviews. Only a re-snap of the same key and
+// variant with the same digest is already decided by an earlier verdict.
 func PendingCount() (int, error) {
 	ids, err := store.ProjectIDs()
 	if err != nil {
@@ -351,7 +449,7 @@ func PendingCountFor(project string) (int, error) {
 }
 
 // Empty session preserves the project-wide count. Filter before deduplicating because a
-// digest first captured by another session can still belong to this session as well.
+// review first captured by another session can still belong to this session as well.
 func PendingCountForSession(project, session string) (int, error) {
 	thread, err := store.ThreadFor(project, session)
 	if err != nil {
@@ -361,23 +459,20 @@ func PendingCountForSession(project, session string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	notes, err := store.Notes(project)
+	closed, err := store.Closed(project, snaps)
 	if err != nil {
 		return 0, err
-	}
-	decided := make(map[string]bool, len(notes))
-	for _, n := range notes {
-		decided[n.Digest] = true
 	}
 	pending, seen := 0, make(map[string]bool)
 	for _, snap := range snaps {
 		if session != "" && snap.ThreadID() != thread {
 			continue
 		}
-		if decided[snap.Digest] || seen[snap.Digest] {
+		review := store.ReviewID(snap.Key, snap.Variant, snap.Digest)
+		if closed[snap.Review()] || seen[review] {
 			continue
 		}
-		seen[snap.Digest] = true
+		seen[review] = true
 		if !store.HasShot(project, snap.Digest) {
 			continue
 		}
@@ -407,20 +502,17 @@ func Queue() ([]Item, error) {
 		if err != nil {
 			return nil, err
 		}
-		notes, err := store.Notes(id)
+		closed, err := store.Closed(id, snaps)
 		if err != nil {
 			return nil, err
 		}
-		decided := make(map[string]bool)
-		for _, n := range notes {
-			decided[n.Digest] = true
-		}
 		name := id[:min(8, len(id))]
 		for _, snap := range snaps {
-			if decided[snap.Digest] || seen[snap.Digest] {
+			review := store.ReviewID(snap.Key, snap.Variant, snap.Digest)
+			if closed[snap.Review()] || seen[id+"@"+review] {
 				continue
 			}
-			seen[snap.Digest] = true
+			seen[id+"@"+review] = true
 			// A record whose picture is gone cannot be reviewed, and one such record must
 			// not take down every other project's queue with it, so it is skipped here and
 			// in the pending count alike.
@@ -513,11 +605,11 @@ func baselineRecord(project, key, variant string) (store.Snap, bool) {
 	approved := make(map[string]bool)
 	for _, n := range notes {
 		if n.Verdict == "ok" && n.Key == key && n.Variant == variant {
-			approved[n.Digest] = true
+			approved[store.ReviewID(n.Key, n.Variant, n.Digest)] = true
 		}
 	}
 	for i := len(snaps) - 1; i >= 0; i-- {
-		if approved[snaps[i].Digest] {
+		if approved[store.ReviewID(snaps[i].Key, snaps[i].Variant, snaps[i].Digest)] {
 			return snaps[i], true
 		}
 	}
@@ -529,7 +621,7 @@ func attachSteps(items []Item) {
 		base := strings.Split(items[i].Key, "#")[0]
 		for _, candidate := range items {
 			if strings.Split(candidate.Key, "#")[0] == base && strings.Contains(candidate.Key, "#") && candidate.Variant == items[i].Variant {
-				items[i].Steps = append(items[i].Steps, Step{Digest: candidate.Digest, ThumbURL: candidate.ShotURL})
+				items[i].Steps = append(items[i].Steps, Step{Key: candidate.Key, Digest: candidate.Digest, ThumbURL: candidate.ShotURL})
 			}
 		}
 	}

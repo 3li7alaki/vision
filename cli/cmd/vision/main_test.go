@@ -2,18 +2,25 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	"image/png"
 	"io"
 	"maps"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -364,6 +371,186 @@ func TestNotesSessionFilters(t *testing.T) {
 	}
 }
 
+func TestNotesWaitUsage(t *testing.T) {
+	t.Setenv("VISION_SESSION_ID", "")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+	t.Setenv("CODEX_THREAD_ID", "")
+	for _, args := range [][]string{
+		{"--wait", "1s", "--session", "mine", "--unread"},
+		{"--wait", "1s", "--session", "mine", "--unread=false"},
+		{"--wait", "1s", "--session", "mine", "--since=0"},
+		{"--wait", "1s", "--session", "mine", "--open"},
+		{"--wait", "1s", "--session", "mine", "--open=false"},
+		{"--wait", "0", "--session", "mine"},
+		{"--wait", "-1s", "--session", "mine"},
+		{"--wait", "25h", "--session", "mine"},
+		{"--wait", "1s"},
+	} {
+		if err := notes(args); err == nil || err.Error() != usageText {
+			t.Errorf("notes %v: err=%v, want usage error", args, err)
+		}
+	}
+}
+
+func TestNotesWaitReceivesThreadVerdict(t *testing.T) {
+	for _, explicit := range []bool{false, true} {
+		t.Run(fmt.Sprintf("explicit=%v", explicit), func(t *testing.T) {
+			t.Setenv("VISION_STATE_HOME", t.TempDir())
+			t.Setenv("VISION_SESSION_ID", "successor")
+			project, err := store.Identify(".")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.JoinThread(project.ID, "successor", "shared"); err != nil {
+				t.Fatal(err)
+			}
+			for _, snap := range []store.Snap{
+				{Key: "cart/empty", Variant: "default", Digest: "mine", Session: "predecessor", Thread: "shared"},
+				{Key: "cart/other", Variant: "default", Digest: "other", Session: "other"},
+			} {
+				if err := store.AppendSnap(project.ID, snap, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := store.AppendNote(project.ID, store.Note{Key: "cart/other", Variant: "default", Digest: "other", Verdict: "ok"}); err != nil {
+				t.Fatal(err)
+			}
+			note := store.Note{Key: "cart/empty", Variant: "default", Digest: "mine", Verdict: "flag", Note: "fix"}
+			appended := make(chan error, 1)
+			go func() {
+				time.Sleep(200 * time.Millisecond)
+				appended <- store.AppendNote(project.ID, note)
+			}()
+			args := []string{"--wait", "4s", "--flagged"}
+			if explicit {
+				t.Setenv("VISION_SESSION_ID", "wrong-session")
+				args = append(args, "--session", "successor")
+			} else {
+				args = append(args, "--json")
+			}
+			started := time.Now()
+			out, waitErr := commandOutput(t, func() error { return notes(args) })
+			if err := <-appended; err != nil {
+				t.Fatal(err)
+			}
+			if waitErr != nil || time.Since(started) >= 4*time.Second {
+				t.Fatalf("wait did not return after the verdict: output=%q err=%v", out, waitErr)
+			}
+			if explicit {
+				if out != "flag cart/empty@default: mine fix\n" {
+					t.Fatalf("wait text=%q", out)
+				}
+			} else {
+				var result struct{ Notes []store.Note }
+				if err := json.Unmarshal([]byte(out), &result); err != nil || len(result.Notes) != 1 || !reflect.DeepEqual(result.Notes[0], note) {
+					t.Fatalf("wait JSON=%s err=%v", out, err)
+				}
+			}
+			if values, err := store.UnreadNotesForSession(project.ID, "successor"); err != nil || len(values) != 0 {
+				t.Fatalf("wait did not share unread cursor: %v %v", values, err)
+			}
+		})
+	}
+}
+
+func TestNotesWaitTimeout(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	out, err := commandOutput(t, func() error { return notes([]string{"--wait", "40ms", "--session", "mine"}) })
+	if err == nil || err.Error() != "no new verdicts after 40ms" || out != "" {
+		t.Fatalf("timeout: output=%q err=%v", out, err)
+	}
+}
+
+func TestNotesWaitUsesSharedCursor(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	project, err := store.Identify(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendSnap(project.ID, store.Snap{Digest: "mine", Session: "mine"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendNote(project.ID, store.Note{Digest: "mine", Verdict: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := commandOutput(t, func() error { return notes([]string{"--wait", "1s", "--session", "mine", "--flagged"}) })
+	if err != nil || out != "" {
+		t.Fatalf("wait did not filter the unread ok: output=%q err=%v", out, err)
+	}
+	if values, err := store.UnreadNotesForSession(project.ID, "mine"); err != nil || len(values) != 0 {
+		t.Fatalf("filtered ok was not consumed: %v %v", values, err)
+	}
+}
+
+func TestDiscard(t *testing.T) {
+	original := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = original })
+	for _, variant := range []string{"default", "case=ar,vp=mobile"} {
+		t.Run(variant, func(t *testing.T) {
+			t.Setenv("VISION_STATE_HOME", t.TempDir())
+			t.Setenv("VISION_SESSION_ID", "successor")
+			project, err := store.Identify(".")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.JoinThread(project.ID, "successor", "shared"); err != nil {
+				t.Fatal(err)
+			}
+			snap := store.Snap{Key: "cart/empty", Variant: variant, Digest: "sha256:aaaa", Session: "predecessor", Thread: "shared"}
+			if err := store.AppendSnap(project.ID, snap, nil); err != nil {
+				t.Fatal(err)
+			}
+			handler := server.New().Handler()
+			var paths []string
+			http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				paths = append(paths, r.URL.Path)
+				rec := httptest.NewRecorder()
+				handler.ServeHTTP(rec, r)
+				return rec.Result(), nil
+			})
+			args := []string{"discard", snap.Key}
+			if variant != "default" {
+				args = append(args, "--as", variant, "--json")
+			}
+			out, err := commandOutput(t, func() error { return run(args) })
+			if err != nil || !slices.Equal(paths, []string{"/health", "/api/withdraw"}) {
+				t.Fatalf("discard: output=%q paths=%v err=%v", out, paths, err)
+			}
+			if variant == "default" {
+				if out != "withdrew cart/empty@default (1 shot(s))\n" {
+					t.Fatalf("discard text=%q", out)
+				}
+			} else {
+				var result struct {
+					SchemaVersion int
+					Withdrawn     []string
+				}
+				if err := json.Unmarshal([]byte(out), &result); err != nil || result.SchemaVersion != 1 || !slices.Equal(result.Withdrawn, []string{snap.Digest}) {
+					t.Fatalf("discard JSON=%s err=%v", out, err)
+				}
+			}
+			values, err := store.Withdrawals(project.ID)
+			if err != nil || len(values) != 1 || values[0].Thread != "shared" || values[0].Session != "successor" {
+				t.Fatalf("discard lost session/thread: %v %v", values, err)
+			}
+		})
+	}
+}
+
+func TestDiscardValidation(t *testing.T) {
+	t.Setenv("VISION_SESSION_ID", "")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+	t.Setenv("CODEX_THREAD_ID", "")
+	for _, args := range [][]string{nil, {"bad-key"}, {"cart/empty", "--as", "bad/variant"}, {"cart/empty", "--dim", "vp=mobile"}, {"cart/empty", "extra"}} {
+		if err := discard(args); err == nil {
+			t.Errorf("discard %v: expected validation error", args)
+		}
+	}
+	if err := discard([]string{"cart/empty"}); err == nil || !strings.Contains(err.Error(), "VISION_SESSION_ID") || !strings.Contains(err.Error(), "CLAUDE_CODE_SESSION_ID") {
+		t.Fatalf("missing session error=%v", err)
+	}
+}
+
 // Indented continuation lines keep region annotations inside their verdict's visual block.
 func TestNotesIndentContinuationLines(t *testing.T) {
 	t.Setenv("VISION_STATE_HOME", t.TempDir())
@@ -484,6 +671,96 @@ func TestStatusProjectAndGlobalURLs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestWaitHealthyEventuallyOK(t *testing.T) {
+	var attempts atomic.Int32
+	srv := healthTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/health" {
+			t.Errorf("unexpected health path: %s", r.URL.Path)
+		}
+		if attempts.Add(1) <= 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	if err := waitHealthy(srv.URL+"/health", 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := attempts.Load(); got != 3 {
+		t.Fatalf("health attempts=%d, want 3", got)
+	}
+}
+
+func TestWaitHealthyTimeout(t *testing.T) {
+	srv := healthTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	timeout := 250 * time.Millisecond
+	started := time.Now()
+	err := waitHealthy(srv.URL+"/health", timeout)
+	if err == nil || !strings.Contains(err.Error(), "within 250ms") {
+		t.Fatalf("health timeout error=%v", err)
+	}
+	if elapsed := time.Since(started); elapsed < timeout || elapsed > time.Second {
+		t.Fatalf("health timeout took %s, want at least %s and at most 1s", elapsed, timeout)
+	}
+}
+
+// The sandbox forbids socket listeners, so net.Pipe keeps real HTTP requests and an httptest server usable on Go 1.26.
+func healthTestServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	listener := &healthListener{connections: make(chan net.Conn), closed: make(chan struct{})}
+	srv := &httptest.Server{Listener: listener, Config: &http.Server{Handler: handler}}
+	srv.Start()
+	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		client, server := net.Pipe()
+		select {
+		case listener.connections <- server:
+			return client, nil
+		case <-ctx.Done():
+			client.Close()
+			server.Close()
+			return nil, ctx.Err()
+		case <-listener.closed:
+			client.Close()
+			server.Close()
+			return nil, net.ErrClosed
+		}
+	}}
+	original := http.DefaultTransport
+	http.DefaultTransport = transport
+	t.Cleanup(func() {
+		transport.CloseIdleConnections()
+		srv.Close()
+		http.DefaultTransport = original
+	})
+	return srv
+}
+
+type healthListener struct {
+	connections chan net.Conn
+	closed      chan struct{}
+	closeOnce   sync.Once
+}
+
+func (l *healthListener) Accept() (net.Conn, error) {
+	select {
+	case conn := <-l.connections:
+		return conn, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *healthListener) Close() error {
+	l.closeOnce.Do(func() { close(l.closed) })
+	return nil
+}
+
+func (l *healthListener) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4747}
 }
 
 func commandOutput(t *testing.T, command func() error) (string, error) {

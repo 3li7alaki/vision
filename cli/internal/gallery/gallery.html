@@ -708,7 +708,10 @@
 
   let all = [];            // every pending item the server sent, in its order
   let queue = [];          // the slice of `all` this view shows; derived, never edited
-  const taken = new Set(); // digests judged here, hidden until the server stops sending them
+  const taken = new Set(); // reviews judged here, hidden until the server stops sending them
+  // One review is one key@variant at one digest. Identical pixels under two keys share a
+  // digest but are two reviews, so judging one must never hide or annotate the other.
+  const rid = it => `${it.projectId} ${it.key}@${it.variant} ${it.digest}`;
   let at = 0;              // cursor into queue
   let layer = 0;           // index into modes(current())
   let peeking = false;     // `b` held
@@ -747,7 +750,7 @@
     (!v.thread || it.thread === v.thread);
 
   function refilter() {
-    queue = all.filter(it => !taken.has(it.digest) && inView(it));
+    queue = all.filter(it => !taken.has(rid(it)) && inView(it));
     if (at >= queue.length) at = Math.max(0, queue.length - 1);
   }
 
@@ -780,9 +783,22 @@
     const es = new EventSource('/events');
     es.onmessage = e => {
       let item; try { item = JSON.parse(e.data); } catch { return; }
-      // A burst is still landing. Append, never reorder under the reviewer's cursor.
-      if (!all.some(q => q.digest === item.digest)) all.push(item);
+      const was = current() && rid(current());
+      // The daemon stops counting a shot the agent withdrew, or one a newer snap of the
+      // same key@variant on the same thread replaced, so the open page drops it too:
+      // reviewing a picture nobody will act on is the waste this exists to remove.
+      const replaced = q => q.projectId === item.projectId && q.thread === item.thread
+        && q.key === item.key && q.variant === item.variant && q.digest !== item.digest;
+      if (item.status === 'withdrawn') all = all.filter(q => rid(q) !== rid(item));
+      else {
+        all = all.filter(q => !replaced(q));
+        // A burst is still landing. Append, never reorder under the reviewer's cursor.
+        if (!all.some(q => rid(q) === rid(item))) all.push(item);
+      }
+      if (draft && !all.includes(draft.it)) closeComposer(false);
       refilter();
+      const keep = queue.findIndex(q => rid(q) === was);
+      if (keep >= 0) at = keep;
       render();
     };
     es.onerror = () => {};   // EventSource retries on its own
@@ -835,7 +851,7 @@
   // Groups by name, not id: a project's name is its repo's basename and is what a human
   // reads and what URLs carry. Only the open project lists its branches and sessions.
   function sidebar() {
-    const live = all.filter(it => !taken.has(it.digest));
+    const live = all.filter(it => !taken.has(rid(it)));
     const projects = new Map();
     for (const it of live) {
       if (!projects.has(it.project)) projects.set(it.project, []);
@@ -1080,14 +1096,14 @@
   // Conventional Comments' vocabulary, the one reviewers already know from code review.
   const TONES = ['issue', 'praise', 'question'];
   const PROMPT = { issue: 'What should change?', praise: 'What is right here? (keep it)', question: 'What do you want to know?' };
-  const notesBy = new Map();   // digest -> [{x, y, w, h, tone, text, flow}]
+  const notesBy = new Map();   // rid -> [{x, y, w, h, tone, text, flow}]
   let shown = 1;               // CSS px per image px, set by fit()
   let draft = null;            // {it, note, fresh} while the composer is open
   let drawing = null;          // {x0, y0, box} while a drag is in progress
   let hot = -1;                // note index under the pointer, mirrored in marks and list
   const entering = new WeakSet(); // notes placed since the last draw, the only ones that animate
 
-  const notesOf = it => (it && notesBy.get(it.digest)) || [];
+  const notesOf = it => (it && notesBy.get(rid(it))) || [];
   const toneVar = t => `var(--${t})`;
   const flowBase = it => (it.key.includes('#') ? `${it.projectId} ${it.key.split('#')[0]} ${it.variant}` : '');
 
@@ -1099,7 +1115,7 @@
     if (!base) return [];
     const out = [];
     for (const q of all) {
-      if (q.digest === it.digest || flowBase(q) !== base) continue;
+      if (rid(q) === rid(it) || flowBase(q) !== base) continue;
       notesOf(q).forEach((n, i) => n.flow && out.push({ ...n, from: q.key.split('#')[1], index: i }));
     }
     return out;
@@ -1258,8 +1274,8 @@
       ? { ...drawing.rect, text: '', flow: false }
       : { x: drawing.x0, y: drawing.y0, w: 0, h: 0, tone: 'issue', text: '', flow: false };
     drawing = null;
-    if (!notesBy.has(it.digest)) notesBy.set(it.digest, []);
-    notesBy.get(it.digest).push(n);
+    if (!notesBy.has(rid(it))) notesBy.set(rid(it), []);
+    notesBy.get(rid(it)).push(n);
     entering.add(n);
     edit(it, n, true);
   });
@@ -1362,8 +1378,8 @@
       const b = document.createElement('button');
       b.textContent = i + 1;
       if (s.thumbUrl) b.style.backgroundImage = `url(${s.thumbUrl})`;
-      b.className = s.digest === it.digest ? 'on' : '';
-      b.onclick = () => { const j = queue.findIndex(q => q.digest === s.digest); if (j >= 0) go(j); };
+      b.className = s.key === it.key && s.digest === it.digest ? 'on' : '';
+      b.onclick = () => { const j = queue.findIndex(q => q.key === s.key && q.digest === s.digest && q.variant === it.variant); if (j >= 0) go(j); };
       el.strip.append(b);
     });
   }
@@ -1399,7 +1415,7 @@
     // every card back at the position it actually came from instead of at the cursor.
     const rows = whole ? groupRows() : [at];
     const judged = rows.map(i => ({ item: queue[i], index: i }));
-    judged.forEach(({ item }) => taken.add(item.digest));
+    judged.forEach(({ item }) => taken.add(rid(item)));
     refilter();
     at = Math.max(0, Math.min(rows[0], queue.length - 1));
     render();
@@ -1445,7 +1461,7 @@
         }),
       }).catch(() => {
         // Never lose the reviewer's words: put the card back and say so.
-        taken.delete(item.digest);
+        taken.delete(rid(item));
         refilter();
         render();
         el.stat.className = 'stat warn';
@@ -1462,9 +1478,9 @@
     el.toast.classList.remove('show');
     // Cards come back where they were because the view is derived from the server's order,
     // not from a list this page spliced.
-    p.judged.forEach(({ item }) => taken.delete(item.digest));
+    p.judged.forEach(({ item }) => taken.delete(rid(item)));
     refilter();
-    const back = queue.findIndex(q => q.digest === p.judged[0].item.digest);
+    const back = queue.findIndex(q => rid(q) === rid(p.judged[0].item));
     go(back >= 0 ? back : p.judged[0].index);
   }
 
@@ -1545,7 +1561,7 @@
     if (/^[1-9]$/.test(k)) {
       const it = current();
       const s = it && it.steps && it.steps[Number(k) - 1];
-      if (s) { const j = queue.findIndex(q => q.digest === s.digest); if (j >= 0) go(j); }
+      if (s) { const j = queue.findIndex(q => q.key === s.key && q.digest === s.digest && q.variant === current().variant); if (j >= 0) go(j); }
     }
   });
 
@@ -1582,7 +1598,7 @@
 
     // Steps carry thumbnails because the server sends them; without one the filmstrip
     // shows bare numbers and stops matching what a real flow looks like.
-    const flow = ['#0ea5e9', '#8b5cf6', '#22c55e'].map((c, i) => ({ digest: `d${i + 4}`, thumbUrl: px(900, 560, '#ffffff', c) }));
+    const flow = ['#0ea5e9', '#8b5cf6', '#22c55e'].map((c, i) => ({ key: `checkout/happy-path#${i + 1}`, digest: `d${i + 4}`, thumbUrl: px(900, 560, '#ffffff', c) }));
 
     // Two sessions in shop and one in dashboard, spread over the last hour, so the sidebar
     // has branches and sessions to list.

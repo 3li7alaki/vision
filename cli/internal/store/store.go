@@ -103,6 +103,64 @@ type Note struct {
 	Regions       []Region  `json:"regions,omitempty"`
 }
 
+// Withdrawals stay separate from human verdicts so notes readers, cursors and hooks
+// never need to filter agent actions out of notes.jsonl.
+type Withdrawal struct {
+	SchemaVersion int       `json:"schemaVersion"`
+	TS            time.Time `json:"ts"`
+	Key           string    `json:"key"`
+	Variant       string    `json:"variant"`
+	Digest        string    `json:"digest"`
+	Session       string    `json:"session"`
+	Thread        string    `json:"thread"`
+}
+
+// ReviewID keeps decisions separate when identical pixels belong to different keys or variants.
+func ReviewID(key, variant, digest string) string {
+	return key + "@" + variant + "@" + digest
+}
+
+// Review scopes agent actions to a thread while human verdicts still apply to identical reviews.
+type Review struct {
+	Thread string
+	ID     string
+}
+
+func (s Snap) Review() Review {
+	return Review{Thread: s.ThreadID(), ID: ReviewID(s.Key, s.Variant, s.Digest)}
+}
+
+// Closed derives the single pending rule: decided, withdrawn and superseded reviews
+// are closed. Ledger order defines newest so clock skew cannot revive a stale review.
+func Closed(project string, snaps []Snap) (map[Review]bool, error) {
+	notes, err := Notes(project)
+	if err != nil {
+		return nil, err
+	}
+	withdrawals, err := Withdrawals(project)
+	if err != nil {
+		return nil, err
+	}
+	decided := make(map[string]bool, len(notes))
+	for _, note := range notes {
+		decided[ReviewID(note.Key, note.Variant, note.Digest)] = true
+	}
+	closed := make(map[Review]bool)
+	for _, w := range withdrawals {
+		closed[Review{Thread: w.Thread, ID: ReviewID(w.Key, w.Variant, w.Digest)}] = true
+	}
+	latest := make(map[[3]string]string)
+	for _, snap := range snaps {
+		latest[[3]string{snap.ThreadID(), snap.Key, snap.Variant}] = snap.Digest
+	}
+	for _, snap := range snaps {
+		if decided[ReviewID(snap.Key, snap.Variant, snap.Digest)] || latest[[3]string{snap.ThreadID(), snap.Key, snap.Variant}] != snap.Digest {
+			closed[snap.Review()] = true
+		}
+	}
+	return closed, nil
+}
+
 type Project struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
@@ -403,6 +461,14 @@ func AppendNote(project string, note Note) error {
 	return appendJSON(filepath.Join(dir, "notes.jsonl"), note)
 }
 
+func AppendWithdrawal(project string, w Withdrawal) error {
+	dir, err := ProjectDir(project)
+	if err != nil {
+		return err
+	}
+	return appendJSON(filepath.Join(dir, "withdrawn.jsonl"), w)
+}
+
 func appendJSON(path string, value any) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -458,6 +524,14 @@ func Notes(project string) ([]Note, error) {
 		return nil, err
 	}
 	return ReadJSONL[Note](filepath.Join(dir, "notes.jsonl"))
+}
+
+func Withdrawals(project string) ([]Withdrawal, error) {
+	dir, err := ProjectDir(project)
+	if err != nil {
+		return nil, err
+	}
+	return ReadJSONL[Withdrawal](filepath.Join(dir, "withdrawn.jsonl"))
 }
 
 func NotesForSession(project, session string) ([]Note, error) {
@@ -549,7 +623,7 @@ func CopyBaseline(project, key, variant, digest string) error {
 	return os.Rename(name, dst)
 }
 
-// KeepSuperseded is how many already-decided shots survive per key and variant, on top of
+// KeepSuperseded is how many closed shots survive per key and variant, on top of
 // the current baseline. Zero would make a mistaken ok unrecoverable, since the shot it
 // replaced would be gone the moment it was replaced.
 const KeepSuperseded = 2
@@ -561,16 +635,19 @@ const KeepSuperseded = 2
 const pruneGrace = time.Minute
 
 // Prune deletes shot PNGs and their element snapshots that no longer serve anyone: not
-// pending, not the current baseline, and older than the last KeepSuperseded decided shots
-// for their key and variant. Both file types use the same digest and grace window.
+// pending, not the current baseline, and older than the last KeepSuperseded closed shots
+// for their key and variant. Superseded and withdrawn reviews enter the same retention
+// window as decided reviews. Both file types use the same digest and grace window.
+// A shared file survives if any review on any thread still needs it.
 //
-// It never touches index.jsonl or notes.jsonl. Those are the record of what was shot and
-// what the human said about it, they are tiny, and they stay append-only forever. This is
-// why pruning does not weaken the append-only invariant: a pruned shot still appears in the
-// index, and a flag still appears in the notes, so no queue can be made to look clean. Only
-// the picture and its element snapshot are reclaimed, never the fact that it existed.
+// It never touches index.jsonl, notes.jsonl or withdrawn.jsonl. Those ledgers preserve
+// every capture, human verdict and agent withdrawal even when its picture is reclaimed.
 func Prune(project string) error {
 	snaps, err := Snaps(project)
+	if err != nil {
+		return err
+	}
+	closed, err := Closed(project, snaps)
 	if err != nil {
 		return err
 	}
@@ -580,32 +657,33 @@ func Prune(project string) error {
 	}
 	verdict := make(map[string]string, len(notes))
 	for _, n := range notes {
-		verdict[n.Digest] = n.Verdict
+		verdict[ReviewID(n.Key, n.Variant, n.Digest)] = n.Verdict
 	}
 	keep := make(map[string]bool)
-	decided := make(map[string][]string)
+	decided := make(map[string][]Snap)
 	for _, s := range snaps {
-		if verdict[s.Digest] == "" {
+		if !closed[s.Review()] {
 			// Pending: the human has not looked at it yet, so it is the one thing
 			// pruning must never take.
 			keep[s.Digest] = true
 			continue
 		}
 		group := s.Key + "@" + s.Variant
-		decided[group] = append(decided[group], s.Digest)
+		decided[group] = append(decided[group], s)
 	}
-	for _, digests := range decided {
-		for i := len(digests) - 1; i >= 0; i-- {
-			if verdict[digests[i]] == "ok" {
-				keep[digests[i]] = true
+	for _, shots := range decided {
+		for i := len(shots) - 1; i >= 0; i-- {
+			s := shots[i]
+			if verdict[ReviewID(s.Key, s.Variant, s.Digest)] == "ok" {
+				keep[s.Digest] = true
 				break
 			}
 		}
 		// The window is the current baseline plus KeepSuperseded behind it, so a shot
 		// that was just replaced is still there to compare against.
 		window := KeepSuperseded + 1
-		for i := len(digests) - 1; i >= 0 && len(digests)-i <= window; i-- {
-			keep[digests[i]] = true
+		for i := len(shots) - 1; i >= 0 && len(shots)-i <= window; i-- {
+			keep[shots[i].Digest] = true
 		}
 	}
 	dir, err := ProjectDir(project)

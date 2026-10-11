@@ -106,6 +106,200 @@ func TestPruneSparesAFreshPictureWithNoRecordYet(t *testing.T) {
 	}
 }
 
+// A pending review must keep shared files even after another key's approval ages out of retention.
+func TestPruneKeepsSharedPendingShot(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	const shared = "sha256:aaaa"
+	add := func(key, digest string, approved bool) {
+		t.Helper()
+		thread := "pending"
+		if approved {
+			thread = "approved"
+		}
+		if err := AppendSnap("p", Snap{Key: key, Variant: "default", Digest: digest, Thread: thread}, []byte(digest)); err != nil {
+			t.Fatal(err)
+		}
+		if approved {
+			if err := AppendNote("p", Note{Key: key, Variant: "default", Digest: digest, Verdict: "ok"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	add("orders/list", shared, true)
+	add("orders/theme", shared, false)
+	// Approvals on another thread push shared pixels outside retention without superseding the pending review.
+	for i := 0; i <= KeepSuperseded; i++ {
+		digest := fmt.Sprintf("sha256:%04x", i)
+		for _, key := range []string{"orders/list", "orders/theme"} {
+			add(key, digest, true)
+		}
+	}
+	if err := WriteElements("p", shared, []Element{{Role: "button", Name: "Order", W: 1, H: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	shot, err := ShotPath("p", shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elements, err := ElementsPath("p", shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * pruneGrace)
+	for _, path := range []string{shot, elements} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := Prune("p"); err != nil {
+		t.Fatal(err)
+	}
+	if !HasShot("p", shared) {
+		t.Fatal("pruned shared pixels for the unjudged orders/theme review")
+	}
+	if got, err := ReadElements("p", shared); err != nil || len(got) != 1 {
+		t.Fatalf("pruned shared elements for the unjudged orders/theme review: %#v %v", got, err)
+	}
+}
+
+func TestClosedSupersedesWithinThread(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	old := Snap{Key: "cart/empty", Variant: "default", Digest: "old", Session: "mine"}
+	live := old
+	live.Digest = "live"
+	other := old
+	other.Session = "other"
+	otherKey := old
+	otherKey.Key = "cart/full"
+	otherVariant := old
+	otherVariant.Variant = "dark"
+	snaps := []Snap{old, live, live, other, otherKey, otherVariant}
+	closed, err := Closed("p", snaps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !closed[old.Review()] {
+		t.Fatal("older digest on the same thread stayed pending")
+	}
+	for _, snap := range snaps[1:] {
+		if closed[snap.Review()] {
+			t.Errorf("closed live or independent review: %+v", snap)
+		}
+	}
+	// Returning to earlier pixels restores that same review rather than inventing a new one.
+	closed, err = Closed("p", append(snaps, old))
+	if err != nil || closed[old.Review()] || !closed[live.Review()] {
+		t.Fatalf("return to old digest: closed=%v err=%v", closed, err)
+	}
+}
+
+func TestWithdrawalRoundTrip(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	if values, err := Withdrawals("p"); err != nil || len(values) != 0 {
+		t.Fatalf("missing ledger: withdrawals=%v err=%v", values, err)
+	}
+	first := Withdrawal{SchemaVersion: SchemaVersion, TS: time.Now().UTC(), Key: "cart/empty", Variant: "default", Digest: "old", Session: "mine", Thread: "thread"}
+	if err := AppendWithdrawal("p", first); err != nil {
+		t.Fatal(err)
+	}
+	dir, _ := ProjectDir("p")
+	path := filepath.Join(dir, "withdrawn.jsonl")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.Digest = "live"
+	if err := AppendWithdrawal("p", second); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !strings.HasPrefix(string(after), string(before)) || strings.Count(string(after), "\n") != 2 {
+		t.Fatalf("withdrawal rewrote its ledger: before=%q after=%q err=%v", before, after, err)
+	}
+	values, err := Withdrawals("p")
+	if err != nil || !reflect.DeepEqual(values, []Withdrawal{first, second}) {
+		t.Fatalf("withdrawals=%v err=%v", values, err)
+	}
+	if notes, err := Notes("p"); err != nil || len(notes) != 0 {
+		t.Fatalf("agent withdrawal entered human notes: %v %v", notes, err)
+	}
+}
+
+func TestClosedDecidedWithdrawnSuperseded(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	snaps := []Snap{
+		{Key: "cart/decided", Variant: "default", Digest: "flag", Thread: "mine"},
+		{Key: "cart/decided", Variant: "default", Digest: "flag", Thread: "other"},
+		{Key: "cart/withdrawn", Variant: "default", Digest: "withdrawn", Thread: "mine"},
+		{Key: "cart/withdrawn", Variant: "default", Digest: "withdrawn", Thread: "other"},
+		{Key: "cart/superseded", Variant: "default", Digest: "old", Thread: "mine"},
+		{Key: "cart/superseded", Variant: "default", Digest: "live", Thread: "mine"},
+	}
+	if err := AppendNote("p", Note{Key: snaps[0].Key, Variant: "default", Digest: "flag", Verdict: "flag", Note: "fix"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := AppendWithdrawal("p", Withdrawal{Key: snaps[2].Key, Variant: "default", Digest: "withdrawn", Session: "successor", Thread: "mine"}); err != nil {
+		t.Fatal(err)
+	}
+	closed, err := Closed("p", snaps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []bool{true, true, true, false, true, false} {
+		if got := closed[snaps[i].Review()]; got != want {
+			t.Errorf("review %d closed=%v, want %v", i, got, want)
+		}
+	}
+}
+
+func TestPruneReclaimsClosedReviews(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	snaps := []Snap{
+		{Digest: "sha256:0000", Thread: "approved"},
+		{Digest: "sha256:1111", Thread: "abandoned"},
+		{Digest: "sha256:2222", Thread: "iterating"},
+		{Digest: "sha256:3333", Thread: "iterating"},
+		{Digest: "sha256:4444", Thread: "iterating"},
+		{Digest: "sha256:5555", Thread: "iterating"},
+		{Digest: "sha256:6666", Thread: "iterating"},
+	}
+	old := time.Now().Add(-2 * pruneGrace)
+	for i := range snaps {
+		snaps[i].Key, snaps[i].Variant = "cart/empty", "default"
+		if err := AppendSnap("p", snaps[i], []byte(snaps[i].Digest)); err != nil {
+			t.Fatal(err)
+		}
+		path, _ := ShotPath("p", snaps[i].Digest)
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := AppendNote("p", Note{Key: "cart/empty", Variant: "default", Digest: snaps[0].Digest, Verdict: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := CopyBaseline("p", "cart/empty", "default", snaps[0].Digest); err != nil {
+		t.Fatal(err)
+	}
+	if err := AppendWithdrawal("p", Withdrawal{Key: "cart/empty", Variant: "default", Digest: snaps[1].Digest, Thread: "abandoned"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Prune("p"); err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []bool{true, false, false, true, true, true, true} {
+		if got := HasShot("p", snaps[i].Digest); got != want {
+			t.Errorf("shot %d exists=%v, want %v", i, got, want)
+		}
+	}
+	if values, err := Snaps("p"); err != nil || len(values) != len(snaps) {
+		t.Fatalf("prune changed index: %v %v", values, err)
+	}
+	if values, err := Withdrawals("p"); err != nil || len(values) != 1 {
+		t.Fatalf("prune changed withdrawals: %v %v", values, err)
+	}
+}
+
 // Pixel-identical captures share one digest, so the first snapshot must survive later DOM changes.
 func TestElementsStorage(t *testing.T) {
 	t.Setenv("VISION_STATE_HOME", t.TempDir())
