@@ -1296,13 +1296,20 @@
     // so the server refuses one. Say that plainly, and point at the one comparison still
     // honest: looking at the baseline yourself.
     el.stat.title = '';
+    // A phone has no b key; its compare button does the same thing when held.
+    const peekHint = touch.matches ? 'hold compare for the baseline' : 'hold b for the baseline';
     if (it.incomparable) {
       el.stat.className = 'stat warn';
-      el.stat.textContent = `no diff: ${it.incomparable.replace(/^baseline and this shot differ in /, '').replace(/\. Not comparable\.$/, '')}${it.baselineUrl ? ', hold b for the baseline' : ''}`;
+      el.stat.textContent = `no diff: ${it.incomparable.replace(/^baseline and this shot differ in /, '').replace(/\. Not comparable\.$/, '')}${it.baselineUrl ? `, ${peekHint}` : ''}`;
       el.stat.title = it.incomparable;
     } else if (it.status === 'new') {
       el.stat.className = 'stat new';
       el.stat.textContent = 'new, no baseline yet';
+    } else if (isVideo(it)) {
+      // The server never pixel diffs a recording (server.go: content identity only), so it
+      // sends no fraction, and "0% changed" read as "nothing moved" on every changed one.
+      el.stat.className = 'stat';
+      el.stat.textContent = `recording changed, ${peekHint}`;
     } else {
       el.stat.className = 'stat';
       el.stat.textContent = `${fmtPct(it.changedFraction)} changed`;
@@ -2365,30 +2372,59 @@
   /* ---------- mock ---------- */
 
   function mockQueue() {
+    // The sizes real snaps come in, so the mock lays out the way the queue does: the vision
+    // skill's capture table (360x700 phone, 1440x700 desktop) at device pixel ratio 2, which is
+    // what PinchTab shoots by default (the store is mostly 720x1400 and 2880x1400). Drawn in CSS
+    // px and exported at 2x through the viewBox, the way a real retina PNG is.
+    const DPR = 2;
+    const PHONE = { w: 360, h: 700 }, DESK = { w: 1440, h: 700 };
     const svg = (w, h, body) =>
       'data:image/svg+xml;utf8,' + encodeURIComponent(
         // viewBox matters: without one an SVG has no intrinsic aspect ratio and the mock
         // stops being a fair stand-in for a real PNG.
-        `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">${body}</svg>`);
-    const text = (w, ink) =>
-      `<rect x="24" y="60" width="${w * 0.6}" height="18" rx="4" fill="${ink}"/>` +
-      `<rect x="24" y="94" width="${w * 0.4}" height="14" rx="4" fill="${ink}" opacity=".8"/>`;
-    const bar = (w, h, fill) => `<rect x="24" y="${h - 120}" width="${w - 48}" height="52" rx="8" fill="${fill}"/>`;
-    const ink = bg => (bg === '#fafafa' || bg === '#ffffff' ? '#3f3f46' : '#d4d4d8');
-    const px = (w, h, bg, fill) => svg(w, h, `<rect width="100%" height="100%" fill="${bg}"/>${text(w, ink(bg))}${bar(w, h, fill)}`);
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${w * DPR}" height="${h * DPR}" viewBox="0 0 ${w} ${h}">${body}</svg>`);
+    const light = bg => bg === '#fafafa' || bg === '#ffffff';
+    // A page, not a poster: nav bar, heading, a paragraph, a card, the primary button, and a
+    // list row under it. Narrow is the phone layout, full-bleed with 16px gutters. Drawings
+    // return markup; svg() wraps and encodes last, so a diff can add its overlay first.
+    const page = ({ w, h }, bg, accent, dim) => {
+      const ink = dim || (light(bg) ? '#3f3f46' : '#d4d4d8');
+      const card = dim || (light(bg) ? '#ececef' : '#232327');
+      const narrow = w < 600;
+      const x = narrow ? 16 : (w - 720) / 2, cw = narrow ? w - 32 : 720;
+      const r = (rx, ry, rw, rh, fill, extra = '') => `<rect x="${rx}" y="${ry}" width="${rw}" height="${rh}" rx="6" fill="${fill}"${extra}/>`;
+      return `<rect width="100%" height="100%" fill="${bg}"/>` +
+        `<rect width="${w}" height="56" fill="${card}"/>` + r(16, 18, 84, 20, ink) +
+        (narrow ? r(w - 40, 18, 24, 20, ink, ' opacity=".6"') : [0, 1, 2].map(i => r(w - 320 + i * 100, 22, 72, 12, ink, ' opacity=".6"')).join('')) +
+        r(x, 96, cw * 0.55, 28, ink) +
+        [1, 0.92, 0.7].map((f, i) => r(x, 148 + i * 24, cw * f, 12, ink, ' opacity=".55"')).join('') +
+        r(x, 240, cw, narrow ? 200 : 240, card) + r(x + 20, 264, cw * 0.4, 16, ink, ' opacity=".8"') +
+        r(x, narrow ? h - 92 : 512, narrow ? cw : 240, 48, accent) +
+        (narrow ? '' : r(x, 600, cw, 44, card));
+    };
+    // An element shot is the element alone: a card with a title, as many rows as fit, its button.
+    const CARD = { w: 480, h: 160 }, CARD_GROWN = { w: 480, h: 200 };
+    const card = ({ w, h }, bg, accent, dim) => `<rect width="100%" height="100%" rx="12" fill="${dim ? '#0d0d0d' : '#232327'}"/>` +
+      `<rect x="20" y="20" width="${w * 0.45}" height="16" rx="6" fill="${dim || '#d4d4d8'}"/>` +
+      Array.from({ length: Math.floor((h - 100) / 24) }, (_, i) => `<rect x="20" y="${52 + i * 24}" width="${w - 40}" height="10" rx="5" fill="${dim || '#d4d4d8'}" opacity=".5"/>`).join('') +
+      `<rect x="20" y="${h - 56}" width="140" height="36" rx="8" fill="${accent}"/>`;
+    const px = (size, bg, accent) => svg(size.w, size.h, page(size, bg, accent));
+    const cardShot = (size, accent) => svg(size.w, size.h, card(size, null, accent));
 
     // Drawn the way diff.PNG paints: the shot dimmed to gray for context, changed pixels
     // red, and rows that exist in only one image amber. A mock diff that is just another
     // recolored page teaches nothing about what the real one looks like.
-    const diff = (w, h, base) => {
+    const diff = (size, base, draw = page) => {
+      const { w, h } = size;
       const grown = base && base.h < h ? `<rect y="${base.h}" width="${w}" height="${h - base.h}" fill="#fbbf24"/>` : '';
-      return svg(w, h, `<rect width="100%" height="100%" fill="#0d0d0d"/>${text(w, '#4a4a4a')}` +
-        `<rect x="24" y="${h - 120}" width="${w - 48}" height="52" rx="8" fill="#f43f5e"/>${grown}`);
+      return svg(w, h, draw(size, '#0d0d0d', '#f43f5e', '#3a3a3a') + grown);
     };
+    // Changes name sizes in image pixels, as diff.Changes reads them from the PNG header.
+    const sizeChange = (a, b) => `size ${a.w * DPR}x${a.h * DPR} to ${b.w * DPR}x${b.h * DPR}`;
 
     // Steps carry thumbnails because the server sends them; without one the filmstrip
     // shows bare numbers and stops matching what a real flow looks like.
-    const flow = ['#0ea5e9', '#8b5cf6', '#22c55e'].map((c, i) => ({ key: `checkout/happy-path#${i + 1}`, digest: `d${i + 4}`, thumbUrl: px(900, 560, '#ffffff', c) }));
+    const flow = ['#0ea5e9', '#8b5cf6', '#22c55e'].map((c, i) => ({ key: `checkout/happy-path#${i + 1}`, digest: `d${i + 4}`, thumbUrl: px(DESK, '#ffffff', c) }));
 
     // Two sessions in shop and one in dashboard, spread over the last hour, so the sidebar
     // has branches and sessions to list.
@@ -2406,48 +2442,50 @@
         variant: 'case=declined,flow=payment,scheme=dark,vp=mobile',
         dims: { flow: 'payment', case: 'declined', scheme: 'dark', vp: 'mobile' },
         digest: 'p1', status: 'changed', changedFraction: 0.031,
-        shotUrl: px(375, 812, '#18181b', '#22c55e'),
-        baselineUrl: px(375, 812, '#18181b', '#6366f1'),
-        diffUrl: diff(375, 812) },
+        shotUrl: px(PHONE, '#18181b', '#22c55e'),
+        baselineUrl: px(PHONE, '#18181b', '#6366f1'),
+        diffUrl: diff(PHONE) },
       { project: 'shop', branch: 'feat/checkout', key: 'checkout/pay', group: 'shop checkout/pay',
         variant: 'case=declined,flow=payment,scheme=light,vp=mobile',
         dims: { flow: 'payment', case: 'declined', scheme: 'light', vp: 'mobile' },
         digest: 'p2', status: 'changed', changedFraction: 0.029,
-        shotUrl: px(375, 812, '#fafafa', '#22c55e'),
-        baselineUrl: px(375, 812, '#fafafa', '#6366f1'),
-        diffUrl: diff(375, 812) },
+        shotUrl: px(PHONE, '#fafafa', '#22c55e'),
+        baselineUrl: px(PHONE, '#fafafa', '#6366f1'),
+        diffUrl: diff(PHONE) },
       { project: 'shop', branch: 'feat/checkout', key: 'checkout/pay', group: 'shop checkout/pay',
         variant: 'case=declined,flow=payment,scheme=dark,vp=desktop',
         dims: { flow: 'payment', case: 'declined', scheme: 'dark', vp: 'desktop' },
         digest: 'p3', status: 'changed', changedFraction: 0.028,
-        shotUrl: px(900, 560, '#18181b', '#22c55e'),
-        baselineUrl: px(900, 560, '#18181b', '#6366f1'),
-        diffUrl: diff(900, 560) },
-      // The page grew: the server pads top-left and diffs anyway, and says so beside the
-      // percentage. Swipe has to keep both images on one scale for this card to read right.
+        shotUrl: px(DESK, '#18181b', '#22c55e'),
+        baselineUrl: px(DESK, '#18181b', '#6366f1'),
+        diffUrl: diff(DESK) },
+      // The URL moved: a viewport shot keeps its size (vision crops to the viewport), so the
+      // only drift the server names here is the url, beside the percentage.
       { project: 'shop', branch: 'feat/checkout', key: 'orders/list', variant: 'desktop-dark',
         digest: 'g1', status: 'changed', changedFraction: 0.21,
-        changes: ['size 900x560 to 900x700', 'url http://localhost:3000/orders?page=1 to http://localhost:3000/orders?page=2'],
-        shotUrl: px(900, 700, '#18181b', '#22c55e'),
-        baselineUrl: px(900, 560, '#18181b', '#6366f1'),
-        diffUrl: diff(900, 700, { h: 560 }) },
-      // An element shot (`snap --selector`): small, no viewport around it.
+        changes: ['url http://localhost:3000/orders?page=1 to http://localhost:3000/orders?page=2'],
+        shotUrl: px(DESK, '#18181b', '#22c55e'),
+        baselineUrl: px(DESK, '#18181b', '#6366f1'),
+        diffUrl: diff(DESK) },
+      // An element shot (`snap --selector`) that grew: small, no viewport around it, and the
+      // one place a size really changes. The server pads top-left and diffs anyway, so swipe
+      // has to keep both images on one scale for this card to read right.
       { project: 'shop', branch: 'feat/checkout', key: 'orders/card', variant: 'desktop-dark',
         digest: 'e1', status: 'changed', changedFraction: 0.24,
-        changes: ['size 720x196 to 720x243'],
-        shotUrl: px(720, 243, '#1a1a1f', '#16a34a'),
-        baselineUrl: px(720, 196, '#1a1a1f', '#6366f1'),
-        diffUrl: diff(720, 243, { h: 196 }) },
+        changes: [sizeChange(CARD, CARD_GROWN)],
+        shotUrl: cardShot(CARD_GROWN, '#16a34a'),
+        baselineUrl: cardShot(CARD, '#6366f1'),
+        diffUrl: diff(CARD_GROWN, CARD, card) },
       { project: 'shop', branch: 'feat/checkout', key: 'settings/danger-zone', variant: 'desktop-light',
         digest: 'b2', status: 'changed', changedFraction: 0.0007,
-        shotUrl: px(900, 560, '#fafafa', '#ef4444'),
-        baselineUrl: px(900, 560, '#fafafa', '#a1a1aa'),
-        diffUrl: diff(900, 560) },
+        shotUrl: px(DESK, '#fafafa', '#ef4444'),
+        baselineUrl: px(DESK, '#fafafa', '#a1a1aa'),
+        diffUrl: diff(DESK) },
       // Refused: still shows the baseline under `b`, and offers no swipe or diff.
       { project: 'dashboard', branch: 'main', key: 'billing/plan-picker', variant: 'desktop',
         digest: 'c3', status: 'changed', incomparable: 'baseline and this shot differ in scheme "dark" vs "light". Not comparable.',
-        shotUrl: px(1280, 800, '#fafafa', '#22c55e'),
-        baselineUrl: px(1280, 800, '#0c0a09', '#22c55e') },
+        shotUrl: px(DESK, '#fafafa', '#22c55e'),
+        baselineUrl: px(DESK, '#0c0a09', '#22c55e') },
       { project: 'shop', branch: 'feat/checkout', key: 'checkout/happy-path#1', variant: 'desktop-light',
         digest: 'd4', status: 'new', shotUrl: flow[0].thumbUrl, steps: flow },
       { project: 'shop', branch: 'feat/checkout', key: 'checkout/happy-path#2', variant: 'desktop-light',
@@ -2463,7 +2501,7 @@
   async function mockVideo() {
     if (!window.MediaRecorder || !HTMLCanvasElement.prototype.captureStream) return;
     const record = color => new Promise(resolve => {
-      const c = Object.assign(document.createElement('canvas'), { width: 640, height: 360 });
+      const c = Object.assign(document.createElement('canvas'), { width: 1280, height: 720 });
       const g = c.getContext('2d');
       const rec = new MediaRecorder(c.captureStream(30));
       const parts = [];
@@ -2474,8 +2512,8 @@
       // recording would never stop.
       const tick = setInterval(() => {
         const t = Math.min((performance.now() - t0) / 2000, 1);
-        g.fillStyle = '#18181b'; g.fillRect(0, 0, 640, 360);
-        g.fillStyle = color; g.fillRect(40 + t * 480, 140, 80, 80);
+        g.fillStyle = '#18181b'; g.fillRect(0, 0, 1280, 720);
+        g.fillStyle = color; g.fillRect(80 + t * 960, 280, 160, 160);
         if (t === 1) { clearInterval(tick); rec.stop(); }
       }, 33);
       rec.start();
