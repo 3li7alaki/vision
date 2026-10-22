@@ -1074,7 +1074,7 @@
   /* ---------- data ---------- */
 
   async function load() {
-    if (mock) { all = mockQueue(); refilter(); render(); return mockVideo(); }
+    if (mock) { all = await rasterize(mockQueue()); refilter(); render(); return mockVideo(); }
     try {
       const r = await fetch('/api/queue');
       all = (await r.json()) || [];
@@ -2493,6 +2493,37 @@
       { project: 'shop', branch: 'feat/checkout', key: 'checkout/happy-path#3', variant: 'desktop-light',
         digest: 'd6', status: 'new', shotUrl: flow[2].thumbUrl, steps: flow },
     ]);
+  }
+
+  // Real snaps are PNG, so the mock's drawings become PNG before the gallery sees them. An SVG
+  // <img> is sized by engine-specific rules the spec leaves open (WebKit takes the viewBox,
+  // Chromium the width attribute), and on iPhone Safari the mock came out tiny depending on
+  // which card was shown before, while real PNG snaps never did. Size comes from the SVG's own
+  // width and height attributes, never from naturalWidth, for the same reason.
+  async function rasterize(items) {
+    const done = new Map();
+    const png = url => {
+      if (!url || !url.startsWith('data:image/svg')) return url;
+      if (!done.has(url)) done.set(url, new Promise((resolve, reject) => {
+        const [, w, h] = decodeURIComponent(url).match(/width="(\d+)" height="(\d+)"/).map(Number);
+        const img = new Image();
+        img.onload = () => {
+          const c = Object.assign(document.createElement('canvas'), { width: w, height: h });
+          c.getContext('2d').drawImage(img, 0, 0, w, h);
+          c.toBlob(b => resolve(URL.createObjectURL(b)), 'image/png');
+        };
+        img.onerror = reject;
+        img.src = url;
+      }));
+      return done.get(url);
+    };
+    return Promise.all(items.map(async it => ({
+      ...it,
+      shotUrl: await png(it.shotUrl),
+      baselineUrl: await png(it.baselineUrl),
+      diffUrl: await png(it.diffUrl),
+      steps: it.steps && await Promise.all(it.steps.map(async s => ({ ...s, thumbUrl: await png(s.thumbUrl) }))),
+    })));
   }
 
   // A recorded flow for the mock, made in the browser so the repo carries no binary: a box
