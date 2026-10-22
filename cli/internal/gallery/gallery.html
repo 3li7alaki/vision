@@ -54,8 +54,8 @@
     height: 100dvh;
     display: grid;
     grid-template-columns: 248px minmax(0, 1fr);
-    /* One row the height of the window, never auto: an auto row grows to a zoomed shot's height,
-       and then the stage has nothing to scroll. */
+    /* One row the height of the window, never auto: an auto row grows to fit a tall shot, and
+       the bars below it slide off the bottom of a phone. */
     grid-template-rows: minmax(0, 1fr);
   }
   #side {
@@ -687,37 +687,59 @@
   /* The status bar and the home indicator draw over a home-screen app, so the bars pad
      themselves and their background runs underneath (pwafy: safe area on the bar, not body). */
   .touch header {
-      padding: max(10px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right)) 8px max(14px, env(safe-area-inset-left));
+      padding: max(6px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) 4px max(12px, env(safe-area-inset-left));
       min-height: 0;
   }
-  .touch footer { min-height: 0; padding: 2px 16px 6px; }
+  .touch footer { min-height: 0; padding: 0 14px 2px; }
   /* The key is what a reviewer reads first, so on a phone it keeps the whole first line and
      the dims drop to a second one instead of squeezing it to "ch...". */
   .touch .crumb { flex-wrap: wrap; row-gap: 6px; }
   .touch .crumb .dims { flex: 1 1 100%; order: 3; overflow-x: auto; scrollbar-width: none; touch-action: pan-x; }
   .touch .crumb .dims::-webkit-scrollbar { display: none; }
   .touch footer .keys, .touch #help, .touch #composer .hint, .touch #note .hint, .touch #undo kbd { display: none !important; }
-  /* Phone shots fit the width and scroll down, like Photos, instead of shrinking to fit the
-     height and leaving a gutter either side. pan-y leaves pinch to the gallery's own zoom, so
-     the browser never zooms the page and the bars stay put; zoomed in, both axes pan natively. */
-  .touch #stage { padding: 6px 8px 8px; overflow: auto; place-items: start; overscroll-behavior: contain; touch-action: pan-y; }
-  .touch body.zoomed #stage, .touch body.zoomed #marks { touch-action: pan-x pan-y; }
-  .touch #frame { margin: 0 auto; }
-  .touch #empty { place-self: center; }
+  /* The whole shot stays in view, no zoom and no scroll (owner, 2026-10-22). The room comes from
+     slimmer bars instead, and the shot sits like a phone screen, so the side margins read as
+     framing rather than waste. One finger does everything here, so the browser gets no gesture. */
+  .touch #stage { padding: 4px 6px 6px; touch-action: none; }
+  .touch #frame { border-radius: 14px; box-shadow: 0 0 0 1px var(--line), 0 14px 40px -12px rgba(0, 0, 0, .85); }
+  .touch #frame.dragging { will-change: transform; }
+
+  /* Pull to refresh: a circle follows the finger down from the top of the stage. */
+  #pull { display: none; }
+  .touch #pull {
+    display: grid; place-items: center;
+    position: absolute; top: 0; left: 50%; z-index: 3;
+    width: 38px; height: 38px; border-radius: 50%;
+    background: var(--bg-raised); border: 1px solid var(--line); color: var(--text);
+    box-shadow: 0 6px 20px -6px rgba(0, 0, 0, .7);
+    transform: translate(-50%, -48px); opacity: 0; pointer-events: none;
+  }
+  .touch #pull svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .touch #pull.spin svg { animation: spin .7s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* The ring under a finger held on the shot: it says "now drag for a box". */
+  #aim {
+    position: fixed; z-index: 3; width: 46px; height: 46px; margin: -23px 0 0 -23px;
+    border: 2px solid var(--new); border-radius: 50%;
+    background: color-mix(in srgb, var(--new) 14%, transparent);
+    opacity: 0; transform: scale(.5); pointer-events: none;
+    transition: opacity .14s ease, transform .2s cubic-bezier(.2,.9,.3,1.3);
+  }
+  #aim.on { opacity: 1; transform: scale(1); }
   /* Marking is a mode on a phone, the way Markup is: outside it a drag pages between cards,
      inside it a tap pins and a drag draws a box, and the two never fight. */
-  .touch #marks { touch-action: pan-y; cursor: default; }
-  .touch body.marking #marks { touch-action: none; cursor: crosshair; }
-  .touch body.marking #frame { box-shadow: 0 0 0 2px color-mix(in srgb, var(--new) 70%, transparent), var(--shadow); }
+  .touch #marks { touch-action: none; cursor: default; }
+  .touch #notes { touch-action: pan-y; }
   .touch .pin { width: 30px; height: 30px; margin-top: -30px; border-radius: 15px 15px 15px 4px; }
   .touch #actions {
       display: flex; gap: 10px; align-items: center;
-      padding: 8px max(14px, env(safe-area-inset-right)) max(10px, env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left));
+      padding: 6px max(12px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
       border-top: 1px solid var(--line);
   }
   .touch .act {
       flex: 1 1 0;
-      height: 50px; min-width: 50px;
+      height: 46px; min-width: 46px;
       display: grid; place-items: center;
       padding: 0 14px;
       border-radius: 14px;
@@ -810,6 +832,7 @@
   </header>
 
   <div id="stage">
+    <div id="pull" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v5h-5"/></svg></div>
     <div id="frame">
       <img id="base" alt="">
       <img id="shot" alt="">
@@ -848,10 +871,7 @@
   <!-- Touch only: the same verdicts the keys give, as buttons under the thumb. -->
   <nav id="actions" aria-label="review">
     <button type="button" id="aFlag" class="act flag">Flag</button>
-    <button type="button" id="aMark" class="act icon" aria-pressed="false" aria-label="mark up">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19 9l-4-4L4 16v4zM13.5 6.5l4 4"/></svg>
-    </button>
-    <button type="button" id="aCompare" class="act icon" aria-label="compare">
+    <button type="button" id="aCompare" class="act icon" aria-label="compare, hold for the baseline">
       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 4v16" /><path d="M12 4a8 8 0 0 1 0 16z" class="fill"/></svg>
     </button>
     <button type="button" id="aOkAll" class="act ok ghost" hidden></button>
@@ -889,6 +909,7 @@
 </div>
 
 <div id="scrim"></div>
+<div id="aim" aria-hidden="true"></div>
 
 <div id="toast">
   <span class="what" id="toastWhat"></span>
@@ -933,7 +954,7 @@
     note: $('#note'), noteTag: $('#noteTag'), noteInput: $('#noteInput'),
     toast: $('#toast'), toastWhat: $('#toastWhat'), help: $('#help'), side: $('#side'),
     menu: $('#menu'), scrim: $('#scrim'), undo: $('#undo'), notesPill: $('#notesPill'),
-    aOk: $('#aOk'), aOkAll: $('#aOkAll'), aFlag: $('#aFlag'), aMark: $('#aMark'), aCompare: $('#aCompare'),
+    aOk: $('#aOk'), aOkAll: $('#aOkAll'), aFlag: $('#aFlag'), aCompare: $('#aCompare'), pull: $('#pull'), aim: $('#aim'),
     composerSave: $('#composerSave'), composerCancel: $('#composerCancel'), composerDelete: $('#composerDelete'),
     noteSend: $('#noteSend'), noteCancel: $('#noteCancel'),
   };
@@ -954,7 +975,6 @@
   let at = 0;              // cursor into queue
   let layer = 0;           // index into modes(current())
   let peeking = false;     // `b` held
-  let zoom = 1;            // touch only: multiplier over the fitted size, reset on every card
   let cut = null;          // swipe divider, CSS px from the frame's left edge
   let pendingVerdict = null; // {timer, item, verdict, note}
   let doneCount = 0;
@@ -1267,6 +1287,10 @@
     paint();
     filmstrip(it);
     sidebar();
+    for (const q of [queue[at - 1], queue[at + 1]]) {
+      if (!q || isVideo(q)) continue;
+      for (const url of [q.shotUrl, q.baselineUrl]) if (url) new Image().src = url;
+    }
   }
 
   // Only the layers this card actually has. A layer that silently fell back to the shot
@@ -1389,9 +1413,7 @@
       w: el.stage.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) - panel,
       h: el.stage.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom) - bar,
     };
-    // A user's zoom may pass the natural size, up to 2 CSS px per image px; fitting never does.
-    const fitted = touch.matches ? Math.min(room.w / w, 1) : Math.min(room.w / w, room.h / h, 1);
-    const scale = touch.matches ? Math.min(fitted * zoom, Math.max(fitted, 2)) : fitted;
+    const scale = Math.min(room.w / w, room.h / h, 1);
     shown = scale;
     el.frame.style.width = `${Math.round(w * scale)}px`;
     el.frame.style.height = `${Math.round(h * scale) + bar}px`;
@@ -1614,30 +1636,22 @@
     el.aFlag.textContent = list.length ? 'Changes' : 'Flag';
     el.aOk.classList.toggle('suggest', list.length > 0 && !issues);
     el.aFlag.classList.toggle('suggest', issues > 0);
-    for (const b of [el.aOk, el.aFlag, el.aMark]) b.disabled = !it;
+    for (const b of [el.aOk, el.aFlag]) b.disabled = !it;
     const group = it ? groupRows().length : 0;
     el.aOkAll.hidden = group < 2;
     el.aOkAll.textContent = `All ${group}`;
-    el.aCompare.disabled = !it || modes(it).length < 2;
+    // Holding compare shows the baseline, so a card with only a baseline still enables it.
+    el.aCompare.disabled = !it || (modes(it).length < 2 && !it.baselineUrl);
   }
 
   /* ---------- touch ---------- */
 
+  const HOLD_MS = 260;
+  const PULL = 64;   // px of travel, after resistance, that refreshes: Android's 64dp, as in pwafy
+
   el.aOk.onclick = () => verdict('ok', '');
   el.aOkAll.onclick = () => verdict('ok', '', true);
   el.aFlag.onclick = () => (notesOf(current()).length ? verdict('flag', '') : openNote('flag'));
-  el.aMark.onclick = () => {
-    const on = !body.classList.contains('marking');
-    body.classList.toggle('marking', on);
-    el.aMark.setAttribute('aria-pressed', String(on));
-  };
-  // One button walks the layers this card has (new, swipe, diff) and back to new.
-  el.aCompare.onclick = () => {
-    const list = modes(current());
-    if (list.length < 2) return;
-    layer = (layer + 1) % list.length;
-    paint();
-  };
   el.notesPill.onclick = () => setNotesSheet(!body.classList.contains('notes-open'));
   el.undo.onclick = () => undo();
   el.composerSave.onclick = () => closeComposer(true);
@@ -1656,6 +1670,43 @@
   el.noteSend.onclick = () => submitNote();
   el.noteCancel.onclick = () => closeNote();
 
+  function endPeek() {
+    if (!peeking) return;
+    peeking = false;
+    paint();
+  }
+
+  // Compare: a tap walks the layers this card has (new, swipe, diff); holding it shows the
+  // baseline for as long as the finger stays down, the touch twin of holding b.
+  const cycleLayer = () => {
+    const list = modes(current());
+    if (list.length < 2) return;
+    layer = (layer + 1) % list.length;
+    paint();
+  };
+  let compareHold = null;
+  el.aCompare.addEventListener('pointerdown', () => {
+    const it = current();
+    compareHold = { peeked: false };
+    compareHold.timer = setTimeout(() => {
+      if (!compareHold || !it || !it.baselineUrl) return;
+      compareHold.peeked = true;
+      peeking = true;
+      paint();
+    }, HOLD_MS);
+  });
+  const releaseCompare = e => {
+    if (!compareHold) return;
+    const h = compareHold;
+    compareHold = null;
+    clearTimeout(h.timer);
+    if (h.peeked) return endPeek();
+    if (e.type === 'pointerup') cycleLayer();
+  };
+  ['pointerup', 'pointercancel', 'pointerleave'].forEach(ev => el.aCompare.addEventListener(ev, releaseCompare));
+  el.aCompare.addEventListener('contextmenu', e => e.preventDefault());
+  el.aCompare.addEventListener('click', e => { if (e.detail === 0) cycleLayer(); });   // keyboard activation
+
   // The keyboard covers the bottom of the layout viewport without resizing it on iOS, so a
   // sheet pinned to bottom: 0 would sit behind it. --kb lifts every sheet by what it covers.
   const vv = window.visualViewport;
@@ -1668,143 +1719,140 @@
     vv.addEventListener('scroll', sync);
   }
 
-  // Swipe between cards like Photos: the card follows the finger, a long or fast drag pages,
-  // anything less settles back. Holding still shows the baseline for as long as the finger
-  // stays down, the touch twin of holding b. Swipe mode keeps its own divider drag.
-  const HOLD_MS = 280;
+  // One finger does everything on the stage, so a gesture is read from how it starts:
+  // - a tap on the shot pins a note there and opens the composer;
+  // - press, hold for a beat (the ring appears), then drag draws a box; letting go unmoved pins;
+  // - a quick sideways drag pages to the next or previous card, the card under the finger;
+  // - a quick drag down pulls to refresh the queue.
   let gesture = null;
-  const moveFrame = (x, fade) => {
-    el.frame.style.transform = x ? `translateX(${x}px)` : '';
-    el.frame.style.opacity = fade ? String(fade) : '';
-  };
-  const ease = 'transform .28s cubic-bezier(.32,.72,0,1), opacity .2s ease';
-  function settle() {
-    el.frame.style.transition = calm.matches ? 'none' : ease;
-    moveFrame(0);
-  }
-  function slideTo(dir) {
-    if (calm.matches) { go(at + dir); return settle(); }
-    el.frame.style.transition = 'transform .17s cubic-bezier(.32,.72,0,1), opacity .17s ease';
-    moveFrame(-dir * innerWidth * 0.55, 0.01);
-    setTimeout(() => {
-      go(at + dir);
-      el.frame.style.transition = 'none';
-      moveFrame(dir * 56, 0.01);
-      void el.frame.offsetWidth;
-      settle();
-    }, 160);
-  }
-  function endPeek() {
-    if (!peeking) return;
-    peeking = false;
-    paint();
-  }
+  const spring = 'transform .32s cubic-bezier(.2,.9,.3,1)';
 
-  // Zoom is the shot's, not the page's, the way Photos does it: a pinch scales the picture under
-  // the fingers, a double tap toggles fitted and close up at the spot tapped, and zoomed in a
-  // drag pans through the stage's own scrolling, momentum included.
-  const ZOOM_MAX = 4;
-  const ZOOM_TAP = 2.5;
-  function setZoom(z, cx, cy, anchor) {
-    // The point under (cx, cy) as a fraction of the picture, so it is still under the finger after.
-    const fr = anchor || el.frame.getBoundingClientRect();
-    const fx = fr.width ? (cx - fr.left) / fr.width : 0.5;
-    const fy = fr.height ? (cy - fr.top) / fr.height : 0;
-    zoom = Math.max(1, Math.min(ZOOM_MAX, z));
-    body.classList.toggle('zoomed', zoom > 1);
-    fit();
-    const now = el.frame.getBoundingClientRect();
-    el.stage.scrollLeft += now.left + fx * now.width - cx;
-    el.stage.scrollTop += now.top + fy * now.height - cy;
+  function showAim(x, y) {
+    Object.assign(el.aim.style, { left: `${x}px`, top: `${y}px` });
+    el.aim.classList.add('on');
   }
+  const hideAim = () => el.aim.classList.remove('on');
 
-  const fingers = new Map();   // touch pointers down on the stage
-  let pinch = null;            // {d0, z0, mx, my, rect} while two fingers are down
-  let lastTap = null;          // {t, x, y} of the last quick tap, for double tap
-  const spread = () => { const [a, b] = [...fingers.values()]; return Math.hypot(a.x - b.x, a.y - b.y); };
+  function onShot(x, y) {
+    if (!current()) return false;
+    const r = el.marks.getBoundingClientRect();
+    return r.width > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+  }
 
   el.stage.addEventListener('pointerdown', e => {
-    if (e.pointerType !== 'touch') return;
-    fingers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    if (fingers.size === 2 && !body.classList.contains('marking') && current()) {
-      if (gesture) { clearTimeout(gesture.hold); gesture = null; endPeek(); settle(); }
-      const [a, b] = [...fingers.values()];
-      pinch = { d0: spread(), z0: zoom, mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2, rect: el.frame.getBoundingClientRect() };
-      el.frame.style.transition = 'none';
-      el.frame.style.transformOrigin = `${pinch.mx - pinch.rect.left}px ${pinch.my - pinch.rect.top}px`;
-      return;
+    if (e.pointerType !== 'touch' || gesture) return;
+    if (e.target.closest('button, input, textarea, #vbar, .pin, #notes')) return;
+    // A touch on the shot while a note is open saves the note and does nothing else.
+    if (draft) { closeComposer(true); return; }
+    const start = { clientX: e.clientX, clientY: e.clientY };
+    gesture = { id: e.pointerId, x: e.clientX, y: e.clientY, t0: e.timeStamp, mode: null, start, shot: onShot(e.clientX, e.clientY) };
+    if (gesture.shot) {
+      gesture.hold = setTimeout(() => {
+        if (!gesture || gesture.mode) return;
+        gesture.mode = 'draw';
+        showAim(gesture.x, gesture.y);
+        beginMark(gesture.start);
+      }, HOLD_MS);
     }
-    if (fingers.size > 1 || body.classList.contains('marking') || !current()) return;
-    if (e.target.closest('button, input, textarea, #vbar, .pin')) return;
-    gesture = { id: e.pointerId, x: e.clientX, y: e.clientY, t0: e.timeStamp, dx: 0, mode: null };
-    gesture.hold = setTimeout(() => {
-      if (!gesture || gesture.mode || !current() || !current().baselineUrl) return;
-      gesture.mode = 'peek';
-      peeking = true;
-      paint();
-    }, HOLD_MS);
   });
   el.stage.addEventListener('contextmenu', e => { if (touch.matches) e.preventDefault(); });
 
   addEventListener('pointermove', e => {
-    if (fingers.has(e.pointerId)) fingers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    if (pinch && fingers.size === 2) {
-      // Scaled with a transform while the fingers move, laid out once when they lift.
-      const z = Math.max(1, Math.min(ZOOM_MAX, pinch.z0 * spread() / pinch.d0));
-      el.frame.style.transform = `scale(${z / pinch.z0})`;
-      pinch.z = z;
-      return;
-    }
-    if (!gesture || e.pointerId !== gesture.id || gesture.mode === 'peek' || gesture.mode === 'pan') return;
+    if (!gesture || e.pointerId !== gesture.id) return;
     const dx = e.clientX - gesture.x;
     const dy = e.clientY - gesture.y;
-    if (!gesture.mode) {
-      if (Math.hypot(dx, dy) < 10) return;
-      clearTimeout(gesture.hold);
-      // Zoomed in, the drag is the browser's pan. Up and down scrolls a tall shot. Swipe mode's
-      // divider already follows the finger. Only a sideways drag on a fitted shot pages.
-      if (zoom > 1 || Math.abs(dx) < Math.abs(dy) || el.frame.classList.contains('swipe')) { gesture.mode = 'pan'; return; }
+    if (gesture.mode === 'draw') { hideAim(); return dragMark(e); }
+    if (gesture.mode === 'page') return pageMove(dx);
+    if (gesture.mode === 'pull') return pullMove(dy);
+    if (gesture.mode || Math.hypot(dx, dy) < 10) return;
+    clearTimeout(gesture.hold);
+    // Swipe mode keeps the sideways drag for its own divider.
+    if (Math.abs(dx) > Math.abs(dy) && current() && !el.frame.classList.contains('swipe')) {
       gesture.mode = 'page';
+      el.frame.classList.add('dragging');
       el.frame.style.transition = 'none';
+      return pageMove(dx);
     }
+    gesture.mode = dy > 0 && Math.abs(dy) > Math.abs(dx) ? 'pull' : 'idle';
+    if (gesture.mode === 'pull') pullMove(dy);
+  });
+
+  function pageMove(dx) {
     // Past either end the card resists instead of paging into nothing.
     const edge = (dx > 0 && at === 0) || (dx < 0 && at === queue.length - 1);
     gesture.dx = edge ? dx * 0.25 : dx;
-    moveFrame(gesture.dx, 1 - Math.min(Math.abs(gesture.dx) / innerWidth, 0.35));
-  });
+    el.frame.style.transform = `translate3d(${gesture.dx}px, 0, 0)`;
+  }
+
+  function springBack() {
+    el.frame.style.transition = calm.matches ? 'none' : spring;
+    el.frame.style.transform = '';
+  }
+
+  // The card leaves with the finger's direction, the next one arrives from the other side, and
+  // both ride transforms only, so nothing relayouts mid-flight.
+  function slideTo(dir) {
+    if (calm.matches) { el.frame.style.transform = ''; return go(at + dir); }
+    const out = -dir * el.stage.clientWidth;
+    el.frame.style.transition = 'transform .16s cubic-bezier(.4, 0, 1, 1)';
+    el.frame.style.transform = `translate3d(${out}px, 0, 0)`;
+    setTimeout(() => {
+      go(at + dir);
+      el.frame.style.transition = 'none';
+      el.frame.style.transform = `translate3d(${-out * 0.5}px, 0, 0)`;
+      void el.frame.offsetWidth;
+      el.frame.style.transition = spring;
+      el.frame.style.transform = '';
+    }, 150);
+  }
+
+  // Free at first, stiffer the further you pull, never past `max` (pwafy pull-refresh).
+  const rubber = (d, max) => (1 - 1 / ((d * 0.55) / max + 1)) * max;
+  function pullMove(dy) {
+    const drag = Math.max(0, dy) * 0.5;
+    gesture.pull = drag <= PULL ? drag : PULL + rubber(drag - PULL, 72);
+    el.pull.style.transition = 'none';
+    el.pull.style.transform = `translate(-50%, ${gesture.pull - 44}px) rotate(${gesture.pull * 5}deg)`;
+    el.pull.style.opacity = String(Math.min(1, gesture.pull / (PULL * 0.5)));
+  }
+  function pullBack() {
+    el.pull.style.transition = calm.matches ? 'none' : 'transform .24s ease, opacity .2s ease';
+    el.pull.style.transform = 'translate(-50%, -48px)';
+    el.pull.style.opacity = '0';
+  }
+  async function pullRefresh() {
+    el.pull.classList.add('spin');
+    el.pull.style.transition = 'transform .2s ease';
+    el.pull.style.transform = `translate(-50%, ${PULL - 44}px)`;
+    // A refresh that answers in 50ms still shows a full turn, so it reads as having happened.
+    await Promise.all([resync(), new Promise(done => setTimeout(done, 600))]);
+    el.pull.classList.remove('spin');
+    pullBack();
+  }
 
   const endGesture = e => {
-    fingers.delete(e.pointerId);
-    if (pinch) {
-      if (fingers.size < 2) {
-        const p = pinch;
-        pinch = null;
-        el.frame.style.transform = '';
-        el.frame.style.transformOrigin = '';
-        if (p.z && Math.abs(p.z - p.z0) > 0.01) setZoom(p.z < 1.08 ? 1 : p.z, p.mx, p.my, p.rect);
-      }
-      return;
-    }
     if (!gesture || e.pointerId !== gesture.id) return;
     const g = gesture;
     gesture = null;
     clearTimeout(g.hold);
-    if (g.mode === 'peek') return endPeek();
-    if (!g.mode && e.type === 'pointerup' && e.timeStamp - g.t0 < 250) {
-      const t = { t: e.timeStamp, x: e.clientX, y: e.clientY };
-      if (lastTap && t.t - lastTap.t < 300 && Math.hypot(t.x - lastTap.x, t.y - lastTap.y) < 30) {
-        lastTap = null;
-        return setZoom(zoom > 1 ? 1 : ZOOM_TAP, t.x, t.y);
-      }
-      lastTap = t;
-      return;
+    hideAim();
+    const up = e.type === 'pointerup';
+    if (g.mode === 'draw') {
+      if (up) return endMark();
+      drawing = null;
+      return drawMarks();
     }
-    if (g.mode !== 'page') return;
-    const quick = Math.abs(g.dx) > 40 && e.timeStamp - g.t0 < 260;
-    const far = Math.abs(g.dx) > innerWidth * 0.22;
-    const dir = e.type === 'pointerup' && (quick || far) ? -Math.sign(g.dx) : 0;
-    if (!dir || at + dir < 0 || at + dir >= queue.length) return settle();
-    slideTo(dir);
+    if (g.mode === 'page') {
+      el.frame.classList.remove('dragging');
+      const quick = Math.abs(g.dx) > 40 && e.timeStamp - g.t0 < 260;
+      const far = Math.abs(g.dx) > el.stage.clientWidth * 0.25;
+      const dir = up && (quick || far) ? -Math.sign(g.dx) : 0;
+      if (!dir || at + dir < 0 || at + dir >= queue.length) return springBack();
+      return slideTo(dir);
+    }
+    if (g.mode === 'pull') return up && g.pull >= PULL ? pullRefresh() : pullBack();
+    // A tap on the shot pins a note where it landed.
+    if (!g.mode && up && g.shot && e.timeStamp - g.t0 < HOLD_MS) { beginMark(g.start); endMark(); }
   };
   addEventListener('pointerup', endGesture);
   addEventListener('pointercancel', endGesture);
@@ -1821,21 +1869,17 @@
   }
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') resync(); });
 
-  el.marks.addEventListener('pointerdown', e => {
-    if (e.button !== 0 || !current()) return;
-    if (draft) return closeComposer(true);
-    // Outside mark mode a finger pages and peeks (the stage handles it), so it pins nothing.
-    if (e.pointerType === 'touch' && !body.classList.contains('marking')) return;
-    e.preventDefault();
+  // A mark starts where the pointer went down. Mouse calls these from the marks layer; a finger
+  // calls them from the stage gestures (tap pins, hold then drag draws a box).
+  function beginMark(at) {
     // A mark is drawn on a still frame: the moment the pointer went down is the one the
     // reviewer meant, and a box dragged over a moving picture would describe nothing.
     if (isVideo(current())) el.vid.pause();
-    try { el.marks.setPointerCapture(e.pointerId); } catch {}
-    const p = toImage(e);
-    drawing = { x0: p.x, y0: p.y, cx: e.clientX, cy: e.clientY, box: null };
-  });
+    const p = toImage(at);
+    drawing = { x0: p.x, y0: p.y, cx: at.clientX, cy: at.clientY, box: null };
+  }
 
-  el.marks.addEventListener('pointermove', e => {
+  function dragMark(e) {
     if (!drawing) return;
     // Under 5px of travel it is a click that wobbled, not a box.
     if (!drawing.box && Math.hypot(e.clientX - drawing.cx, e.clientY - drawing.cy) < 5) return;
@@ -1851,9 +1895,9 @@
       return;
     }
     Object.assign(drawing.box.style, { left: `${n.x * shown}px`, top: `${n.y * shown}px`, width: `${n.w * shown}px`, height: `${n.h * shown}px` });
-  });
+  }
 
-  el.marks.addEventListener('pointerup', () => {
+  function endMark() {
     if (!drawing) return;
     const it = current();
     const n = drawing.rect && drawing.rect.w > 4 && drawing.rect.h > 4
@@ -1865,7 +1909,17 @@
     notesBy.get(rid(it)).push(n);
     entering.add(n);
     edit(it, n, true);
+  }
+
+  el.marks.addEventListener('pointerdown', e => {
+    if (e.pointerType === 'touch' || e.button !== 0 || !current()) return;
+    if (draft) return closeComposer(true);
+    e.preventDefault();
+    try { el.marks.setPointerCapture(e.pointerId); } catch {}
+    beginMark(e);
   });
+  el.marks.addEventListener('pointermove', e => { if (e.pointerType !== 'touch') dragMark(e); });
+  el.marks.addEventListener('pointerup', e => { if (e.pointerType !== 'touch') endMark(); });
 
   function setTone(t) {
     draft.note.tone = t;
@@ -1985,9 +2039,6 @@
     if (!queue.length) return;
     if (draft) closeComposer(true);
     setNotesSheet(false);
-    zoom = 1;
-    body.classList.remove('zoomed');
-    el.stage.scrollTo(0, 0);
     hot = -1;
     at = Math.max(0, Math.min(queue.length - 1, i));
     layer = 0;
