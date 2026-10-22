@@ -31,8 +31,9 @@ The human owns the verdict. Nothing else does.
 6. There is no approve-all. A queue that can be cleared without looking manufactures false
    confidence, which is the problem vision exists to solve.
 7. State is global, XDG, and project-keyed. Linked worktrees of one repository share a project.
-8. The daemon is loopback-only and unauthenticated by design, so it must never bind anything
-   else.
+8. The daemon binds loopback only, never anything else. Another device reaches it only through
+   `tailscale serve`, and only as the one tailnet login named in `~/.config/vision/trusted-user`.
+   Snap and withdraw never leave this machine.
 9. JSON schemas are versioned. Human output is never the integration protocol.
 
 ## Why the camera stays a camera

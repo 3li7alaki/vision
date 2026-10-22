@@ -102,9 +102,13 @@ type Server struct {
 	ledger  sync.Mutex
 	mux     sync.Mutex
 	clients map[chan Item]struct{}
+	// trustedUser names the one tailnet login allowed to review from another device (remote.go).
+	trustedUser func() string
 }
 
-func New() *Server { return &Server{clients: make(map[chan Item]struct{})} }
+func New() *Server {
+	return &Server{clients: make(map[chan Item]struct{}), trustedUser: readTrustedUser}
+}
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -120,6 +124,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /media/{kind}/{project}/{digest}", s.media)
 	mux.HandleFunc("GET /media/icon/{project}", s.projectIcon)
 	mux.HandleFunc("GET /events", s.events)
+	mux.HandleFunc("GET /manifest.webmanifest", asset("application/manifest+json"))
+	mux.HandleFunc("GET /icon.svg", asset("image/svg+xml"))
+	for _, png := range []string{"/icon-180.png", "/icon-192.png", "/icon-512.png"} {
+		mux.HandleFunc("GET "+png, asset("image/png"))
+	}
 	return mux
 }
 
@@ -150,7 +159,20 @@ func (s *Server) ListenAndServe() error {
 			}
 		}
 	}()
-	return http.ListenAndServe(Address, s.Handler())
+	return http.ListenAndServe(Address, s.guard(s.Handler()))
+}
+
+// asset serves one embedded home-screen file by its request path.
+func asset(contentType string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		data, err := gallery.Assets.ReadFile(strings.TrimPrefix(r.URL.Path, "/"))
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", contentType)
+		w.Write(data)
+	}
 }
 
 func (s *Server) gallery(w http.ResponseWriter, _ *http.Request) {

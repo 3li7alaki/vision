@@ -209,8 +209,13 @@ record decision: see Storage.
 One machine-wide daemon serving every project, not one per repository. That is what makes a fixed
 port safe and a bookmark stable.
 
-- Binds `127.0.0.1:4747` only. There is no authentication, so binding any other interface would
-  publish an unauthenticated write endpoint. Do not add a `--host` flag.
+- Binds `127.0.0.1:4747` only. Do not add a `--host` flag: the only way off this machine is
+  `tailscale serve` (tailnet only, never funnel), so the phone can review.
+- `server/remote.go` decides who that is. A request is remote if its Host is not a loopback name or
+  it carries `X-Forwarded-Host` or `X-Forwarded-For`, which serve always overwrites. A remote
+  request needs `Tailscale-User-Login` to match `~/.config/vision/trusted-user` (missing file means
+  nobody), and never reaches snap or withdraw. `http.CrossOriginProtection` wraps everything,
+  because a tailnet identity rides the connection and any page on the phone could post as you.
 - Reached at `http://vision.test:4747` through a hosts entry. Never `.local`, which is Bonjour on
   macOS and causes multi-second resolution stalls.
 - Managed by launchd on macOS and by a systemd user unit on Linux. `vision on`, `off`, and
@@ -290,6 +295,6 @@ would browse is exactly what pruning reclaims. Bounded disk beats a screen nobod
    selector, and never between two recordings.
 6. State is global, XDG, and project-keyed. Linked worktrees share a project. No repo-local state
    exists.
-7. The daemon is loopback-only and unauthenticated by design.
+7. The daemon binds loopback only; remote review goes through tailscale serve and one trusted login.
 8. JSON schemas are versioned. Human output is never the integration protocol.
 9. Standard library only.
