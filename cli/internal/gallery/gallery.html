@@ -54,6 +54,9 @@
     height: 100dvh;
     display: grid;
     grid-template-columns: 248px minmax(0, 1fr);
+    /* One row the height of the window, never auto: an auto row grows to a zoomed shot's height,
+       and then the stage has nothing to scroll. */
+    grid-template-rows: minmax(0, 1fr);
   }
   #side {
     border-right: 1px solid var(--line);
@@ -694,11 +697,16 @@
   .touch .crumb .dims { flex: 1 1 100%; order: 3; overflow-x: auto; scrollbar-width: none; touch-action: pan-x; }
   .touch .crumb .dims::-webkit-scrollbar { display: none; }
   .touch footer .keys, .touch #help, .touch #composer .hint, .touch #note .hint, .touch #undo kbd { display: none !important; }
-  .touch #stage { padding: 4px 10px 8px; touch-action: pinch-zoom; }
-  .touch body.zoomed #stage, .touch body.zoomed #marks { touch-action: auto; }
+  /* Phone shots fit the width and scroll down, like Photos, instead of shrinking to fit the
+     height and leaving a gutter either side. pan-y leaves pinch to the gallery's own zoom, so
+     the browser never zooms the page and the bars stay put; zoomed in, both axes pan natively. */
+  .touch #stage { padding: 6px 8px 8px; overflow: auto; place-items: start; overscroll-behavior: contain; touch-action: pan-y; }
+  .touch body.zoomed #stage, .touch body.zoomed #marks { touch-action: pan-x pan-y; }
+  .touch #frame { margin: 0 auto; }
+  .touch #empty { place-self: center; }
   /* Marking is a mode on a phone, the way Markup is: outside it a drag pages between cards,
      inside it a tap pins and a drag draws a box, and the two never fight. */
-  .touch #marks { touch-action: pinch-zoom; cursor: default; }
+  .touch #marks { touch-action: pan-y; cursor: default; }
   .touch body.marking #marks { touch-action: none; cursor: crosshair; }
   .touch body.marking #frame { box-shadow: 0 0 0 2px color-mix(in srgb, var(--new) 70%, transparent), var(--shadow); }
   .touch .pin { width: 30px; height: 30px; margin-top: -30px; border-radius: 15px 15px 15px 4px; }
@@ -946,6 +954,7 @@
   let at = 0;              // cursor into queue
   let layer = 0;           // index into modes(current())
   let peeking = false;     // `b` held
+  let zoom = 1;            // touch only: multiplier over the fitted size, reset on every card
   let cut = null;          // swipe divider, CSS px from the frame's left edge
   let pendingVerdict = null; // {timer, item, verdict, note}
   let doneCount = 0;
@@ -1229,7 +1238,7 @@
     // ahead of you. It is omitted for a lone card, where it would only say "1 of 1".
     const rows = groupRows();
     const here = rows.indexOf(at);
-    el.count.textContent = rows.length > 1
+    el.count.textContent = touch.matches ? `${at + 1} of ${queue.length}` : rows.length > 1
       ? `${here + 1} of ${rows.length} · ${at + 1} / ${queue.length}`
       : `${at + 1} / ${queue.length}`;
 
@@ -1380,7 +1389,9 @@
       w: el.stage.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) - panel,
       h: el.stage.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom) - bar,
     };
-    const scale = Math.min(room.w / w, room.h / h, 1);
+    // A user's zoom may pass the natural size, up to 2 CSS px per image px; fitting never does.
+    const fitted = touch.matches ? Math.min(room.w / w, 1) : Math.min(room.w / w, room.h / h, 1);
+    const scale = touch.matches ? Math.min(fitted * zoom, Math.max(fitted, 2)) : fitted;
     shown = scale;
     el.frame.style.width = `${Math.round(w * scale)}px`;
     el.frame.style.height = `${Math.round(h * scale) + bar}px`;
@@ -1391,7 +1402,7 @@
     const fw = w * scale;
     if (cut === null || cut > fw) cut = fw / 2;
     el.frame.style.setProperty('--cut', `${cut}px`);
-    el.frame.style.marginRight = `${panel}px`;
+    el.frame.style.marginRight = panel ? `${panel}px` : '';
     drawMarks();
   }
 
@@ -1647,13 +1658,11 @@
 
   // The keyboard covers the bottom of the layout viewport without resizing it on iOS, so a
   // sheet pinned to bottom: 0 would sit behind it. --kb lifts every sheet by what it covers.
-  // Zoomed in, a one-finger drag belongs to the browser's pan, so card paging stands down.
   const vv = window.visualViewport;
   if (vv) {
     const sync = () => {
       const kb = Math.max(0, innerHeight - vv.height - vv.offsetTop);
       document.documentElement.style.setProperty('--kb', `${Math.round(kb)}px`);
-      body.classList.toggle('zoomed', vv.scale > 1.01);
     };
     vv.addEventListener('resize', sync);
     vv.addEventListener('scroll', sync);
@@ -1691,11 +1700,41 @@
     paint();
   }
 
+  // Zoom is the shot's, not the page's, the way Photos does it: a pinch scales the picture under
+  // the fingers, a double tap toggles fitted and close up at the spot tapped, and zoomed in a
+  // drag pans through the stage's own scrolling, momentum included.
+  const ZOOM_MAX = 4;
+  const ZOOM_TAP = 2.5;
+  function setZoom(z, cx, cy, anchor) {
+    // The point under (cx, cy) as a fraction of the picture, so it is still under the finger after.
+    const fr = anchor || el.frame.getBoundingClientRect();
+    const fx = fr.width ? (cx - fr.left) / fr.width : 0.5;
+    const fy = fr.height ? (cy - fr.top) / fr.height : 0;
+    zoom = Math.max(1, Math.min(ZOOM_MAX, z));
+    body.classList.toggle('zoomed', zoom > 1);
+    fit();
+    const now = el.frame.getBoundingClientRect();
+    el.stage.scrollLeft += now.left + fx * now.width - cx;
+    el.stage.scrollTop += now.top + fy * now.height - cy;
+  }
+
+  const fingers = new Map();   // touch pointers down on the stage
+  let pinch = null;            // {d0, z0, mx, my, rect} while two fingers are down
+  let lastTap = null;          // {t, x, y} of the last quick tap, for double tap
+  const spread = () => { const [a, b] = [...fingers.values()]; return Math.hypot(a.x - b.x, a.y - b.y); };
+
   el.stage.addEventListener('pointerdown', e => {
     if (e.pointerType !== 'touch') return;
-    // A second finger is a pinch, which belongs to the browser.
-    if (gesture) { clearTimeout(gesture.hold); gesture = null; endPeek(); return settle(); }
-    if (body.classList.contains('marking') || body.classList.contains('zoomed') || !current()) return;
+    fingers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (fingers.size === 2 && !body.classList.contains('marking') && current()) {
+      if (gesture) { clearTimeout(gesture.hold); gesture = null; endPeek(); settle(); }
+      const [a, b] = [...fingers.values()];
+      pinch = { d0: spread(), z0: zoom, mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2, rect: el.frame.getBoundingClientRect() };
+      el.frame.style.transition = 'none';
+      el.frame.style.transformOrigin = `${pinch.mx - pinch.rect.left}px ${pinch.my - pinch.rect.top}px`;
+      return;
+    }
+    if (fingers.size > 1 || body.classList.contains('marking') || !current()) return;
     if (e.target.closest('button, input, textarea, #vbar, .pin')) return;
     gesture = { id: e.pointerId, x: e.clientX, y: e.clientY, t0: e.timeStamp, dx: 0, mode: null };
     gesture.hold = setTimeout(() => {
@@ -1708,14 +1747,23 @@
   el.stage.addEventListener('contextmenu', e => { if (touch.matches) e.preventDefault(); });
 
   addEventListener('pointermove', e => {
-    if (!gesture || e.pointerId !== gesture.id || gesture.mode === 'peek') return;
+    if (fingers.has(e.pointerId)) fingers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pinch && fingers.size === 2) {
+      // Scaled with a transform while the fingers move, laid out once when they lift.
+      const z = Math.max(1, Math.min(ZOOM_MAX, pinch.z0 * spread() / pinch.d0));
+      el.frame.style.transform = `scale(${z / pinch.z0})`;
+      pinch.z = z;
+      return;
+    }
+    if (!gesture || e.pointerId !== gesture.id || gesture.mode === 'peek' || gesture.mode === 'pan') return;
     const dx = e.clientX - gesture.x;
     const dy = e.clientY - gesture.y;
     if (!gesture.mode) {
       if (Math.hypot(dx, dy) < 10) return;
       clearTimeout(gesture.hold);
-      // Up and down pages nothing, and swipe mode's divider already follows the finger.
-      if (Math.abs(dx) < Math.abs(dy) || el.frame.classList.contains('swipe')) { gesture = null; return; }
+      // Zoomed in, the drag is the browser's pan. Up and down scrolls a tall shot. Swipe mode's
+      // divider already follows the finger. Only a sideways drag on a fitted shot pages.
+      if (zoom > 1 || Math.abs(dx) < Math.abs(dy) || el.frame.classList.contains('swipe')) { gesture.mode = 'pan'; return; }
       gesture.mode = 'page';
       el.frame.style.transition = 'none';
     }
@@ -1726,11 +1774,31 @@
   });
 
   const endGesture = e => {
+    fingers.delete(e.pointerId);
+    if (pinch) {
+      if (fingers.size < 2) {
+        const p = pinch;
+        pinch = null;
+        el.frame.style.transform = '';
+        el.frame.style.transformOrigin = '';
+        if (p.z && Math.abs(p.z - p.z0) > 0.01) setZoom(p.z < 1.08 ? 1 : p.z, p.mx, p.my, p.rect);
+      }
+      return;
+    }
     if (!gesture || e.pointerId !== gesture.id) return;
     const g = gesture;
     gesture = null;
     clearTimeout(g.hold);
     if (g.mode === 'peek') return endPeek();
+    if (!g.mode && e.type === 'pointerup' && e.timeStamp - g.t0 < 250) {
+      const t = { t: e.timeStamp, x: e.clientX, y: e.clientY };
+      if (lastTap && t.t - lastTap.t < 300 && Math.hypot(t.x - lastTap.x, t.y - lastTap.y) < 30) {
+        lastTap = null;
+        return setZoom(zoom > 1 ? 1 : ZOOM_TAP, t.x, t.y);
+      }
+      lastTap = t;
+      return;
+    }
     if (g.mode !== 'page') return;
     const quick = Math.abs(g.dx) > 40 && e.timeStamp - g.t0 < 260;
     const far = Math.abs(g.dx) > innerWidth * 0.22;
@@ -1917,6 +1985,9 @@
     if (!queue.length) return;
     if (draft) closeComposer(true);
     setNotesSheet(false);
+    zoom = 1;
+    body.classList.remove('zoomed');
+    el.stage.scrollTo(0, 0);
     hot = -1;
     at = Math.max(0, Math.min(queue.length - 1, i));
     layer = 0;
