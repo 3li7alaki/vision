@@ -690,12 +690,17 @@
       padding: max(6px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) 4px max(12px, env(safe-area-inset-left));
       min-height: 0;
   }
-  .touch footer { min-height: 0; padding: 0 14px 2px; }
+  /* Both bars keep one height on every card, so paging never resizes the shot: the footer is
+     always tall enough for a change chip, the header always keeps its dims row. */
+  .touch footer { min-height: 22px; padding: 0 14px 2px; }
   /* The key is what a reviewer reads first, so on a phone it keeps the whole first line and
      the dims drop to a second one instead of squeezing it to "ch...". */
   .touch .crumb { flex-wrap: wrap; row-gap: 6px; }
-  .touch .crumb .dims { flex: 1 1 100%; order: 3; overflow-x: auto; scrollbar-width: none; touch-action: pan-x; }
+  .touch .crumb .dims { flex: 1 1 100%; order: 3; min-height: 20px; overflow-x: auto; scrollbar-width: none; touch-action: pan-x; }
   .touch .crumb .dims::-webkit-scrollbar { display: none; }
+  /* A shot without dims shows its raw variant in the dims row instead, so it is two rows too. */
+  .touch .crumb .variant { flex: 1 1 100%; order: 3; line-height: 20px; overflow: hidden; text-overflow: ellipsis; }
+  .touch .crumb .variant:empty, .touch .crumb .variant:not(:empty) ~ .dims { display: none; }
   .touch footer .keys, .touch #help, .touch #composer .hint, .touch #note .hint, .touch #undo kbd { display: none !important; }
   /* The whole shot stays in view, no zoom and no scroll (owner, 2026-10-22). The room comes from
      slimmer bars instead, and the shot sits like a phone screen, so the side margins read as
@@ -1472,7 +1477,10 @@
   el.vseek.onchange = () => el.vseek.blur();
   el.shot.addEventListener('load', fit);
   el.base.addEventListener('load', fit);
-  addEventListener('resize', fit);
+  // The stage's own size, not the window's: render() fits before filmstrip() shows or hides
+  // the step strip, and the bars change height per card, so a window listener left a phone
+  // shot sized for the last card's room (clipped going into a flow, shrunk coming back).
+  new ResizeObserver(() => fit()).observe(el.stage);
 
   /* ---------- annotations ---------- */
 
