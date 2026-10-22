@@ -1,7 +1,19 @@
 <!doctype html>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0a0a0b">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="vision">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon-180.png">
 <title>vision</title>
+<script>
+  // Before first paint, so a phone never flashes the keyboard layout.
+  if (matchMedia('(pointer: coarse)').matches || /[?&]touch\b/.test(location.search)) document.documentElement.classList.add('touch');
+</script>
 <style>
   :root {
     --bg:        #0a0a0b;
@@ -108,6 +120,9 @@
     height: 100%;
     min-width: 0;
     display: grid;
+    /* minmax(0,1fr), not the implicit auto column: auto grows to the header's unwrapped
+       min-content (key, dims, counter on one line), and a phone's stage went 664px wide. */
+    grid-template-columns: minmax(0, 1fr);
     /* minmax(0,1fr), never 1fr: a plain 1fr refuses to shrink below the image's intrinsic
        height, which pushes the bottom of a tall phone screenshot off screen. */
     grid-template-rows: auto minmax(0, 1fr) auto auto;
@@ -422,6 +437,7 @@
   @media (prefers-reduced-motion: reduce) {
     .pin.enter, .pin.saved, .note.enter { animation: none; }
     #composer, #composer.in, .box, .pin { transition: none; }
+    .touch #composer, .touch #composer.in, .touch #notes, #side, #scrim, .act, #toast { transition: none !important; }
   }
 
   .keys.suggest kbd { box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 22%, transparent); }
@@ -623,12 +639,158 @@
     .stat { font-size: 11px; }
     header, footer { gap: 8px; }
   }
+
+  /* ---------- touch ---------- */
+
+  /* The projects button stands in for `p` wherever the sidebar is an overlay. */
+  .tap {
+    flex: 0 0 auto;
+    display: grid; place-items: center;
+    width: 40px; height: 40px; margin: -8px 0 -8px -8px;
+    padding: 0; border: 0; border-radius: 10px;
+    background: none; color: var(--muted); cursor: pointer;
+  }
+  .tap svg, .act svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  .act svg .fill { fill: currentColor; stroke: none; }
+  #menu { display: none; }
+  @media (max-width: 1000px) { #menu { display: grid; } }
+
+  #scrim {
+    position: fixed; inset: 0; z-index: 4;
+    background: rgba(0, 0, 0, .5);
+    opacity: 0; pointer-events: none;
+    transition: opacity .28s ease;
+  }
+  #scrim.on { opacity: 1; pointer-events: auto; }
+
+  #actions, .sheet-actions { display: none; }
+  #notesPill[hidden] { display: none; }
+  #undo { border: 0; padding: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
+  #toast.show #undo { pointer-events: auto; }
+
+  /* Everything below is for a finger, under :root.touch (set in <head> from pointer: coarse, or
+     ?touch to check the layout in a browser that cannot claim a touchscreen). The keyboard flow
+     above stays exactly as it was, so a desktop reviewer loses nothing and a phone reviewer
+     never sees a key it cannot press. */
+  .touch, .touch body { overscroll-behavior: none; }
+  .touch body {
+      touch-action: manipulation;
+      -webkit-tap-highlight-color: transparent;
+      -webkit-user-select: none; user-select: none;
+      -webkit-touch-callout: none;
+  }
+  .touch textarea, .touch input { -webkit-user-select: text; user-select: text; }
+  .touch #app { grid-template-rows: auto minmax(0, 1fr) auto auto auto; }
+  /* The status bar and the home indicator draw over a home-screen app, so the bars pad
+     themselves and their background runs underneath (pwafy: safe area on the bar, not body). */
+  .touch header {
+      padding: max(10px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right)) 8px max(14px, env(safe-area-inset-left));
+      min-height: 0;
+  }
+  .touch footer { min-height: 0; padding: 2px 16px 6px; }
+  /* The key is what a reviewer reads first, so on a phone it keeps the whole first line and
+     the dims drop to a second one instead of squeezing it to "ch...". */
+  .touch .crumb { flex-wrap: wrap; row-gap: 6px; }
+  .touch .crumb .dims { flex: 1 1 100%; order: 3; overflow-x: auto; scrollbar-width: none; touch-action: pan-x; }
+  .touch .crumb .dims::-webkit-scrollbar { display: none; }
+  .touch footer .keys, .touch #help, .touch #composer .hint, .touch #note .hint, .touch #undo kbd { display: none !important; }
+  .touch #stage { padding: 4px 10px 8px; touch-action: pinch-zoom; }
+  .touch body.zoomed #stage, .touch body.zoomed #marks { touch-action: auto; }
+  /* Marking is a mode on a phone, the way Markup is: outside it a drag pages between cards,
+     inside it a tap pins and a drag draws a box, and the two never fight. */
+  .touch #marks { touch-action: pinch-zoom; cursor: default; }
+  .touch body.marking #marks { touch-action: none; cursor: crosshair; }
+  .touch body.marking #frame { box-shadow: 0 0 0 2px color-mix(in srgb, var(--new) 70%, transparent), var(--shadow); }
+  .touch .pin { width: 30px; height: 30px; margin-top: -30px; border-radius: 15px 15px 15px 4px; }
+  .touch #actions {
+      display: flex; gap: 10px; align-items: center;
+      padding: 8px max(14px, env(safe-area-inset-right)) max(10px, env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left));
+      border-top: 1px solid var(--line);
+  }
+  .touch .act {
+      flex: 1 1 0;
+      height: 50px; min-width: 50px;
+      display: grid; place-items: center;
+      padding: 0 14px;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: var(--bg-raised);
+      color: var(--text);
+      font: 600 15px/1 var(--sans);
+      cursor: pointer;
+      transition: transform .12s ease, background-color .12s ease, box-shadow .12s ease;
+  }
+  .touch .act:active { transform: scale(.95); }
+  .touch .act.icon { flex: 0 0 52px; padding: 0; color: var(--muted); }
+  .touch .act.ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 16%, var(--bg-raised)); border-color: color-mix(in srgb, var(--ok) 35%, var(--line)); }
+  .touch .act.flag { color: var(--flag); background: color-mix(in srgb, var(--flag) 11%, var(--bg-raised)); border-color: color-mix(in srgb, var(--flag) 30%, var(--line)); }
+  .touch .act.ghost { background: none; }
+  .touch .act.ok.ghost { flex: 0 0 auto; }
+  .touch .act.danger { color: var(--flag); }
+  .touch .act.suggest { box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 28%, transparent); }
+  .touch .act[aria-pressed="true"] { color: var(--new); background: color-mix(in srgb, var(--new) 18%, var(--bg-raised)); border-color: color-mix(in srgb, var(--new) 45%, var(--line)); }
+  .touch .act[hidden] { display: none; }
+  .touch .act:disabled { opacity: .35; }
+  .touch .pill {
+      width: auto; height: 30px; margin: 0 0 0 auto; padding: 0 12px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--new) 14%, transparent);
+      color: var(--new);
+      font: 600 12px/1 var(--sans);
+  }
+  /* Sheets rise from the bottom and ride on top of the keyboard: --kb is how much of the
+     layout viewport the keyboard covers, set from visualViewport. */
+  .touch #composer, .touch #note, .touch #notes {
+      position: fixed; left: 0; right: 0; top: auto !important;
+      width: auto; z-index: 8;
+      background: var(--bg-raised);
+      border: 1px solid var(--line); border-bottom: 0;
+      border-radius: 18px 18px 0 0;
+      padding: 14px max(16px, env(safe-area-inset-right)) max(14px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+      box-shadow: 0 -12px 40px rgba(0, 0, 0, .45);
+  }
+  .touch #composer, .touch #note { bottom: var(--kb, 0px); left: 0 !important; }
+  .touch #composer { transform: translateY(24px); transform-origin: bottom center; transition: opacity .2s ease, transform .3s cubic-bezier(.32,.72,0,1); }
+  .touch #composer.in { transform: none; transition: opacity .2s ease, transform .3s cubic-bezier(.32,.72,0,1); }
+  /* Under 16px iOS zooms the page on focus. */
+  .touch #composer textarea, .touch #note input { font-size: 16px; }
+  .touch .tones button { padding: 11px 0; font-size: 13px; border-radius: 10px; }
+  .touch .sheet-actions { display: flex; gap: 8px; }
+  .touch .sheet-actions .act { height: 46px; font-size: 15px; }
+  .touch #note { flex-wrap: wrap; gap: 12px; }
+  .touch #note input { flex: 1 1 100%; order: 2; padding: 4px 0; }
+  .touch #note .tag { order: 1; }
+  .touch #note .sheet-actions { order: 3; flex: 1 1 100%; }
+  .touch #notes {
+      bottom: 0; max-height: 55dvh;
+      display: flex !important;
+      transform: translateY(105%);
+      transition: transform .3s cubic-bezier(.32,.72,0,1);
+      z-index: 6;
+  }
+  .touch body.notes-open #notes { transform: none; }
+  .touch .note .del { opacity: 1; font-size: 22px; padding: 0 6px; }
+  .touch #toast { bottom: calc(env(safe-area-inset-bottom) + 86px); font-size: 13px; padding: 8px 8px 8px 14px; border-radius: 12px; }
+  .touch #undo { padding: 8px 12px; border-radius: 9px; background: var(--bg); color: var(--text); font: 600 13px/1 var(--sans); }
+  .touch #frame.video { --vbar: 48px; }
+  .touch #vplay { width: 40px; height: 40px; font-size: 15px; }
+  .touch #strip button { width: 56px; height: 44px; }
+  .touch #side {
+      padding-top: max(14px, env(safe-area-inset-top));
+      width: min(300px, 84vw);
+      transition: transform .3s cubic-bezier(.32,.72,0,1);
+  }
+  .touch #side a { padding: 11px 10px; }
+
 </style>
 
 <div id="shell">
 <nav id="side" aria-label="projects"></nav>
 <div id="app">
   <header>
+    <button type="button" id="menu" class="tap" aria-label="projects">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
+    </button>
     <div class="crumb">
       <span class="ctx" id="ctx"></span>
       <span class="key" id="key"></span>
@@ -672,7 +834,21 @@
     <div class="keys" id="flagKey"><kbd class="flag">f</kbd><span class="label" id="flagLabel">flag</span></div>
     <div class="keys"><kbd>b</kbd><span class="label">baseline</span></div>
     <div class="keys"><kbd>?</kbd></div>
+    <button type="button" id="notesPill" class="tap pill" hidden></button>
   </footer>
+
+  <!-- Touch only: the same verdicts the keys give, as buttons under the thumb. -->
+  <nav id="actions" aria-label="review">
+    <button type="button" id="aFlag" class="act flag">Flag</button>
+    <button type="button" id="aMark" class="act icon" aria-pressed="false" aria-label="mark up">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19 9l-4-4L4 16v4zM13.5 6.5l4 4"/></svg>
+    </button>
+    <button type="button" id="aCompare" class="act icon" aria-label="compare">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 4v16" /><path d="M12 4a8 8 0 0 1 0 16z" class="fill"/></svg>
+    </button>
+    <button type="button" id="aOkAll" class="act ok ghost" hidden></button>
+    <button type="button" id="aOk" class="act ok">OK</button>
+  </nav>
 </div>
 </div>
 
@@ -680,6 +856,10 @@
   <span class="tag" id="noteTag"></span>
   <input id="noteInput" autocomplete="off" spellcheck="true">
   <span class="hint"><kbd>enter</kbd> save &nbsp; <kbd>esc</kbd> cancel</span>
+  <div class="sheet-actions">
+    <button type="button" class="act ghost" id="noteCancel">Cancel</button>
+    <button type="button" class="act" id="noteSend">Send</button>
+  </div>
 </div>
 
 <div id="composer" role="dialog" aria-label="note">
@@ -693,12 +873,19 @@
     <label id="flowAll"><input type="checkbox" id="flowAllBox"> every step of this flow</label>
     <span class="hint">enter · tab tone · esc</span>
   </div>
+  <div class="sheet-actions">
+    <button type="button" class="act ghost danger" id="composerDelete">Delete</button>
+    <button type="button" class="act ghost" id="composerCancel">Cancel</button>
+    <button type="button" class="act" id="composerSave">Save</button>
+  </div>
 </div>
+
+<div id="scrim"></div>
 
 <div id="toast">
   <span class="what" id="toastWhat"></span>
   <span class="bar"><i></i></span>
-  <span><kbd>u</kbd> undo</span>
+  <button type="button" id="undo"><kbd>u</kbd> undo</button>
 </div>
 
 <div id="help">
@@ -737,7 +924,16 @@
     empty: $('#empty'), emptySub: $('#emptySub'), emptyNext: $('#emptyNext'),
     note: $('#note'), noteTag: $('#noteTag'), noteInput: $('#noteInput'),
     toast: $('#toast'), toastWhat: $('#toastWhat'), help: $('#help'), side: $('#side'),
+    menu: $('#menu'), scrim: $('#scrim'), undo: $('#undo'), notesPill: $('#notesPill'),
+    aOk: $('#aOk'), aOkAll: $('#aOkAll'), aFlag: $('#aFlag'), aMark: $('#aMark'), aCompare: $('#aCompare'),
+    composerSave: $('#composerSave'), composerCancel: $('#composerCancel'), composerDelete: $('#composerDelete'),
+    noteSend: $('#noteSend'), noteCancel: $('#noteCancel'),
   };
+
+  // A finger, not a mouse: the CSS swaps the key hints for buttons and sheets on the same query.
+  const touch = { get matches() { return document.documentElement.classList.contains('touch'); } };
+  const calm = matchMedia('(prefers-reduced-motion: reduce)');
+  const body = document.body;
 
   const UNDO_MS = 4000;
 
@@ -795,10 +991,25 @@
     if (path !== location.pathname + location.search) history.pushState(null, '', path);
     at = 0;
     layer = 0;
-    el.side.classList.remove('open');
+    setSide(false);
     refilter();
     render();
   }
+
+  // The sidebar and the notes sheet dim the page behind them, and a tap there closes them.
+  function setSide(open) {
+    el.side.classList.toggle('open', open);
+    syncScrim();
+  }
+  function setNotesSheet(open) {
+    body.classList.toggle('notes-open', open && touch.matches);
+    syncScrim();
+  }
+  function syncScrim() {
+    el.scrim.classList.toggle('on', el.side.classList.contains('open') || body.classList.contains('notes-open'));
+  }
+  el.scrim.onclick = () => { setSide(false); setNotesSheet(false); };
+  el.menu.onclick = () => setSide(!el.side.classList.contains('open'));
   addEventListener('popstate', () => { view = parseView(); at = 0; refilter(); render(); });
 
   /* ---------- data ---------- */
@@ -986,6 +1197,9 @@
       el.count.textContent = '';
       el.stat.textContent = '';
       el.strip.classList.remove('show');
+      el.notesPill.hidden = true;
+      setNotesSheet(false);
+      verdictHint(null);
       const where = view.thread ? 'this session' : view.branch ? view.branch : view.project;
       el.emptySub.textContent = doneCount
         ? `${doneCount} reviewed this session`
@@ -1157,8 +1371,8 @@
     if (!w) return;
     const cs = getComputedStyle(el.stage);
     // The notes panel takes its width out of the room instead of covering the shot: a note
-    // is useless if it hides the thing it is about.
-    const panel = el.notes.classList.contains('show') ? el.notes.offsetWidth + 16 : 0;
+    // is useless if it hides the thing it is about. On a phone it is a sheet, so no room.
+    const panel = el.notes.classList.contains('show') && !touch.matches ? el.notes.offsetWidth + 16 : 0;
     // The video controls hang under the picture inside the frame, so they come out of the
     // height the picture may use. CSS owns their height; 0 when they are hidden.
     const bar = el.vbar.offsetHeight;
@@ -1316,6 +1530,10 @@
     const from = it ? carried(it) : [];
     const had = el.notes.classList.contains('show');
     const has = list.length + from.length > 0;
+    const total = list.length + from.length;
+    el.notesPill.hidden = !touch.matches || !total;
+    el.notesPill.textContent = `${total} note${total === 1 ? '' : 's'}`;
+    if (!total) setNotesSheet(false);
     // On a wide window the panel's room is reserved even when empty, so the first note does
     // not shrink and shift the shot under the pin that was just placed.
     const wide = matchMedia('(min-width: 1000px)').matches;
@@ -1380,11 +1598,166 @@
     el.flagLabel.textContent = list.length ? 'request changes' : 'flag';
     el.okKey.classList.toggle('suggest', list.length > 0 && !issues);
     el.flagKey.classList.toggle('suggest', issues > 0);
+    // The buttons say the same thing the keys do, in fewer words for a 50px target.
+    el.aOk.textContent = list.length ? 'Approve' : 'OK';
+    el.aFlag.textContent = list.length ? 'Changes' : 'Flag';
+    el.aOk.classList.toggle('suggest', list.length > 0 && !issues);
+    el.aFlag.classList.toggle('suggest', issues > 0);
+    for (const b of [el.aOk, el.aFlag, el.aMark]) b.disabled = !it;
+    const group = it ? groupRows().length : 0;
+    el.aOkAll.hidden = group < 2;
+    el.aOkAll.textContent = `All ${group}`;
+    el.aCompare.disabled = !it || modes(it).length < 2;
   }
+
+  /* ---------- touch ---------- */
+
+  el.aOk.onclick = () => verdict('ok', '');
+  el.aOkAll.onclick = () => verdict('ok', '', true);
+  el.aFlag.onclick = () => (notesOf(current()).length ? verdict('flag', '') : openNote('flag'));
+  el.aMark.onclick = () => {
+    const on = !body.classList.contains('marking');
+    body.classList.toggle('marking', on);
+    el.aMark.setAttribute('aria-pressed', String(on));
+  };
+  // One button walks the layers this card has (new, swipe, diff) and back to new.
+  el.aCompare.onclick = () => {
+    const list = modes(current());
+    if (list.length < 2) return;
+    layer = (layer + 1) % list.length;
+    paint();
+  };
+  el.notesPill.onclick = () => setNotesSheet(!body.classList.contains('notes-open'));
+  el.undo.onclick = () => undo();
+  el.composerSave.onclick = () => closeComposer(true);
+  el.composerCancel.onclick = () => closeComposer(false);
+  el.composerDelete.onclick = () => {
+    if (!draft) return;
+    const list = notesOf(draft.it);
+    const i = list.indexOf(draft.note);
+    draft = null;
+    if (i >= 0) list.splice(i, 1);
+    hot = -1;
+    el.composer.classList.remove('in', 'show');
+    el.composerText.blur();
+    drawMarks();
+  };
+  el.noteSend.onclick = () => submitNote();
+  el.noteCancel.onclick = () => closeNote();
+
+  // The keyboard covers the bottom of the layout viewport without resizing it on iOS, so a
+  // sheet pinned to bottom: 0 would sit behind it. --kb lifts every sheet by what it covers.
+  // Zoomed in, a one-finger drag belongs to the browser's pan, so card paging stands down.
+  const vv = window.visualViewport;
+  if (vv) {
+    const sync = () => {
+      const kb = Math.max(0, innerHeight - vv.height - vv.offsetTop);
+      document.documentElement.style.setProperty('--kb', `${Math.round(kb)}px`);
+      body.classList.toggle('zoomed', vv.scale > 1.01);
+    };
+    vv.addEventListener('resize', sync);
+    vv.addEventListener('scroll', sync);
+  }
+
+  // Swipe between cards like Photos: the card follows the finger, a long or fast drag pages,
+  // anything less settles back. Holding still shows the baseline for as long as the finger
+  // stays down, the touch twin of holding b. Swipe mode keeps its own divider drag.
+  const HOLD_MS = 280;
+  let gesture = null;
+  const moveFrame = (x, fade) => {
+    el.frame.style.transform = x ? `translateX(${x}px)` : '';
+    el.frame.style.opacity = fade ? String(fade) : '';
+  };
+  const ease = 'transform .28s cubic-bezier(.32,.72,0,1), opacity .2s ease';
+  function settle() {
+    el.frame.style.transition = calm.matches ? 'none' : ease;
+    moveFrame(0);
+  }
+  function slideTo(dir) {
+    if (calm.matches) { go(at + dir); return settle(); }
+    el.frame.style.transition = 'transform .17s cubic-bezier(.32,.72,0,1), opacity .17s ease';
+    moveFrame(-dir * innerWidth * 0.55, 0.01);
+    setTimeout(() => {
+      go(at + dir);
+      el.frame.style.transition = 'none';
+      moveFrame(dir * 56, 0.01);
+      void el.frame.offsetWidth;
+      settle();
+    }, 160);
+  }
+  function endPeek() {
+    if (!peeking) return;
+    peeking = false;
+    paint();
+  }
+
+  el.stage.addEventListener('pointerdown', e => {
+    if (e.pointerType !== 'touch') return;
+    // A second finger is a pinch, which belongs to the browser.
+    if (gesture) { clearTimeout(gesture.hold); gesture = null; endPeek(); return settle(); }
+    if (body.classList.contains('marking') || body.classList.contains('zoomed') || !current()) return;
+    if (e.target.closest('button, input, textarea, #vbar, .pin')) return;
+    gesture = { id: e.pointerId, x: e.clientX, y: e.clientY, t0: e.timeStamp, dx: 0, mode: null };
+    gesture.hold = setTimeout(() => {
+      if (!gesture || gesture.mode || !current() || !current().baselineUrl) return;
+      gesture.mode = 'peek';
+      peeking = true;
+      paint();
+    }, HOLD_MS);
+  });
+  el.stage.addEventListener('contextmenu', e => { if (touch.matches) e.preventDefault(); });
+
+  addEventListener('pointermove', e => {
+    if (!gesture || e.pointerId !== gesture.id || gesture.mode === 'peek') return;
+    const dx = e.clientX - gesture.x;
+    const dy = e.clientY - gesture.y;
+    if (!gesture.mode) {
+      if (Math.hypot(dx, dy) < 10) return;
+      clearTimeout(gesture.hold);
+      // Up and down pages nothing, and swipe mode's divider already follows the finger.
+      if (Math.abs(dx) < Math.abs(dy) || el.frame.classList.contains('swipe')) { gesture = null; return; }
+      gesture.mode = 'page';
+      el.frame.style.transition = 'none';
+    }
+    // Past either end the card resists instead of paging into nothing.
+    const edge = (dx > 0 && at === 0) || (dx < 0 && at === queue.length - 1);
+    gesture.dx = edge ? dx * 0.25 : dx;
+    moveFrame(gesture.dx, 1 - Math.min(Math.abs(gesture.dx) / innerWidth, 0.35));
+  });
+
+  const endGesture = e => {
+    if (!gesture || e.pointerId !== gesture.id) return;
+    const g = gesture;
+    gesture = null;
+    clearTimeout(g.hold);
+    if (g.mode === 'peek') return endPeek();
+    if (g.mode !== 'page') return;
+    const quick = Math.abs(g.dx) > 40 && e.timeStamp - g.t0 < 260;
+    const far = Math.abs(g.dx) > innerWidth * 0.22;
+    const dir = e.type === 'pointerup' && (quick || far) ? -Math.sign(g.dx) : 0;
+    if (!dir || at + dir < 0 || at + dir >= queue.length) return settle();
+    slideTo(dir);
+  };
+  addEventListener('pointerup', endGesture);
+  addEventListener('pointercancel', endGesture);
+
+  // A phone suspends the event stream in the background and every snap sent meanwhile is
+  // gone, so coming back refetches the queue rather than trusting the reconnect (pwafy:
+  // sockets die in the background).
+  async function resync() {
+    if (mock) return;
+    const was = current() && rid(current());
+    await load();
+    const keep = queue.findIndex(q => rid(q) === was);
+    if (keep >= 0 && keep !== at) { at = keep; render(); }
+  }
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') resync(); });
 
   el.marks.addEventListener('pointerdown', e => {
     if (e.button !== 0 || !current()) return;
     if (draft) return closeComposer(true);
+    // Outside mark mode a finger pages and peeks (the stage handles it), so it pins nothing.
+    if (e.pointerType === 'touch' && !body.classList.contains('marking')) return;
     e.preventDefault();
     // A mark is drawn on a still frame: the moment the pointer went down is the one the
     // reviewer meant, and a box dragged over a moving picture would describe nothing.
@@ -1445,6 +1818,7 @@
     el.flowAllBox.checked = Boolean(note.flow);
     setTone(note.tone);
     el.composer.classList.add('show');
+    el.composerDelete.hidden = fresh;
     place(note);
     requestAnimationFrame(() => el.composer.classList.add('in'));
     autosize();
@@ -1542,6 +1916,7 @@
   function go(i) {
     if (!queue.length) return;
     if (draft) closeComposer(true);
+    setNotesSheet(false);
     hot = -1;
     at = Math.max(0, Math.min(queue.length - 1, i));
     layer = 0;
@@ -1650,15 +2025,18 @@
 
   function closeNote() { el.note.classList.remove('show'); el.noteInput.blur(); noteKind = null; }
 
-  el.noteInput.addEventListener('keydown', e => {
-    e.stopPropagation();
-    if (e.key === 'Escape') return closeNote();
-    if (e.key !== 'Enter') return;
+  function submitNote() {
     const text = el.noteInput.value.trim();
-    if (noteKind === 'flag' && !text) return;   // a flag with no words is not a state
+    if (noteKind === 'flag' && !text) return el.noteInput.focus();   // a flag with no words is not a state
     const kind = noteKind;
     closeNote();
     verdict(kind, text);
+  }
+
+  el.noteInput.addEventListener('keydown', e => {
+    e.stopPropagation();
+    if (e.key === 'Escape') return closeNote();
+    if (e.key === 'Enter') submitNote();
   });
 
   /* ---------- keys ---------- */
@@ -1708,7 +2086,7 @@
       case ',': case '.':
         if (isVideo(current())) { el.vid.pause(); el.vid.currentTime = Math.max(0, el.vid.currentTime + (e.key === '.' ? 0.1 : -0.1)); }
         return;
-      case 'p': return el.side.classList.toggle('open');
+      case 'p': return setSide(!el.side.classList.contains('open'));
       case 'n': if (!current() && elsewhere) show(elsewhere.v); return;
     }
     if (/^[1-9]$/.test(k)) {

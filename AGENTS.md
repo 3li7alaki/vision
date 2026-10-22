@@ -216,6 +216,10 @@ port safe and a bookmark stable.
   request needs `Tailscale-User-Login` to match `~/.config/vision/trusted-user` (missing file means
   nobody), and never reaches snap or withdraw. `http.CrossOriginProtection` wraps everything,
   because a tailnet identity rides the connection and any page on the phone could post as you.
+- The gallery has a touch layer for the phone: buttons instead of key hints, swipe between cards,
+  hold for the baseline, a mark mode, and bottom sheets. It lives under `:root.touch`, which the
+  head script sets from `pointer: coarse` or `?touch`, because no headless browser can claim a
+  touchscreen. Check it with `/?mock&touch` at 360x700; the keyboard flow must stay untouched.
 - Reached at `http://vision.test:4747` through a hosts entry. Never `.local`, which is Bonjour on
   macOS and causes multi-second resolution stalls.
 - Managed by launchd on macOS and by a systemd user unit on Linux. `vision on`, `off`, and
