@@ -1418,7 +1418,9 @@
       w: el.stage.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) - panel,
       h: el.stage.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom) - bar,
     };
-    const scale = Math.min(room.w / w, room.h / h, 1);
+    // A pinch multiplies the fitted size and may pass the natural pixels: that is the reviewer
+    // asking for a closer look, not fit() inventing softness.
+    const scale = Math.min(room.w / w, room.h / h, 1) * zoom;
     shown = scale;
     el.frame.style.width = `${Math.round(w * scale)}px`;
     el.frame.style.height = `${Math.round(h * scale) + bar}px`;
@@ -1430,7 +1432,44 @@
     if (cut === null || cut > fw) cut = fw / 2;
     el.frame.style.setProperty('--cut', `${cut}px`);
     el.frame.style.marginRight = panel ? `${panel}px` : '';
+    if (zoom > 1 && !pinch) applyPan();
     drawMarks();
+  }
+
+  // Touch only. Zoomed, the shot is laid out at its zoomed size (so pins and boxes keep their
+  // size and toImage stays exact) and moved by a translate, held so it never shows a gap where
+  // it could cover the stage, and centred on any axis where it is smaller than the stage.
+  let zoom = 1;
+  let pan = { x: 0, y: 0 };
+  let pinch = null;            // {mid0, o, fx, fy, z0, z, mid} while two fingers are down
+  const ZOOM_MAX = 4;
+  // Where layout put the frame, in the stage's coordinates. offsetLeft/Top ignore transforms, so
+  // this holds whatever translate the frame carries right now.
+  const laidOut = () => ({ x: el.frame.offsetLeft, y: el.frame.offsetTop, w: el.frame.offsetWidth, h: el.frame.offsetHeight });
+  function applyPan() {
+    const cs = getComputedStyle(el.stage);
+    const f = laidOut();
+    const axis = (lo, size, vlo, vhi, p) => size <= vhi - vlo
+      ? (vlo + vhi) / 2 - (lo + size / 2)
+      : Math.max(vhi - lo - size, Math.min(vlo - lo, p));
+    pan = {
+      x: axis(f.x, f.w, parseFloat(cs.paddingLeft), el.stage.clientWidth - parseFloat(cs.paddingRight), pan.x),
+      y: axis(f.y, f.h, parseFloat(cs.paddingTop), el.stage.clientHeight - parseFloat(cs.paddingBottom), pan.y),
+    };
+    el.frame.style.transform = `translate3d(${pan.x}px, ${pan.y}px, 0)`;
+  }
+  // The image point at (fx, fy) of the frame lands under `at` after the zoom changes.
+  function setZoom(z, at, fx, fy) {
+    zoom = Math.max(1, Math.min(ZOOM_MAX, z));
+    pan = { x: 0, y: 0 };
+    el.frame.style.transition = 'none';
+    el.frame.style.transform = '';
+    fit();
+    if (zoom === 1) return;
+    const s = el.stage.getBoundingClientRect();
+    const f = laidOut();
+    pan = { x: at.x - fx * f.w - (s.left + el.stage.clientLeft + f.x), y: at.y - fy * f.h - (s.top + el.stage.clientTop + f.y) };
+    applyPan();
   }
 
   // The pixels marks are measured in: the video's own frame size, or the larger of shot and
@@ -1747,9 +1786,63 @@
     return r.width > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
   }
 
+  // Fingers down on the stage. The first finger of a touch clears it, so a pointerup the
+  // browser never delivered cannot leave a ghost that turns the next one-finger tap into a pinch.
+  const fingers = new Map();
+  const midpoint = () => { const [a, b] = [...fingers.values()]; return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, d: Math.hypot(a.x - b.x, a.y - b.y) }; };
+
+  // A second finger turns whatever the first one started into a pinch. While the fingers move
+  // the frame only gets a transform; the zoom is laid out once, when they lift.
+  function startPinch() {
+    const g = gesture;
+    gesture = null;
+    if (g) {
+      clearTimeout(g.hold);
+      hideAim();
+      el.frame.classList.remove('dragging');
+      if (g.mode === 'draw') { drawing = null; drawMarks(); }
+      if (g.mode === 'pull') pullBack();
+    }
+    const m = midpoint();
+    const r = el.frame.getBoundingClientRect();
+    pinch = {
+      d0: m.d, mid0: m, mid: m, z0: zoom, z: zoom,
+      fx: (m.x - r.left) / r.width, fy: (m.y - r.top) / r.height,
+    };
+    // The point under the fingers in the frame's own box. Scaling about it with translate(pan + drift)
+    // keeps that point under the fingers as they spread and move.
+    pinch.o = { x: m.x - r.left, y: m.y - r.top };
+    el.frame.style.transition = 'none';
+    el.frame.style.transformOrigin = `${pinch.o.x}px ${pinch.o.y}px`;
+  }
+  addEventListener('pointermove', e => {
+    if (!fingers.has(e.pointerId)) return;
+    fingers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (!pinch || fingers.size !== 2) return;
+    const m = midpoint();
+    // A little give under 1x, so pinching out of a zoom feels like it lands rather than hits a wall.
+    pinch.z = Math.max(0.8, Math.min(ZOOM_MAX, pinch.z0 * m.d / pinch.d0));
+    pinch.mid = m;
+    el.frame.style.transform = `translate3d(${pan.x + m.x - pinch.mid0.x}px, ${pan.y + m.y - pinch.mid0.y}px, 0) scale(${pinch.z / pinch.z0})`;
+  });
+  const liftFinger = e => {
+    if (!fingers.delete(e.pointerId) || !pinch || fingers.size >= 2) return;
+    const p = pinch;
+    pinch = null;
+    el.frame.style.transformOrigin = '';
+    // Under 1.08x is a pinch back to the fitted shot (the threshold 3644e05 used).
+    setZoom(p.z < 1.08 ? 1 : p.z, p.mid, p.fx, p.fy);
+  };
+  addEventListener('pointerup', liftFinger);
+  addEventListener('pointercancel', liftFinger);
+
   el.stage.addEventListener('pointerdown', e => {
-    if (e.pointerType !== 'touch' || gesture) return;
+    if (e.pointerType !== 'touch') return;
     if (e.target.closest('button, input, textarea, #vbar, .pin, #notes')) return;
+    if (e.isPrimary) fingers.clear();
+    fingers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (fingers.size === 2 && current() && !draft) return startPinch();
+    if (gesture || pinch || fingers.size > 1) return;
     // A touch on the shot while a note is open saves the note and does nothing else.
     if (draft) { closeComposer(true); return; }
     const start = { clientX: e.clientX, clientY: e.clientY };
@@ -1772,8 +1865,17 @@
     if (gesture.mode === 'draw') { hideAim(); return dragMark(e); }
     if (gesture.mode === 'page') return pageMove(dx);
     if (gesture.mode === 'pull') return pullMove(dy);
+    if (gesture.mode === 'pan') { pan = { x: gesture.pan0.x + dx, y: gesture.pan0.y + dy }; return applyPan(); }
     if (gesture.mode || Math.hypot(dx, dy) < 10) return;
     clearTimeout(gesture.hold);
+    // Zoomed, a quick drag moves around the shot (Photos); paging waits until it is fitted again.
+    // ponytail: no momentum on release; add a decay from the last pointermove velocity if it feels dead.
+    if (zoom > 1) {
+      gesture.mode = 'pan';
+      gesture.pan0 = { ...pan };
+      el.frame.style.transition = 'none';
+      return;
+    }
     // Swipe mode keeps the sideways drag for its own divider.
     if (Math.abs(dx) > Math.abs(dy) && current() && !el.frame.classList.contains('swipe')) {
       gesture.mode = 'page';
@@ -2014,7 +2116,7 @@
   // The divider follows the pointer, no drag: comparing is scrubbing back and forth, and
   // a grab handle turns every pass into two extra motions.
   el.frame.addEventListener('pointermove', e => {
-    if (!el.frame.classList.contains('swipe')) return;
+    if (!el.frame.classList.contains('swipe') || pinch || (gesture && gesture.mode === 'pan')) return;
     const r = el.frame.getBoundingClientRect();
     cut = Math.max(0, Math.min(r.width, e.clientX - r.left));
     el.frame.style.setProperty('--cut', `${cut}px`);
@@ -2050,6 +2152,8 @@
     hot = -1;
     at = Math.max(0, Math.min(queue.length - 1, i));
     layer = 0;
+    // Every card arrives fitted. Only a zoom owns the transform here: paging's slide sets its own.
+    if (zoom > 1) { zoom = 1; pan = { x: 0, y: 0 }; el.frame.style.transform = ''; }
     render();
   }
 
