@@ -817,6 +817,31 @@
   }
   .touch #side a { padding: 11px 10px; }
 
+  /* A phone held sideways has height to spare for nothing: the bars stacked under the shot took
+     133 of 340px. So the buttons become a column on the right, the crumb one line, and the shot
+     gets the full height. The notch side is padded, whichever way the phone was turned. */
+  @media (orientation: landscape) and (max-height: 500px) {
+    .touch #app {
+      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-rows: auto minmax(0, 1fr) auto auto;
+      grid-template-areas: "head acts" "stage acts" "strip acts" "foot acts";
+    }
+    .touch header { grid-area: head; padding-top: 6px; }
+    .touch .crumb { flex-wrap: nowrap; }
+    .touch .crumb .ctx { display: none; }   /* the key never truncates for project and branch */
+    .touch .crumb .dims, .touch .crumb .variant { flex: 0 1 auto; order: 0; min-height: 0; }
+    .touch #stage { grid-area: stage; padding-left: max(6px, env(safe-area-inset-left)); }
+    .touch #strip { grid-area: strip; }
+    .touch footer { grid-area: foot; padding-left: max(14px, env(safe-area-inset-left)); }
+    .touch #actions {
+      grid-area: acts;
+      flex-direction: column; align-items: stretch; width: 96px;
+      border-top: 0; border-left: 1px solid var(--line);
+      padding: max(8px, env(safe-area-inset-top)) max(10px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) 10px;
+    }
+    .touch .act, .touch .act.icon, .touch .act.ok.ghost { flex: 1 1 0; height: auto; min-height: 44px; padding: 0; }
+  }
+
 </style>
 
 <div id="shell">
