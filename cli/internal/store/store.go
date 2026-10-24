@@ -314,7 +314,22 @@ func StateHome() (string, error) {
 func Identify(dir string) (Project, error) {
 	worktree, err := git(dir, "rev-parse", "--show-toplevel")
 	if err != nil {
-		return Project{}, errors.New("vision must run inside a Git repository")
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || !strings.Contains(string(exitErr.Stderr), "not a git repository") {
+			return Project{}, err
+		}
+		root, err := filepath.Abs(dir)
+		if err != nil {
+			return Project{}, err
+		}
+		root, err = filepath.EvalSymlinks(root)
+		if err != nil {
+			return Project{}, err
+		}
+		// NUL cannot occur in Git remote URLs or filesystem paths, so this input
+		// cannot equal the Git identity input remote + "\n" + root.
+		sum := sha256.Sum256([]byte("\x00" + root))
+		return Project{ID: hex.EncodeToString(sum[:]), Name: filepath.Base(root), Root: root, Worktree: root}, nil
 	}
 	worktree, err = filepath.EvalSymlinks(worktree)
 	if err != nil {
@@ -358,6 +373,8 @@ func canonicalRemote(remote string) string {
 
 func git(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	// Identify matches Git diagnostics, so keep them untranslated regardless of the user's locale.
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
 	b, err := cmd.Output()
 	return strings.TrimSpace(string(b)), err
 }

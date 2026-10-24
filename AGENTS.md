@@ -142,6 +142,13 @@ taking the same approach mint does. **Linked worktrees of one repository are one
 SlayZone task worktree must not fork a fresh gallery with no baselines; that would fail on
 exactly the branch where UI is being changed.
 
+Only when Git reports `not a git repository`, project identity falls back to the absolute
+directory path with symlinks resolved. Other Git failures remain errors. The ID is the
+SHA-256 of a NUL byte followed by that path, keeping it separate from Git identities.
+Root and worktree use that path, the name is its base name,
+and Git metadata stays empty. A non-repo project is keyed by the exact directory, so running
+from a subdirectory is a different project.
+
 Branch, worktree path, commit sha, dirty-tree state, and session id are fields on each snap
 record, never directory levels. Baselines are per key and variant, and branch-agnostic.
 

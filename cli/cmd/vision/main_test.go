@@ -838,7 +838,7 @@ func TestStatusSession(t *testing.T) {
 	}
 }
 
-func TestStatusProjectAndGlobalURLs(t *testing.T) {
+func TestStatusGitAndDirectoryProjectURLs(t *testing.T) {
 	t.Setenv("VISION_STATE_HOME", t.TempDir())
 	project, err := store.Identify(".")
 	if err != nil {
@@ -849,11 +849,12 @@ func TestStatusProjectAndGlobalURLs(t *testing.T) {
 	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"pending":0}`)), Header: make(http.Header)}, nil
 	})
+	dir := t.TempDir()
 	for _, tc := range []struct {
 		name, dir, want string
 	}{
 		{"project", "", galleryURL + "/p/" + project.Name},
-		{"outside project", t.TempDir(), galleryURL},
+		{"directory project", dir, galleryURL + "/p/" + filepath.Base(dir)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.dir != "" {

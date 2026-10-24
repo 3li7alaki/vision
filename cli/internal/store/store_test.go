@@ -3,6 +3,7 @@ package store
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -467,6 +468,123 @@ func TestViewportClassBoundaries(t *testing.T) {
 			t.Errorf("width %d: got %q, want %q", width, got, want)
 		}
 	}
+}
+
+func TestProjectIdentityDirectoryFallback(t *testing.T) {
+	dir := t.TempDir()
+	root, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err := Identify(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if project.Root != root || project.Worktree != root || project.Name != filepath.Base(root) {
+		t.Fatalf("directory identity: %+v, want root %q", project, root)
+	}
+	if project.Branch != "" || project.SHA != "" || project.Dirty {
+		t.Fatalf("directory has Git metadata: %+v", project)
+	}
+	if len(project.ID) != 64 || strings.Trim(project.ID, "0123456789abcdef") != "" {
+		t.Fatalf("ID is not lowercase SHA-256 hex: %q", project.ID)
+	}
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(dir, alias); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	for _, path := range []string{dir, ".", alias} {
+		got, err := Identify(path)
+		if err != nil || got != project {
+			t.Errorf("Identify(%q) = %+v, %v; want %+v", path, got, err, project)
+		}
+	}
+	child := filepath.Join(dir, "child")
+	if err := os.Mkdir(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{t.TempDir(), child} {
+		got, err := Identify(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ID == project.ID {
+			t.Errorf("different directory %q shares identity %q", path, got.ID)
+		}
+	}
+	if _, err := Identify(filepath.Join(dir, "missing")); err == nil {
+		t.Fatal("identified a missing directory")
+	}
+	// Initializing Git at the same path must enter a separate identity namespace.
+	runGit(t, dir, "init")
+	gitProject, err := Identify(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("%x", sha256.Sum256([]byte("\n"+root)))
+	if gitProject.ID != want || gitProject.ID == project.ID {
+		t.Fatalf("Git identity = %q, want %q, distinct from %q", gitProject.ID, want, project.ID)
+	}
+}
+
+func TestProjectIdentityDirectoryFallbackWithTranslatedGit(t *testing.T) {
+	dir := t.TempDir()
+	bin := t.TempDir()
+	const script = `#!/bin/sh
+if [ "$LC_ALL" = C ]; then
+    printf '%s\n' 'fatal: not a git repository (or any of the parent directories): .git' >&2
+else
+    printf '%s\n' 'fatal: Kein Git-Repository (oder irgendeines der Elternverzeichnisse): .git' >&2
+fi
+exit 128
+`
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	t.Setenv("LANG", "de_DE.UTF-8")
+	t.Setenv("LC_ALL", "de_DE.UTF-8")
+	root, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err := Identify(dir)
+	if err != nil {
+		t.Fatalf("directory fallback must work with translated Git: %v", err)
+	}
+	want := Project{ID: fmt.Sprintf("%x", sha256.Sum256([]byte("\x00"+root))), Name: filepath.Base(root), Root: root, Worktree: root}
+	if project != want {
+		t.Fatalf("directory identity: got %+v, want %+v", project, want)
+	}
+}
+
+func TestProjectIdentityRequiresWorkingGit(t *testing.T) {
+	root := t.TempDir()
+	runGit(t, root, "init")
+	child := filepath.Join(root, "child")
+	if err := os.Mkdir(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("missing git", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		if _, err := Identify(child); !errors.Is(err, exec.ErrNotFound) {
+			t.Fatalf("Identify with no git: got %v, want exec.ErrNotFound", err)
+		}
+	})
+	t.Run("dubious ownership", func(t *testing.T) {
+		bin := t.TempDir()
+		const diagnostic = "fatal: detected dubious ownership in repository"
+		if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nprintf '%s\\n' '"+diagnostic+"' >&2\nexit 128\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", bin)
+		_, err := Identify(child)
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || strings.TrimSpace(string(exitErr.Stderr)) != diagnostic {
+			t.Fatalf("Identify must preserve Git failure: got %v", err)
+		}
+	})
 }
 
 func TestProjectIdentitySharedByLinkedWorktree(t *testing.T) {
