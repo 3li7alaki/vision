@@ -697,10 +697,9 @@ const KeepSuperseded = 2
 // anything a human would notice as wasted disk.
 const pruneGrace = time.Minute
 
-// Prune deletes shot media and element snapshots that no longer serve anyone: not
-// pending, not the current baseline, and older than the last KeepSuperseded closed shots
-// for their key and variant. Superseded and withdrawn reviews enter the same retention
-// window as decided reviews. All file types use the same digest and grace window.
+// Prune deletes unneeded shot media and element snapshots, plus retired baselines.
+// Live pairs keep pending shots, the current baseline and a KeepSuperseded + 1 window
+// of closed shots. Superseded and withdrawn reviews enter that same retention window.
 // A shared file survives if any review on any thread still needs it.
 //
 // It never touches index.jsonl, notes.jsonl or withdrawn.jsonl. Those ledgers preserve
@@ -718,13 +717,37 @@ func Prune(project string) error {
 	if err != nil {
 		return err
 	}
+	withdrawals, err := Withdrawals(project)
+	if err != nil {
+		return err
+	}
+	// Retired pairs need no film once every thread is closed and no later snap revives them.
+	// Delete their baselines too, or a later snap would be diffed against a dead page.
+	dead := make(map[[2]string]time.Time)
+	for _, w := range withdrawals {
+		pair := [2]string{w.Key, w.Variant}
+		if ts, ok := dead[pair]; w.Reason != "" && (!ok || w.TS.After(ts)) {
+			dead[pair] = w.TS
+		}
+	}
+	for _, s := range snaps {
+		pair := [2]string{s.Key, s.Variant}
+		if ts, ok := dead[pair]; ok && (s.TS.After(ts) || !closed[s.Review()]) {
+			delete(dead, pair)
+		}
+	}
 	verdict := make(map[string]string, len(notes))
 	for _, n := range notes {
 		verdict[ReviewID(n.Key, n.Variant, n.Digest)] = n.Verdict
 	}
 	keep := make(map[string]bool)
+	retired := make(map[string]bool)
 	decided := make(map[string][]Snap)
 	for _, s := range snaps {
+		if _, ok := dead[[2]string{s.Key, s.Variant}]; ok {
+			retired[s.Digest] = true
+			continue
+		}
 		if !closed[s.Review()] {
 			// Pending: the human has not looked at it yet, so it is the one thing
 			// pruning must never take.
@@ -753,6 +776,23 @@ func Prune(project string) error {
 	if err != nil {
 		return err
 	}
+	base := filepath.Join(dir, "base")
+	for pair := range dead {
+		for media := range mediaExtensions {
+			path, err := BaselinePathMedia(project, pair[0], pair[1], media)
+			if err != nil {
+				return err
+			}
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			for parent := filepath.Dir(path); strings.HasPrefix(parent, base+string(os.PathSeparator)); parent = filepath.Dir(parent) {
+				if err := os.Remove(parent); err != nil {
+					break
+				}
+			}
+		}
+	}
 	shots := filepath.Join(dir, "shots")
 	entries, err := os.ReadDir(shots)
 	if errors.Is(err, os.ErrNotExist) {
@@ -771,11 +811,15 @@ func Prune(project string) error {
 		if e.IsDir() || !known {
 			continue
 		}
-		if keep["sha256:"+strings.TrimSuffix(name, ext)] {
+		digest := "sha256:" + strings.TrimSuffix(name, ext)
+		if keep[digest] {
 			continue
 		}
-		if info, err := e.Info(); err != nil || time.Since(info.ModTime()) < pruneGrace {
-			continue
+		// Retired film is already recorded and closed, so it needs no in-flight capture grace.
+		if !retired[digest] {
+			if info, err := e.Info(); err != nil || time.Since(info.ModTime()) < pruneGrace {
+				continue
+			}
 		}
 		if err := os.Remove(filepath.Join(shots, name)); err != nil {
 			return err

@@ -99,14 +99,15 @@ an unchanged digest; reading it does not.
 Use `vision retire 'site/hero-lab-*' --reason 'Pages deleted'` for keys whose page no longer
 exists. It closes open flags and pending shots on the current thread, across all variants
 unless `--as` selects one. The reason is recorded permanently. A later snap of the key opens
-normally.
+normally. A retired key's baseline and shots are deleted from disk; the ledger keeps one line per shot.
+Retire also works when a key has nothing open; retiring it again changes nothing.
 
 `vision discard <key> --dim locale=x --dim vp=desktop` matches a subset of stored dimensions
 and requires exactly one pending variant on this thread.
 `vision retire <key|glob> --dim locale=x --reason 'Pages deleted'` covers every variant
 containing those dimensions on this thread.
-When discard or retire misses, its error lists up to 10 sorted open entries for that key
-or pattern on this thread, labelled `(pending)` or `(flag)`, then `and N more` if needed.
+When discard misses, its error lists up to 10 sorted open entries for that key on this thread,
+labelled `(pending)` or `(flag)`, then `and N more` if needed.
 
 ## Threads and handoffs
 

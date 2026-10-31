@@ -799,6 +799,13 @@ func TestRetire(t *testing.T) {
 					}
 				}
 			}
+			closed := store.Snap{Key: "site/hero-lab-3", Variant: "mobile", Digest: "sha256:0003", Thread: "shared", TS: ts.Add(-time.Minute)}
+			if err := store.AppendSnap(project.ID, closed, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.AppendNote(project.ID, store.Note{Key: closed.Key, Variant: closed.Variant, Digest: closed.Digest, Verdict: "ok", TS: ts}); err != nil {
+				t.Fatal(err)
+			}
 			handler := server.New().Handler()
 			var paths []string
 			var request server.RetireRequest
@@ -839,8 +846,11 @@ func TestRetire(t *testing.T) {
 					t.Fatalf("retire JSON=%s err=%v", out, err)
 				}
 			} else {
-				if !strings.HasPrefix(out, "retired 2 flag(s) and 2 pending shot(s) on 2 key(s): Pages deleted\n") || strings.Count(out, "\n") != 5 {
+				if !strings.HasPrefix(out, "retired 2 flag(s), 2 pending shot(s) and 1 closed shot(s) on 3 key(s): Pages deleted\n") || strings.Count(out, "\n") != 6 {
 					t.Fatalf("retire text=%q", out)
+				}
+				if !strings.Contains(out, "\nsite/hero-lab-3@mobile\n") {
+					t.Fatalf("retire omitted closed key: %q", out)
 				}
 				for key := 1; key <= 2; key++ {
 					for _, v := range []string{"mobile", "desktop"} {

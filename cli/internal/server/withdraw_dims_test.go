@@ -143,8 +143,10 @@ func TestReviewMissOpenHere(t *testing.T) {
 					for i := count - 1; i >= 0; i-- {
 						variant := fmt.Sprintf("locale=x,scheme=dark,vp=v%02d", i)
 						snap := store.Snap{Key: "room/probe", Variant: variant, Digest: fmt.Sprintf("sha256:%04x", i), Thread: "work", TS: ts.Add(-time.Minute)}
-						if err := store.AppendSnap(id, snap, nil); err != nil {
-							t.Fatal(err)
+						for range 2 {
+							if err := store.AppendSnap(id, snap, nil); err != nil {
+								t.Fatal(err)
+							}
 						}
 						kind := "pending"
 						if i%2 != 0 {
@@ -153,7 +155,11 @@ func TestReviewMissOpenHere(t *testing.T) {
 								t.Fatal(err)
 							}
 						}
-						entries = append(entries, snap.Key+"@"+variant+" ("+kind+")")
+						entry := snap.Key + "@" + variant
+						if endpoint == "withdraw" {
+							entry += " (" + kind + ")"
+						}
+						entries = append(entries, entry)
 					}
 					for _, snap := range []store.Snap{
 						{Key: "room/probe", Variant: "other-thread", Digest: "sha256:eeee", Thread: "other"},
@@ -173,16 +179,23 @@ func TestReviewMissOpenHere(t *testing.T) {
 					if endpoint == "withdraw" {
 						rec = postWithdraw(t, New(), WithdrawRequest{Project: id, Key: pattern, Variant: variant, Dims: dims, Thread: "work"})
 					} else {
-						pattern, action = "room/prob*", "open"
+						pattern = "room/prob*"
 						rec = postRetire(t, New(), RetireRequest{Project: id, Pattern: pattern, Variant: variant, Dims: dims, Thread: "work", Reason: "Page deleted"})
 					}
 					want := "nothing " + action + " for " + pattern + "@locale=x,vp=desktop on this thread"
+					if endpoint == "retire" {
+						want = "nothing matches " + pattern + "@locale=x,vp=desktop on this thread"
+					}
 					if count != 0 {
 						slices.Sort(entries)
 						if count > 10 {
 							entries = append(entries[:10], fmt.Sprintf("and %d more", count-10))
 						}
-						want += "; open here: " + strings.Join(entries, ", ")
+						if endpoint == "retire" {
+							want += "; snapped here: " + strings.Join(entries, ", ")
+						} else {
+							want += "; open here: " + strings.Join(entries, ", ")
+						}
 					}
 					if rec.Code != http.StatusNotFound || responseError(t, rec) != want {
 						t.Fatalf("miss: status=%d body=%s, want %q", rec.Code, rec.Body.String(), want)
@@ -296,11 +309,14 @@ func TestRetireSupersededFlag(t *testing.T) {
 			}
 			newer := old
 			newer.Digest, newer.TS = "sha256:bbbb", ts.Add(-time.Minute)
-			if err := store.AppendSnap(id, newer, nil); err != nil {
+			if err := store.AppendSnap(id, newer, []byte("placeholder")); err != nil {
 				t.Fatal(err)
 			}
 			if approved {
 				if err := store.AppendNote(id, store.Note{Key: newer.Key, Variant: newer.Variant, Digest: newer.Digest, Verdict: "ok", TS: ts}); err != nil {
+					t.Fatal(err)
+				}
+				if err := store.CopyBaseline(id, newer.Key, newer.Variant, newer.Digest); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -316,13 +332,94 @@ func TestRetireSupersededFlag(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			rec := postRetire(t, New(), RetireRequest{Project: id, Pattern: old.Key, Thread: "work", Reason: "Page deleted"})
+			s := New()
+			req := RetireRequest{Project: id, Pattern: old.Key, Thread: "work", Reason: "Page deleted"}
+			rec := postRetire(t, s, req)
+			var response RetireResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil || rec.Code != http.StatusCreated || len(response.Retired) != 1 {
+				t.Fatalf("retire: status=%d body=%s err=%v", rec.Code, rec.Body.String(), err)
+			}
+			want := RetiredReview{Key: newer.Key, Variant: newer.Variant, Digest: newer.Digest, Kind: "pending"}
 			if approved {
-				if rec.Code != http.StatusNotFound {
-					t.Errorf("nothing open: status=%d body=%s", rec.Code, rec.Body.String())
+				want.Kind = "closed"
+				baseline, _ := store.BaselinePath(id, newer.Key, newer.Variant)
+				if _, err := os.Stat(baseline); !os.IsNotExist(err) {
+					t.Errorf("retired baseline remains: %s: %v", baseline, err)
+				}
+			}
+			if review := response.Retired[0]; review != want {
+				t.Fatalf("wrong retirement: %+v, want %+v", review, want)
+			}
+			if withdrawals, err := store.Withdrawals(id); err != nil || len(withdrawals) != 2 || withdrawals[1].Key != newer.Key || withdrawals[1].Variant != newer.Variant || withdrawals[1].Digest != newer.Digest || withdrawals[1].Thread != "work" || withdrawals[1].Reason != req.Reason {
+				t.Fatalf("wrong withdrawals: %+v %v", withdrawals, err)
+			}
+			after, err := os.ReadFile(ledger)
+			if err != nil || !bytes.HasPrefix(after, before) || bytes.Equal(after, before) {
+				t.Fatalf("retirement did not append withdrawals: %v", err)
+			}
+			rec = postRetire(t, s, req)
+			if rec.Code != http.StatusNotFound || responseError(t, rec) != old.Key+" is already retired on this thread" {
+				t.Fatalf("repeat retirement: status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if repeat, err := os.ReadFile(ledger); err != nil || !bytes.Equal(after, repeat) {
+				t.Fatalf("repeat retirement changed withdrawals: %v", err)
+			}
+		})
+	}
+}
+
+func TestRetireClosedWithdrawals(t *testing.T) {
+	ts := time.Now().UTC().Add(-time.Hour)
+	snap := store.Snap{Key: "room/probe", Variant: "locale=x,vp=desktop", Digest: "sha256:bbbb", Thread: "work", TS: ts}
+	withdrawal := store.Withdrawal{Key: snap.Key, Variant: snap.Variant, Digest: snap.Digest, Thread: snap.Thread, TS: ts.Add(time.Minute)}
+	for _, tc := range []struct {
+		name, reason, thread string
+		ts                   time.Time
+		retired              bool
+	}{
+		{"plain withdrawal", "", "work", withdrawal.TS, false},
+		{"other thread", "Page deleted", "other", withdrawal.TS, false},
+		{"older retirement", "Page deleted", "work", ts.Add(-time.Minute), false},
+		{"equal retirement", "Page deleted", "work", ts, true},
+		{"newer retirement", "Page deleted", "work", withdrawal.TS, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("VISION_STATE_HOME", t.TempDir())
+			id := strings.Repeat("a", 64)
+			older := snap
+			older.Digest, older.TS = "sha256:aaaa", ts.Add(-2*time.Minute)
+			excluded := snap
+			excluded.Variant = "locale=y,vp=desktop"
+			// Timestamp order, not append order, picks the snap retirement must cover.
+			for _, shot := range []store.Snap{snap, older, excluded} {
+				if err := store.AppendSnap(id, shot, nil); err != nil {
+					t.Fatal(err)
+				}
+				if err := store.AppendNote(id, store.Note{Key: shot.Key, Variant: shot.Variant, Digest: shot.Digest, Verdict: "ok", TS: ts}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			w := withdrawal
+			w.Reason, w.Thread, w.TS = tc.reason, tc.thread, tc.ts
+			if tc.retired {
+				w.Digest = older.Digest
+			}
+			if err := store.AppendWithdrawal(id, w); err != nil {
+				t.Fatal(err)
+			}
+			dir, _ := store.ProjectDir(id)
+			ledger := filepath.Join(dir, "withdrawn.jsonl")
+			before, err := os.ReadFile(ledger)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := postRetire(t, New(), RetireRequest{Project: id, Pattern: "room/*", Dims: map[string]string{"locale": "x"}, Thread: "work", Reason: "Page deleted"})
+			if tc.retired {
+				if rec.Code != http.StatusNotFound || responseError(t, rec) != "room/*@locale=x is already retired on this thread" {
+					t.Fatalf("already retired: status=%d body=%s", rec.Code, rec.Body.String())
 				}
 				if after, err := os.ReadFile(ledger); err != nil || !bytes.Equal(before, after) {
-					t.Fatalf("nothing open changed withdrawals: %v", err)
+					t.Fatalf("already retired changed ledger: %v", err)
 				}
 				return
 			}
@@ -330,12 +427,8 @@ func TestRetireSupersededFlag(t *testing.T) {
 			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil || rec.Code != http.StatusCreated || len(response.Retired) != 1 {
 				t.Fatalf("retire: status=%d body=%s err=%v", rec.Code, rec.Body.String(), err)
 			}
-			want := RetiredReview{Key: newer.Key, Variant: newer.Variant, Digest: newer.Digest, Kind: "pending"}
-			if review := response.Retired[0]; review != want {
-				t.Fatalf("wrong pending retirement: %+v, want %+v", review, want)
-			}
-			if withdrawals, err := store.Withdrawals(id); err != nil || len(withdrawals) != 2 || withdrawals[1].Key != newer.Key || withdrawals[1].Variant != newer.Variant || withdrawals[1].Digest != newer.Digest || withdrawals[1].Thread != "work" {
-				t.Fatalf("wrong withdrawals: %+v %v", withdrawals, err)
+			if want := (RetiredReview{Key: snap.Key, Variant: snap.Variant, Digest: snap.Digest, Kind: "closed"}); response.Retired[0] != want {
+				t.Fatalf("wrong closed retirement: %+v, want %+v", response.Retired[0], want)
 			}
 		})
 	}

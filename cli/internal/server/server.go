@@ -607,10 +607,16 @@ func (s *Server) retire(w http.ResponseWriter, r *http.Request) {
 	matching := make(map[[2]string]store.Snap)
 	snapped := make(map[string]bool)
 	latestSnap := make(map[[2]string]time.Time)
+	retiredAt := make(map[[2]string]time.Time)
+	withdrawn := make(map[string]bool)
 	seen := make(map[string]bool)
 	for _, withdrawal := range withdrawals {
 		if withdrawal.Thread == req.Thread {
-			seen[store.ReviewID(withdrawal.Key, withdrawal.Variant, withdrawal.Digest)] = true
+			withdrawn[store.ReviewID(withdrawal.Key, withdrawal.Variant, withdrawal.Digest)] = true
+			pair := [2]string{withdrawal.Key, withdrawal.Variant}
+			if ts, ok := retiredAt[pair]; withdrawal.Reason != "" && (!ok || withdrawal.TS.After(ts)) {
+				retiredAt[pair] = withdrawal.TS
+			}
 		}
 	}
 	var retired []RetiredReview
@@ -624,8 +630,8 @@ func (s *Server) retire(w http.ResponseWriter, r *http.Request) {
 		id := store.ReviewID(snap.Key, snap.Variant, snap.Digest)
 		snapped[id] = true
 		pair := [2]string{snap.Key, snap.Variant}
-		matching[pair] = snap
-		if ts, ok := latestSnap[pair]; !ok || snap.TS.After(ts) {
+		if ts, ok := latestSnap[pair]; !ok || !snap.TS.Before(ts) {
+			matching[pair] = snap
 			latestSnap[pair] = snap.TS
 		}
 		if !closed[snap.Review()] && !seen[id] {
@@ -633,28 +639,53 @@ func (s *Server) retire(w http.ResponseWriter, r *http.Request) {
 			seen[id] = true
 		}
 	}
+	if len(matching) == 0 {
+		entries := make(map[string]bool)
+		for _, snap := range snaps {
+			if snap.ThreadID() != req.Thread {
+				continue
+			}
+			if match, _ := path.Match(req.Pattern, snap.Key); match {
+				entries[snap.Key+"@"+snap.Variant] = true
+			}
+		}
+		var sorted []string
+		for entry := range entries {
+			sorted = append(sorted, entry)
+		}
+		sort.Strings(sorted)
+		const limit = 10
+		if len(sorted) > limit {
+			sorted = append(sorted[:limit], fmt.Sprintf("and %d more", len(sorted)-limit))
+		}
+		tail := ""
+		if len(sorted) != 0 {
+			tail = "; snapped here: " + strings.Join(sorted, ", ")
+		}
+		problem(w, http.StatusNotFound, fmt.Errorf("nothing matches %s on this thread%s", filterTarget(req.Pattern, req.Variant, req.Dims), tail))
+		return
+	}
 	for _, flag := range notes {
 		// A newer snap already closed flags raised before it, matching OpenFlags.
 		if ts, ok := latestSnap[[2]string{flag.Key, flag.Variant}]; ok && ts.After(flag.TS) {
 			continue
 		}
 		id := store.ReviewID(flag.Key, flag.Variant, flag.Digest)
-		if flag.Verdict == "flag" && snapped[id] && !seen[id] {
+		if flag.Verdict == "flag" && snapped[id] && !withdrawn[id] && !seen[id] {
 			retired = append(retired, RetiredReview{Key: flag.Key, Variant: flag.Variant, Digest: flag.Digest, Kind: "flag"})
 			seen[id] = true
 		}
 	}
-	if len(retired) == 0 {
-		flags, err := store.OpenFlags(req.Project, req.Thread)
-		if err != nil {
-			problem(w, http.StatusInternalServerError, err)
-			return
+	// Record retirement even when a human verdict or plain discard already closed the pair.
+	for pair, snap := range matching {
+		id := store.ReviewID(snap.Key, snap.Variant, snap.Digest)
+		if ts, ok := retiredAt[pair]; seen[id] || (ok && !ts.Before(snap.TS)) {
+			continue
 		}
-		tail := openHere(snaps, closed, flags, req.Thread, func(key string) bool {
-			match, _ := path.Match(req.Pattern, key)
-			return match
-		})
-		problem(w, http.StatusNotFound, fmt.Errorf("nothing open for %s on this thread%s", filterTarget(req.Pattern, req.Variant, req.Dims), tail))
+		retired = append(retired, RetiredReview{Key: snap.Key, Variant: snap.Variant, Digest: snap.Digest, Kind: "closed"})
+	}
+	if len(retired) == 0 {
+		problem(w, http.StatusNotFound, fmt.Errorf("%s is already retired on this thread", filterTarget(req.Pattern, req.Variant, req.Dims)))
 		return
 	}
 	for _, review := range retired {

@@ -991,9 +991,9 @@ func TestRetireFlagsAndPending(t *testing.T) {
 			s.clients[events] = struct{}{}
 			req := RetireRequest{Project: id, Pattern: "site/hero-lab-*", Variant: variant, Reason: "  Pages deleted  ", Session: "successor", Thread: "work"}
 			rec := postRetire(t, s, req)
-			want := 4
+			want := 5
 			if variant != "" {
-				want = 2
+				want = 3
 			}
 			var response RetireResponse
 			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil || rec.Code != http.StatusCreated || response.SchemaVersion != 1 || response.Reason != "Pages deleted" || len(response.Retired) != want {
@@ -1004,6 +1004,8 @@ func TestRetireFlagsAndPending(t *testing.T) {
 				kind := "pending"
 				if review.Key == "site/hero-lab-1" {
 					kind = "flag"
+				} else if review.Key == "site/hero-lab-approved" {
+					kind = "closed"
 				}
 				reviewID := store.ReviewID(review.Key, review.Variant, review.Digest)
 				if review.Kind != kind || seen[reviewID] || (variant != "" && review.Variant != variant) {
@@ -1056,7 +1058,7 @@ func TestRetireFlagsAndPending(t *testing.T) {
 			if variant != "" {
 				target += "@" + variant
 			}
-			if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "nothing open for "+target+" on this thread") {
+			if rec.Code != http.StatusNotFound || responseError(t, rec) != target+" is already retired on this thread" {
 				t.Fatalf("repeat retire: status=%d body=%s", rec.Code, rec.Body.String())
 			}
 			if after, err := os.ReadFile(filepath.Join(dir, "withdrawn.jsonl")); err != nil || !bytes.Equal(ledgerBefore, after) || len(events) != 0 {
@@ -1073,13 +1075,28 @@ func TestRetireNotFound(t *testing.T) {
 			t.Setenv("VISION_STATE_HOME", state)
 			req := RetireRequest{Project: strings.Repeat("a", 64), Pattern: target.pattern, Variant: target.variant, Reason: "Page deleted", Session: "mine", Thread: "mine"}
 			rec := postRetire(t, New(), req)
-			if rec.Code != http.StatusNotFound {
+			if rec.Code != http.StatusNotFound || responseError(t, rec) != "nothing matches "+filterTarget(req.Pattern, req.Variant, req.Dims)+" on this thread" {
 				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 			}
 			if entries, err := os.ReadDir(state); err != nil || len(entries) != 0 {
 				t.Fatalf("unmatched retirement wrote state: %v %v", entries, err)
 			}
 		})
+	}
+}
+
+func TestRetireOnlyOtherThread(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	id := strings.Repeat("a", 64)
+	if err := store.AppendSnap(id, store.Snap{Key: "site/missing", Variant: "default", Digest: "sha256:aaaa", Thread: "other"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	rec := postRetire(t, New(), RetireRequest{Project: id, Pattern: "site/*", Thread: "work", Reason: "Pages deleted"})
+	if rec.Code != http.StatusNotFound || responseError(t, rec) != "nothing matches site/* on this thread" {
+		t.Fatalf("other thread matched: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if withdrawals, err := store.Withdrawals(id); err != nil || len(withdrawals) != 0 {
+		t.Fatalf("miss wrote withdrawals: %v %v", withdrawals, err)
 	}
 }
 
@@ -1129,12 +1146,18 @@ func TestRetireAbandonedHQPages(t *testing.T) {
 	t.Setenv("VISION_STATE_HOME", t.TempDir())
 	id := strings.Repeat("a", 64)
 	ts := time.Now().UTC()
+	var baselines []string
 	for key := 1; key <= 6; key++ {
 		for _, variant := range []string{"mobile", "desktop"} {
 			snap := store.Snap{Key: fmt.Sprintf("site/hero-lab-%d", key), Variant: variant, Digest: fmt.Sprintf("sha256:%04x", key), Session: "eabda0cf", TS: ts.Add(-time.Minute)}
 			if err := store.AppendSnap(id, snap, []byte(snap.Digest)); err != nil {
 				t.Fatal(err)
 			}
+			if err := store.CopyBaseline(id, snap.Key, snap.Variant, snap.Digest); err != nil {
+				t.Fatal(err)
+			}
+			baseline, _ := store.BaselinePath(id, snap.Key, snap.Variant)
+			baselines = append(baselines, baseline)
 			if err := store.AppendNote(id, store.Note{Key: snap.Key, Variant: snap.Variant, Digest: snap.Digest, Verdict: "flag", Note: "fix", TS: ts}); err != nil {
 				t.Fatal(err)
 			}
@@ -1152,6 +1175,11 @@ func TestRetireAbandonedHQPages(t *testing.T) {
 	}
 	if withdrawals, err := store.Withdrawals(id); err != nil || len(withdrawals) != 12 {
 		t.Fatalf("withdrawals=%v err=%v", withdrawals, err)
+	}
+	for _, baseline := range baselines {
+		if _, err := os.Stat(baseline); !os.IsNotExist(err) {
+			t.Errorf("retired baseline remains: %s: %v", baseline, err)
+		}
 	}
 }
 

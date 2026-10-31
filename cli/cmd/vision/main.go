@@ -570,15 +570,18 @@ func retire(args []string) error {
 	if *asJSON {
 		return printJSON(result)
 	}
-	flags, pending := 0, 0
+	flags, pending, closed := 0, 0, 0
 	keys := make(map[string]bool)
 	pairs := make(map[[2]string]bool)
 	var lines []string
 	for _, review := range result.Retired {
-		if review.Kind == "flag" {
+		switch review.Kind {
+		case "flag":
 			flags++
-		} else {
+		case "pending":
 			pending++
+		case "closed":
+			closed++
 		}
 		keys[review.Key] = true
 		pair := [2]string{review.Key, review.Variant}
@@ -587,7 +590,7 @@ func retire(args []string) error {
 			pairs[pair] = true
 		}
 	}
-	fmt.Printf("retired %d flag(s) and %d pending shot(s) on %d key(s): %s\n", flags, pending, len(keys), result.Reason)
+	fmt.Printf("retired %d flag(s), %d pending shot(s) and %d closed shot(s) on %d key(s): %s\n", flags, pending, closed, len(keys), result.Reason)
 	for _, line := range lines {
 		fmt.Println(line)
 	}

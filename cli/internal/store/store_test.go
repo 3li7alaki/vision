@@ -163,6 +163,255 @@ func TestPruneKeepsSharedPendingShot(t *testing.T) {
 	}
 }
 
+func appendPruneShot(t *testing.T, snap Snap, verdict string) {
+	t.Helper()
+	if err := AppendSnap("p", snap, []byte(snap.Digest)); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteElements("p", snap.Digest, []Element{{Name: "Page", W: 1, H: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if verdict != "" {
+		if err := AppendNote("p", Note{Key: snap.Key, Variant: snap.Variant, Digest: snap.Digest, Verdict: verdict, Note: "reviewed", TS: snap.TS}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if verdict == "ok" {
+		if err := CopyBaselineMedia("p", snap.Key, snap.Variant, snap.Digest, snap.Media); err != nil {
+			t.Fatal(err)
+		}
+	}
+	shot, _ := ShotPathMedia("p", snap.Digest, snap.Media)
+	elements, _ := ElementsPath("p", snap.Digest)
+	old := time.Now().Add(-2 * pruneGrace)
+	for _, path := range []string{shot, elements} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestPruneRetiredPairRemovesFilm(t *testing.T) {
+	for media := range mediaExtensions {
+		t.Run(media, func(t *testing.T) {
+			t.Setenv("VISION_STATE_HOME", t.TempDir())
+			ts := time.Now().Add(-time.Hour)
+			var retired []Snap
+			for i := range 4 {
+				snap := Snap{Key: "retired/page", Variant: "default", Digest: fmt.Sprintf("sha256:%04x", i), Media: media, Thread: "work", TS: ts.Add(time.Duration(i) * time.Minute)}
+				verdict := "flag"
+				if i == 0 {
+					verdict = "ok"
+				}
+				appendPruneShot(t, snap, verdict)
+				// Retirement must reclaim even fresh, already-recorded film.
+				shot, _ := ShotPathMedia("p", snap.Digest, media)
+				elements, _ := ElementsPath("p", snap.Digest)
+				for _, path := range []string{shot, elements} {
+					if err := os.Chtimes(path, time.Now(), time.Now()); err != nil {
+						t.Fatal(err)
+					}
+				}
+				retired = append(retired, snap)
+			}
+			var baselines []string
+			for format := range mediaExtensions {
+				path, _ := BaselinePathMedia("p", "retired/page", "default", format)
+				if err := os.WriteFile(path, []byte("baseline"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				baselines = append(baselines, path)
+			}
+			live := Snap{Key: "live/page", Variant: "default", Digest: "sha256:aaaa", TS: ts}
+			appendPruneShot(t, live, "ok")
+			pending := live
+			pending.Digest = "sha256:bbbb"
+			appendPruneShot(t, pending, "")
+			if err := AppendWithdrawal("p", Withdrawal{Key: "retired/page", Variant: "default", Digest: retired[3].Digest, Thread: "work", TS: ts.Add(time.Hour), Reason: "Page deleted"}); err != nil {
+				t.Fatal(err)
+			}
+			dir, _ := ProjectDir("p")
+			ledgers := make(map[string]string)
+			for _, name := range []string{"index.jsonl", "notes.jsonl", "withdrawn.jsonl"} {
+				data, err := os.ReadFile(filepath.Join(dir, name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				ledgers[name] = string(data)
+			}
+			for range 2 {
+				if err := Prune("p"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, snap := range retired {
+				if HasShot("p", snap) {
+					t.Errorf("kept retired shot %s", snap.Digest)
+				}
+				if elements, err := ReadElements("p", snap.Digest); err != nil || elements != nil {
+					t.Errorf("kept retired elements: %v %v", elements, err)
+				}
+			}
+			for _, path := range append(baselines, filepath.Join(dir, "base", "retired")) {
+				if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("retired baseline or empty directory remains: %s: %v", path, err)
+				}
+			}
+			for _, snap := range []Snap{live, pending} {
+				if !HasShot("p", snap) {
+					t.Errorf("pruned live shot %s", snap.Digest)
+				}
+			}
+			baseline, _ := BaselinePath("p", live.Key, live.Variant)
+			if _, err := os.Stat(baseline); err != nil {
+				t.Fatalf("pruned live baseline: %v", err)
+			}
+			for name, before := range ledgers {
+				if after, err := os.ReadFile(filepath.Join(dir, name)); err != nil || string(after) != before {
+					t.Errorf("prune changed %s: %v", name, err)
+				}
+			}
+		})
+	}
+}
+
+func TestPruneRetirementTimestamps(t *testing.T) {
+	ts := time.Now().Add(-time.Hour)
+	for _, tc := range []struct {
+		name        string
+		snaps       []int
+		withdrawals []int
+		keep        bool
+	}{
+		{"newer snap revives", []int{2}, []int{1}, true},
+		{"equal timestamp retires", []int{1}, []int{1}, false},
+		{"newest retirement wins", []int{2}, []int{3, 1}, false},
+		{"newest snap across threads wins", []int{2, 0}, []int{1}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("VISION_STATE_HOME", t.TempDir())
+			baseline := Snap{Key: "site/page", Variant: "default", Digest: "sha256:aaaa", Thread: "original", TS: ts}
+			appendPruneShot(t, baseline, "ok")
+			snaps := []Snap{baseline}
+			for i, minute := range tc.snaps {
+				snap := baseline
+				snap.Digest, snap.Thread, snap.TS = fmt.Sprintf("sha256:%04x", i), fmt.Sprint(i), ts.Add(time.Duration(minute)*time.Minute)
+				appendPruneShot(t, snap, "flag")
+				snaps = append(snaps, snap)
+			}
+			for _, minute := range tc.withdrawals {
+				if err := AppendWithdrawal("p", Withdrawal{Key: baseline.Key, Variant: baseline.Variant, Digest: baseline.Digest, Thread: baseline.Thread, TS: ts.Add(time.Duration(minute) * time.Minute), Reason: "Page deleted"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := Prune("p"); err != nil {
+				t.Fatal(err)
+			}
+			for _, snap := range snaps {
+				if got := HasShot("p", snap); got != tc.keep {
+					t.Errorf("shot %s exists=%v, want %v", snap.Digest, got, tc.keep)
+				}
+			}
+			path, _ := BaselinePath("p", baseline.Key, baseline.Variant)
+			if _, err := os.Stat(path); (err == nil) != tc.keep || (err != nil && !errors.Is(err, os.ErrNotExist)) {
+				t.Errorf("baseline: %v, want kept=%v", err, tc.keep)
+			}
+			dir, _ := ProjectDir("p")
+			if _, err := os.Stat(filepath.Join(dir, "base")); err != nil {
+				t.Errorf("pruned base directory: %v", err)
+			}
+		})
+	}
+}
+
+func TestPruneKeepsPendingRetiredPair(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	ts := time.Now().Add(-time.Hour)
+	baseline := Snap{Key: "site/page", Variant: "default", Digest: "sha256:aaaa", Thread: "A", TS: ts}
+	appendPruneShot(t, baseline, "ok")
+	retired := baseline
+	retired.Digest = "sha256:bbbb"
+	appendPruneShot(t, retired, "")
+	pending := baseline
+	pending.Digest, pending.Thread = "sha256:cccc", "B"
+	appendPruneShot(t, pending, "")
+	if err := AppendWithdrawal("p", Withdrawal{Key: retired.Key, Variant: retired.Variant, Digest: retired.Digest, Thread: "A", TS: ts.Add(time.Minute), Reason: "Page deleted"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Prune("p"); err != nil {
+		t.Fatal(err)
+	}
+	for _, snap := range []Snap{baseline, retired, pending} {
+		if !HasShot("p", snap) {
+			t.Errorf("pruned shot while another thread is pending: %s", snap.Digest)
+		}
+	}
+	path, _ := BaselinePath("p", baseline.Key, baseline.Variant)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("pruned baseline while another thread is pending: %v", err)
+	}
+}
+
+func TestPruneKeepsLiveSharedDigest(t *testing.T) {
+	for _, sameKey := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sameKey=%v", sameKey), func(t *testing.T) {
+			t.Setenv("VISION_STATE_HOME", t.TempDir())
+			dead := Snap{Key: "site/retired", Variant: "default", Digest: "sha256:aaaa", TS: time.Now().Add(-time.Hour)}
+			appendPruneShot(t, dead, "ok")
+			live := dead
+			if sameKey {
+				live.Variant = "mobile"
+			} else {
+				live.Key = "site/live"
+			}
+			appendPruneShot(t, live, "ok")
+			if err := AppendWithdrawal("p", Withdrawal{Key: dead.Key, Variant: dead.Variant, Digest: dead.Digest, TS: time.Now(), Reason: "Page deleted"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := Prune("p"); err != nil {
+				t.Fatal(err)
+			}
+			if !HasShot("p", live) {
+				t.Fatal("pruned digest shared with live pair")
+			}
+			if elements, err := ReadElements("p", live.Digest); err != nil || len(elements) != 1 {
+				t.Fatalf("pruned shared elements: %v %v", elements, err)
+			}
+			for _, snap := range []Snap{dead, live} {
+				path, _ := BaselinePath("p", snap.Key, snap.Variant)
+				want := snap.Key == live.Key && snap.Variant == live.Variant
+				if _, err := os.Stat(path); (err == nil) != want || (err != nil && !errors.Is(err, os.ErrNotExist)) {
+					t.Errorf("baseline %s@%s: %v", snap.Key, snap.Variant, err)
+				}
+			}
+		})
+	}
+}
+
+func TestPruneDiscardKeepsBaseline(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	snap := Snap{Key: "site/page", Variant: "default", Digest: "sha256:aaaa", Thread: "work", TS: time.Now().Add(-time.Hour)}
+	appendPruneShot(t, snap, "ok")
+	discarded := snap
+	discarded.Digest = "sha256:bbbb"
+	appendPruneShot(t, discarded, "")
+	if err := AppendWithdrawal("p", Withdrawal{Key: discarded.Key, Variant: discarded.Variant, Digest: discarded.Digest, Thread: discarded.Thread, TS: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Prune("p"); err != nil {
+		t.Fatal(err)
+	}
+	for _, shot := range []Snap{snap, discarded} {
+		if !HasShot("p", shot) {
+			t.Errorf("pruned retained shot after plain discard: %s", shot.Digest)
+		}
+	}
+	path, _ := BaselinePath("p", snap.Key, snap.Variant)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("pruned baseline after plain discard: %v", err)
+	}
+}
+
 func TestClosedSupersedesWithinThread(t *testing.T) {
 	t.Setenv("VISION_STATE_HOME", t.TempDir())
 	old := Snap{Key: "cart/empty", Variant: "default", Digest: "old", Session: "mine"}
