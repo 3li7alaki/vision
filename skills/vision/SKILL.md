@@ -171,16 +171,34 @@ red`, and `regions` carries it as `t`, in seconds.
 A new snap of the same key and variant replaces your older pending one: the human only ever
 reviews the latest. Iterate without cleaning up.
 
-A key you abandoned (renamed, deleted, or shot by mistake) does not get replaced, so
-withdraw it:
+A key you abandoned (renamed, or shot by mistake) does not get replaced, so withdraw it:
 
 ```bash
-vision discard storefront/category-icon-sample --as scheme=light,vp=desktop
+vision discard storefront/category-icon-sample --dim scheme=light --dim vp=desktop
 ```
 
-It withdraws only your own thread's shots that nobody has judged yet. It never approves,
-never moves a baseline, and is recorded permanently. A flagged or approved shot cannot be
-withdrawn: fix a flag by re-snapping.
+`--dim` matches part of a variant, so you need not know the dims a snap added on its own
+(`scheme`, `vp`). If two pending variants match, it refuses and lists them; pick one with
+`--as`. A miss names what is open for that key on your thread. It withdraws only your own
+thread's shots that nobody has judged yet, never approves, never moves a baseline, and is
+recorded permanently.
+
+When the page itself is gone (deleted, redirected, a rejected experiment), its flags can never
+be fixed by a re-snap. Retire the key instead of faking a page to re-snap:
+
+```bash
+vision retire 'site/hero-lab-*' --reason "Pages deleted: lab variants lost to the v3 hero"
+```
+
+It retires every matching key on your thread, all variants unless `--as` or `--dim` narrows
+it, whether or not anything is still open: open flags and pending shots close, and the key's
+baseline and shot files are deleted from disk. Retiring it again changes nothing. The reason
+is required and kept in the ledger: say what happened to the page, not what you did. A later
+snap of the key starts fresh, with no baseline.
+
+Retire only a key whose page no longer exists. A flag on a page that still exists is the
+human asking for a fix: fix it and re-snap. Retiring it to clear the queue hides feedback,
+which rule 3 forbids.
 
 ## Rules
 
