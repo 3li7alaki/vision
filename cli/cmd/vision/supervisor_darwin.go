@@ -1,7 +1,7 @@
 package main
 
 import (
-	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -38,35 +38,67 @@ func installService(exe string) (string, error) {
 	}
 	domain := fmt.Sprintf("gui/%d", os.Getuid())
 	target := domain + "/dev.vision"
-	exec.Command("launchctl", "bootout", target).Run()
-	// Bootout is asynchronous, so wait for the old job to disappear before bootstrapping its replacement.
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	for exec.CommandContext(ctx, "launchctl", "print", target).Run() == nil {
-		select {
-		case <-ctx.Done():
-		case <-time.After(100 * time.Millisecond):
+	launchctl("bootout", target)
+	if err := waitUnloaded(target); err != nil {
+		return "", err
+	}
+	// A bootstrap can still land on a job a recent bootout is tearing down: it succeeds, the
+	// job vanishes, and kickstart reports 113 (seen once, `vision off` then `vision on`,
+	// 2026-10-31). The job is gone by then, so one more bootstrap is all it takes.
+	for attempt := 1; ; attempt++ {
+		if out, err := launchctl("bootstrap", domain, path); err != nil {
+			return "", fmt.Errorf("launchctl bootstrap: %w: %s", err, out)
+		}
+		// RunAtLoad was seen not to spawn after a bootout/bootstrap pair, so explicitly start the job.
+		out, err := launchctl("kickstart", "-k", target)
+		if err == nil {
+			return "", nil
+		}
+		if launchctlCode(err) != serviceNotFound || attempt == 2 {
+			return "", fmt.Errorf("launchctl kickstart: %w: %s", err, out)
 		}
 	}
-	if err := ctx.Err(); err != nil {
-		return "", fmt.Errorf("launchctl bootout: timed out waiting for %s to unload: %w", target, err)
-	}
-	if out, err := exec.Command("launchctl", "bootstrap", domain, path).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("launchctl bootstrap: %w: %s", err, strings.TrimSpace(string(out)))
-	}
-	// RunAtLoad was seen not to spawn after a bootout/bootstrap pair, so explicitly start the job.
-	if out, err := exec.Command("launchctl", "kickstart", "-k", target).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("launchctl kickstart: %w: %s", err, strings.TrimSpace(string(out)))
-	}
-	return "", nil
 }
 
 func removeService() error {
 	target := fmt.Sprintf("gui/%d/dev.vision", os.Getuid())
-	if out, err := exec.Command("launchctl", "bootout", target).CombinedOutput(); err != nil {
-		return fmt.Errorf("launchctl bootout: %w: %s", err, strings.TrimSpace(string(out)))
+	if out, err := launchctl("bootout", target); err != nil {
+		return fmt.Errorf("launchctl bootout: %w: %s", err, out)
 	}
-	return nil
+	// Bootout returns before the job is gone; an `on` right after would race its teardown.
+	return waitUnloaded(target)
+}
+
+// launchctl is a variable so tests can play launchd's replies.
+var launchctl = func(args ...string) (string, error) {
+	out, err := exec.Command("launchctl", args...).CombinedOutput()
+	return strings.TrimSpace(string(out)), err
+}
+
+// serviceNotFound is launchctl's exit status for "Could not find service".
+const serviceNotFound = 113
+
+func launchctlCode(err error) int {
+	var exit interface{ ExitCode() int }
+	if errors.As(err, &exit) {
+		return exit.ExitCode()
+	}
+	return -1
+}
+
+// waitUnloaded polls until launchd no longer knows target. Three seconds is well above the
+// sub-second unloads seen on this box.
+func waitUnloaded(target string) error {
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := launchctl("print", target); err != nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("launchctl bootout: timed out waiting for %s to unload", target)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func xmlEscape(s string) string {
