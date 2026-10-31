@@ -57,3 +57,8 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "latest" \
             --notes "Rolling build from ${GITHUB_SHA::7}. \`curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/install.sh | sh\`"
+          # gh uploads assets to a draft, then publishes it; on 2026-10-31 that last step
+          # silently left mint's release a Draft and install.sh 404ed. Publish explicitly
+          # and fail the job if it is still a draft.
+          gh release edit latest --repo "$GITHUB_REPOSITORY" --draft=false
+          test "$(gh release view latest --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)" = false
