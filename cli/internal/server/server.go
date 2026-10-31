@@ -236,7 +236,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /p/{project}/t/{thread}", s.gallery)
 	mux.HandleFunc("GET /health", s.health)
 	mux.HandleFunc("GET /api/queue", s.queue)
-	mux.HandleFunc("GET /api/retired", s.retired)
 	mux.HandleFunc("POST /api/snap", s.snap)
 	mux.HandleFunc("POST /api/verdict", s.verdict)
 	mux.HandleFunc("POST /api/withdraw", s.withdraw)
@@ -808,75 +807,6 @@ func (s *Server) queue(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, items)
-}
-
-// RetiredWindow bounds the list to what a reviewer could still be wondering about: two
-// weeks covers a sprint, and older retirements stay in withdrawn.jsonl for good.
-const RetiredWindow = 14 * 24 * time.Hour
-
-// RetiredItem is one shot an agent retired. The gallery lists these so that closing a
-// human's flag is always visible to that human, never a silent disappearance.
-type RetiredItem struct {
-	Project   string    `json:"project"`
-	ProjectID string    `json:"projectId"`
-	Thread    string    `json:"thread"`
-	Key       string    `json:"key"`
-	Variant   string    `json:"variant"`
-	Reason    string    `json:"reason"`
-	TS        time.Time `json:"ts"`
-}
-
-func (s *Server) retired(w http.ResponseWriter, _ *http.Request) {
-	items, err := Retired(time.Now())
-	if err != nil {
-		problem(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, items)
-}
-
-// Retired returns withdrawals that carry a reason, newest first. A plain discard has no
-// reason and withdraws only the agent's own pending shot, so it stays out of this list.
-// A timestamp ahead of now (clock skew) is kept: hiding a retirement is the one failure
-// this list exists to prevent, and the gallery shows its age as "now".
-func Retired(now time.Time) ([]RetiredItem, error) {
-	ids, err := store.ProjectIDs()
-	if err != nil {
-		return nil, err
-	}
-	items := []RetiredItem{}
-	cutoff := now.Add(-RetiredWindow)
-	for _, id := range ids {
-		withdrawals, err := store.Withdrawals(id)
-		if err != nil {
-			return nil, err
-		}
-		var mine []store.Withdrawal
-		for _, w := range withdrawals {
-			if w.Reason != "" && !w.TS.Before(cutoff) {
-				mine = append(mine, w)
-			}
-		}
-		if len(mine) == 0 {
-			continue
-		}
-		snaps, err := store.Snaps(id)
-		if err != nil {
-			return nil, err
-		}
-		// Named the way Queue names a project, so the gallery's /p/<name> view matches.
-		name := id[:min(8, len(id))]
-		for _, snap := range snaps {
-			if snap.Project != "" {
-				name = snap.Project
-			}
-		}
-		for _, w := range mine {
-			items = append(items, RetiredItem{Project: name, ProjectID: id, Thread: w.Thread, Key: w.Key, Variant: w.Variant, Reason: w.Reason, TS: w.TS})
-		}
-	}
-	sort.SliceStable(items, func(i, j int) bool { return items[i].TS.After(items[j].TS) })
-	return items, nil
 }
 
 func Queue() ([]Item, error) {
