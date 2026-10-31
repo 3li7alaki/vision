@@ -437,7 +437,9 @@ func submitSnap(req server.SnapRequest, asJSON bool) error {
 		fmt.Printf("queued %s@%s\n", req.Key, req.Variant)
 		fmt.Println(viewURL(req.Project.Name, req.Thread))
 	} else {
-		fmt.Printf("archived unchanged %s@%s\n", req.Key, req.Variant)
+		why := map[string]string{"baseline": ": matches the approved baseline", "reviewed": ": this exact shot was already reviewed"}
+		reason, _ := result["reason"].(string)
+		fmt.Printf("archived unchanged %s@%s%s\n", req.Key, req.Variant, why[reason])
 	}
 	return nil
 }

@@ -1254,3 +1254,46 @@ func TestQueueGroupsVariantsBehindNewerKey(t *testing.T) {
 		t.Fatalf("dimensions or metadata did not survive queue: %#v %#v", items[1].Dims, items[2].Meta)
 	}
 }
+
+func TestSnapSaysWhyItWasNotQueued(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	id := strings.Repeat("b", 64)
+	im := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	var b bytes.Buffer
+	if err := png.Encode(&b, im); err != nil {
+		t.Fatal(err)
+	}
+	shot := b.Bytes()
+	handler := New().Handler()
+	snap := func() map[string]any {
+		t.Helper()
+		body, err := json.Marshal(SnapRequest{Project: store.Project{ID: id, Name: "shop"}, Key: "checkout/cart", Variant: "default", PNG: base64.StdEncoding.EncodeToString(shot)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/snap", bytes.NewReader(body)))
+		var out map[string]any
+		if rec.Code != http.StatusCreated || json.Unmarshal(rec.Body.Bytes(), &out) != nil {
+			t.Fatalf("snap: status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		return out
+	}
+	if out := snap(); out["queued"] != true || out["reason"] != nil {
+		t.Fatalf("first shot: %v", out)
+	}
+	// A verdict on this exact shot that is not an approval leaves no baseline: "reviewed".
+	if err := store.AppendNote(id, store.Note{SchemaVersion: 1, TS: time.Now(), Key: "checkout/cart", Variant: "default", Digest: diff.Digest(shot), Verdict: "fix"}); err != nil {
+		t.Fatal(err)
+	}
+	if out := snap(); out["queued"] != false || out["reason"] != "reviewed" {
+		t.Fatalf("reviewed shot: %v", out)
+	}
+	// Approved and promoted: the same bytes now match the baseline.
+	if err := store.CopyBaseline(id, "checkout/cart", "default", diff.Digest(shot)); err != nil {
+		t.Fatal(err)
+	}
+	if out := snap(); out["queued"] != false || out["reason"] != "baseline" {
+		t.Fatalf("baseline shot: %v", out)
+	}
+}

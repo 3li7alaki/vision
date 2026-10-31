@@ -232,7 +232,11 @@ func TestAdd(t *testing.T) {
 					received <- req
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(http.StatusCreated)
-					fmt.Fprintf(w, `{"schemaVersion":1,"digest":"sha256:test","queued":%t}`, tc.queued)
+					reason := ""
+					if !tc.queued {
+						reason = `,"reason":"baseline"`
+					}
+					fmt.Fprintf(w, `{"schemaVersion":1,"digest":"sha256:test","queued":%t%s}`, tc.queued, reason)
 				default:
 					t.Errorf("unexpected path: %s", r.URL.Path)
 					w.WriteHeader(http.StatusNotFound)
@@ -274,7 +278,7 @@ func TestAdd(t *testing.T) {
 					t.Fatalf("add JSON=%s err=%v", out, err)
 				}
 			} else {
-				want := "archived unchanged flow/record#2@" + tc.variant + "\n"
+				want := "archived unchanged flow/record#2@" + tc.variant + ": matches the approved baseline\n"
 				if tc.queued {
 					want = "queued flow/record#2@" + tc.variant + "\n" + view + "\n"
 				}

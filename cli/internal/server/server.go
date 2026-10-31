@@ -362,11 +362,23 @@ func (s *Server) snap(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusInternalServerError, err)
 		return
 	}
-	pending = pending && !closed[record.Review()]
+	// Say why a shot was not queued: a caller whose output went nowhere (a loop into
+	// /dev/null) otherwise reads "archived" as a lost snap. makeItem only declines a shot
+	// whose bytes match the approved baseline; closed means this exact shot already has a
+	// verdict or was withdrawn.
+	response := map[string]any{"schemaVersion": 1, "digest": digest, "item": item, "warning": variantWarning(req.Project.ID, req.Key, req.Variant)}
+	switch {
+	case !pending:
+		response["reason"] = "baseline"
+	case closed[record.Review()]:
+		response["reason"] = "reviewed"
+		pending = false
+	}
 	if pending {
 		s.publish(item)
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"schemaVersion": 1, "digest": digest, "queued": pending, "item": item, "warning": variantWarning(req.Project.ID, req.Key, req.Variant)})
+	response["queued"] = pending
+	writeJSON(w, http.StatusCreated, response)
 }
 
 func (s *Server) verdict(w http.ResponseWriter, r *http.Request) {
