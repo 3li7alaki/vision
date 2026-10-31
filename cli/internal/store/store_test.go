@@ -635,7 +635,10 @@ func TestParseKeyAndVariant(t *testing.T) {
 			t.Errorf("%s: %v", key, err)
 		}
 	}
-	for _, key := range []string{"checkout", "/empty", "checkout/happy#0", "checkout/happy#x"} {
+	if err := ParseKey("site.v2/hero..wide#3"); err != nil {
+		t.Errorf("dots inside a segment are fine: %v", err)
+	}
+	for _, key := range []string{"checkout", "/empty", "checkout/happy#0", "checkout/happy#x", "../x", "./x", "x/..", "x/.", "../x#2"} {
 		if ParseKey(key) == nil {
 			t.Errorf("accepted %s", key)
 		}

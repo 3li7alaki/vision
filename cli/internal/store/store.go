@@ -203,6 +203,12 @@ func ParseKey(key string) error {
 	if !keyPattern.MatchString(key) {
 		return fmt.Errorf("invalid key %q: want <feature>/<slug> with optional #n", key)
 	}
+	// A key names a path under base/, where baselines are written and deleted, so a dot
+	// segment would let "../x" reach outside it.
+	feature, slug, _ := strings.Cut(strings.SplitN(key, "#", 2)[0], "/")
+	if feature == "." || feature == ".." || slug == "." || slug == ".." {
+		return fmt.Errorf("invalid key %q: segments must not be . or ..", key)
+	}
 	return nil
 }
 
@@ -778,6 +784,10 @@ func Prune(project string) error {
 	}
 	base := filepath.Join(dir, "base")
 	for pair := range dead {
+		// A key written before ParseKey refused dot segments is skipped, never followed.
+		if ParseKey(pair[0]) != nil {
+			continue
+		}
 		for media := range mediaExtensions {
 			path, err := BaselinePathMedia(project, pair[0], pair[1], media)
 			if err != nil {
