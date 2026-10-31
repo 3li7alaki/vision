@@ -41,6 +41,7 @@ func TestGuard(t *testing.T) {
 		{"peer spoofs Host vision.test", "GET", "/", "vision.test:4747", proxied(""), "ali@example.com", 403},
 		{"remote snap, even trusted", "POST", "/api/snap", tailnet, proxied("ali@example.com"), "ali@example.com", 403},
 		{"remote withdraw, even trusted", "POST", "/api/withdraw", tailnet, proxied("ali@example.com"), "ali@example.com", 403},
+		{"remote retire, even trusted", "POST", "/api/retire", tailnet, proxied("ali@example.com"), "ali@example.com", 403},
 		{"cross-site verdict from the phone", "POST", "/api/verdict", tailnet,
 			map[string]string{"X-Forwarded-For": "100.64.0.7", "Tailscale-User-Login": "ali@example.com", "Sec-Fetch-Site": "cross-site"}, "ali@example.com", 403},
 	}

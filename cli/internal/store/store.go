@@ -138,6 +138,7 @@ type Withdrawal struct {
 	Digest        string    `json:"digest"`
 	Session       string    `json:"session"`
 	Thread        string    `json:"thread"`
+	Reason        string    `json:"reason,omitempty"`
 }
 
 // ReviewID keeps decisions separate when identical pixels belong to different keys or variants.

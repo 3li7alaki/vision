@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -922,6 +923,235 @@ func TestWithdrawValidation(t *testing.T) {
 				t.Fatalf("invalid request wrote state: %v %v", entries, err)
 			}
 		})
+	}
+}
+
+func postRetire(t *testing.T, s *Server, req RetireRequest) *httptest.ResponseRecorder {
+	t.Helper()
+	body, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/retire", bytes.NewReader(body)))
+	return rec
+}
+
+func TestRetireFlagsAndPending(t *testing.T) {
+	for _, variant := range []string{"", "mobile"} {
+		t.Run("variant="+variant, func(t *testing.T) {
+			t.Setenv("VISION_STATE_HOME", t.TempDir())
+			id := strings.Repeat("a", 64)
+			ts := time.Now().UTC()
+			for key := 1; key <= 2; key++ {
+				for _, v := range []string{"mobile", "desktop"} {
+					snap := store.Snap{Project: "shop", Key: fmt.Sprintf("site/hero-lab-%d", key), Variant: v, Digest: fmt.Sprintf("sha256:%04x", key), Session: "predecessor", Thread: "work", TS: ts.Add(-time.Minute)}
+					if key == 2 {
+						stale := snap
+						stale.Digest = "sha256:0000"
+						if err := store.AppendSnap(id, stale, []byte(stale.Digest)); err != nil {
+							t.Fatal(err)
+						}
+					}
+					for range 2 {
+						if err := store.AppendSnap(id, snap, []byte(snap.Digest)); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if key == 1 {
+						if err := store.AppendNote(id, store.Note{Key: snap.Key, Variant: v, Digest: snap.Digest, Verdict: "flag", Note: "fix", TS: ts}); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+			}
+			for _, snap := range []store.Snap{
+				{Project: "shop", Key: "site/hero-lab-2", Variant: "mobile", Digest: "sha256:0002", Thread: "other"},
+				{Project: "shop", Key: "site/keep", Variant: "mobile", Digest: "sha256:0003", Thread: "work"},
+				{Project: "shop", Key: "site/hero-lab-approved", Variant: "mobile", Digest: "sha256:0004", Thread: "work"},
+			} {
+				if err := store.AppendSnap(id, snap, []byte(snap.Digest)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := store.AppendNote(id, store.Note{Key: "site/hero-lab-approved", Variant: "mobile", Digest: "sha256:0004", Verdict: "ok", TS: ts}); err != nil {
+				t.Fatal(err)
+			}
+			dir, _ := store.ProjectDir(id)
+			indexBefore, err := os.ReadFile(filepath.Join(dir, "index.jsonl"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			notesBefore, err := os.ReadFile(filepath.Join(dir, "notes.jsonl"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := New()
+			events := make(chan Item, 8)
+			s.clients[events] = struct{}{}
+			req := RetireRequest{Project: id, Pattern: "site/hero-lab-*", Variant: variant, Reason: "  Pages deleted  ", Session: "successor", Thread: "work"}
+			rec := postRetire(t, s, req)
+			want := 4
+			if variant != "" {
+				want = 2
+			}
+			var response RetireResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil || rec.Code != http.StatusCreated || response.SchemaVersion != 1 || response.Reason != "Pages deleted" || len(response.Retired) != want {
+				t.Fatalf("retire: status=%d body=%s err=%v", rec.Code, rec.Body.String(), err)
+			}
+			seen := make(map[string]bool)
+			for _, review := range response.Retired {
+				kind := "pending"
+				if review.Key == "site/hero-lab-1" {
+					kind = "flag"
+				}
+				reviewID := store.ReviewID(review.Key, review.Variant, review.Digest)
+				if review.Kind != kind || seen[reviewID] || (variant != "" && review.Variant != variant) {
+					t.Fatalf("wrong or duplicate retirement: %+v", review)
+				}
+				seen[reviewID] = true
+			}
+			withdrawals, err := store.Withdrawals(id)
+			if err != nil || len(withdrawals) != want {
+				t.Fatalf("withdrawals=%v err=%v", withdrawals, err)
+			}
+			for _, w := range withdrawals {
+				if !seen[store.ReviewID(w.Key, w.Variant, w.Digest)] || w.Reason != "Pages deleted" || w.Session != "successor" || w.Thread != "work" || w.SchemaVersion != 1 || w.TS.IsZero() {
+					t.Fatalf("wrong withdrawal: %+v", w)
+				}
+			}
+			if len(events) != want {
+				t.Fatalf("events=%d, want %d", len(events), want)
+			}
+			for range want {
+				event := <-events
+				if event.ProjectID != id || event.Project != "shop" || event.Thread != "work" || event.Status != "withdrawn" || !seen[store.ReviewID(event.Key, event.Variant, event.Digest)] {
+					t.Fatalf("wrong event: %+v", event)
+				}
+			}
+			wantFlags, wantPending := 0, 1
+			if variant != "" {
+				wantFlags, wantPending = 1, 2
+			}
+			if flags, err := store.OpenFlags(id, "work"); err != nil || len(flags) != wantFlags {
+				t.Fatalf("remaining flags=%v err=%v", flags, err)
+			}
+			if count, err := PendingCountForSession(id, "work"); err != nil || count != wantPending {
+				t.Fatalf("remaining pending=%d err=%v, want %d", count, err, wantPending)
+			}
+			if count, err := PendingCountForSession(id, "other"); err != nil || count != 1 {
+				t.Fatalf("retirement crossed threads: %d %v", count, err)
+			}
+			for name, before := range map[string][]byte{"index.jsonl": indexBefore, "notes.jsonl": notesBefore} {
+				if after, err := os.ReadFile(filepath.Join(dir, name)); err != nil || !bytes.Equal(before, after) {
+					t.Fatalf("retirement changed %s: %v", name, err)
+				}
+			}
+			ledgerBefore, err := os.ReadFile(filepath.Join(dir, "withdrawn.jsonl"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec = postRetire(t, s, req)
+			target := req.Pattern
+			if variant != "" {
+				target += "@" + variant
+			}
+			if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "nothing open for "+target+" on this thread") {
+				t.Fatalf("repeat retire: status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if after, err := os.ReadFile(filepath.Join(dir, "withdrawn.jsonl")); err != nil || !bytes.Equal(ledgerBefore, after) || len(events) != 0 {
+				t.Fatalf("repeat retire changed ledger or published events: %v", err)
+			}
+		})
+	}
+}
+
+func TestRetireNotFound(t *testing.T) {
+	for _, target := range []struct{ pattern, variant string }{{"site/missing", ""}, {"site/missing-*", "mobile"}} {
+		t.Run(target.pattern, func(t *testing.T) {
+			state := t.TempDir()
+			t.Setenv("VISION_STATE_HOME", state)
+			req := RetireRequest{Project: strings.Repeat("a", 64), Pattern: target.pattern, Variant: target.variant, Reason: "Page deleted", Session: "mine", Thread: "mine"}
+			rec := postRetire(t, New(), req)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if entries, err := os.ReadDir(state); err != nil || len(entries) != 0 {
+				t.Fatalf("unmatched retirement wrote state: %v %v", entries, err)
+			}
+		})
+	}
+}
+
+func TestRetireValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		field string
+		value string
+	}{
+		{"empty reason", "reason", ""},
+		{"blank reason", "reason", "   "},
+		{"oversized reason", "reason", strings.Repeat("x", 501)},
+		{"oversized UTF-8 reason", "reason", strings.Repeat("é", 251)},
+		{"control character", "reason", "page\ndeleted"},
+		{"trailing control", "reason", "page deleted\n"},
+		{"unicode control", "reason", "page\u0085deleted"},
+		{"bad pattern", "pattern", "site/["},
+		{"bad literal", "pattern", "invalid"},
+		{"empty pattern", "pattern", ""},
+		{"bad project", "project", "../../etc"},
+		{"bad variant", "variant", "bad/variant"},
+		{"empty thread", "thread", ""},
+		{"unknown field", "unknown", "value"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := t.TempDir()
+			t.Setenv("VISION_STATE_HOME", state)
+			body := map[string]string{"project": strings.Repeat("a", 64), "pattern": "site/hero-lab-*", "reason": "Pages deleted", "thread": "mine"}
+			body[tc.field] = tc.value
+			data, err := json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := httptest.NewRecorder()
+			New().Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/retire", bytes.NewReader(data)))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s, want 400", rec.Code, rec.Body.String())
+			}
+			if entries, err := os.ReadDir(state); err != nil || len(entries) != 0 {
+				t.Fatalf("invalid retirement wrote state: %v %v", entries, err)
+			}
+		})
+	}
+}
+
+func TestRetireAbandonedHQPages(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	id := strings.Repeat("a", 64)
+	ts := time.Now().UTC()
+	for key := 1; key <= 6; key++ {
+		for _, variant := range []string{"mobile", "desktop"} {
+			snap := store.Snap{Key: fmt.Sprintf("site/hero-lab-%d", key), Variant: variant, Digest: fmt.Sprintf("sha256:%04x", key), Session: "eabda0cf", TS: ts.Add(-time.Minute)}
+			if err := store.AppendSnap(id, snap, []byte(snap.Digest)); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.AppendNote(id, store.Note{Key: snap.Key, Variant: snap.Variant, Digest: snap.Digest, Verdict: "flag", Note: "fix", TS: ts}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if flags, err := store.OpenFlags(id, "eabda0cf"); err != nil || len(flags) != 12 {
+		t.Fatalf("fixture flags=%v err=%v", flags, err)
+	}
+	rec := postRetire(t, New(), RetireRequest{Project: id, Pattern: "site/hero-lab-*", Reason: "Pages deleted", Session: "successor", Thread: "eabda0cf"})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if flags, err := store.OpenFlags(id, "eabda0cf"); err != nil || len(flags) != 0 {
+		t.Fatalf("remaining flags=%v err=%v", flags, err)
+	}
+	if withdrawals, err := store.Withdrawals(id); err != nil || len(withdrawals) != 12 {
+		t.Fatalf("withdrawals=%v err=%v", withdrawals, err)
 	}
 }
 

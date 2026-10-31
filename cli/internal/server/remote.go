@@ -34,8 +34,8 @@ func remote(r *http.Request) bool {
 	return !localHosts[strings.ToLower(host)]
 }
 
-// Agents snap and withdraw on this machine; only the human reviews from elsewhere.
-var localOnly = map[string]bool{"/api/snap": true, "/api/withdraw": true}
+// Agents snap, withdraw and retire on this machine; only the human reviews from elsewhere.
+var localOnly = map[string]bool{"/api/snap": true, "/api/withdraw": true, "/api/retire": true}
 
 // guard wraps every route. CrossOriginProtection refuses a cross-site POST, which matters here
 // because the tailnet identity rides on the connection, not a cookie: any page open on the phone

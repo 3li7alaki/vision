@@ -188,6 +188,63 @@ func TestOpenFlags(t *testing.T) {
 	}
 }
 
+func TestOpenFlagsWithdrawal(t *testing.T) {
+	for _, tc := range []struct {
+		name, thread, key, variant, digest string
+		want                               int
+	}{
+		{"same review", "work", "cart/empty", "mobile", "old", 0},
+		{"other thread", "other", "cart/empty", "mobile", "old", 1},
+		{"other key", "work", "cart/other", "mobile", "old", 1},
+		{"other variant", "work", "cart/empty", "desktop", "old", 1},
+		{"other digest", "work", "cart/empty", "mobile", "other", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("VISION_STATE_HOME", t.TempDir())
+			ts := time.Now().UTC()
+			if err := AppendSnap("p", Snap{Session: "work", Key: "cart/empty", Variant: "mobile", Digest: "old", TS: ts.Add(-time.Minute)}, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := AppendNote("p", Note{Key: "cart/empty", Variant: "mobile", Digest: "old", Verdict: "flag", Note: "fix", TS: ts}); err != nil {
+				t.Fatal(err)
+			}
+			if err := AppendWithdrawal("p", Withdrawal{Key: tc.key, Variant: tc.variant, Digest: tc.digest, Thread: tc.thread, Reason: "Page deleted"}); err != nil {
+				t.Fatal(err)
+			}
+			if flags, err := OpenFlags("p", "work"); err != nil || len(flags) != tc.want {
+				t.Fatalf("flags=%v err=%v, want %d", flags, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestRetirementAllowsNewReview(t *testing.T) {
+	t.Setenv("VISION_STATE_HOME", t.TempDir())
+	ts := time.Now().UTC()
+	old := Snap{Session: "work", Key: "cart/empty", Variant: "mobile", Digest: "old", TS: ts.Add(-time.Minute)}
+	if err := AppendSnap("p", old, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := AppendNote("p", Note{Key: old.Key, Variant: old.Variant, Digest: old.Digest, Verdict: "flag", Note: "fix", TS: ts}); err != nil {
+		t.Fatal(err)
+	}
+	if err := AppendWithdrawal("p", Withdrawal{Key: old.Key, Variant: old.Variant, Digest: old.Digest, Thread: "work", Reason: "Page deleted"}); err != nil {
+		t.Fatal(err)
+	}
+	newSnap := old
+	newSnap.Digest, newSnap.TS = "new", ts.Add(time.Minute)
+	if err := AppendSnap("p", newSnap, nil); err != nil {
+		t.Fatal(err)
+	}
+	closed, err := Closed("p", []Snap{old, newSnap})
+	if err != nil || !closed[old.Review()] || closed[newSnap.Review()] {
+		t.Fatalf("reviews after retirement=%v err=%v", closed, err)
+	}
+	if flags, err := OpenFlags("p", "work"); err != nil || len(flags) != 0 {
+		t.Fatalf("old flag reopened: %v %v", flags, err)
+	}
+}
+
 func TestSweepSessionState(t *testing.T) {
 	t.Setenv("VISION_STATE_HOME", t.TempDir())
 	now := time.Now().Truncate(time.Second)

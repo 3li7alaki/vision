@@ -739,6 +739,121 @@ func TestDiscard(t *testing.T) {
 	}
 }
 
+func TestRetireUsageAndValidation(t *testing.T) {
+	out, err := commandOutput(t, func() error { return run([]string{"help"}) })
+	if err != nil || !strings.Contains(out, "vision retire <key|glob> [--as <variant>] --reason <text> [--json]") {
+		t.Fatalf("help lost retire: output=%q err=%v", out, err)
+	}
+	for _, args := range [][]string{nil, {"site/hero"}, {"site/hero", "--json"}, {"site/hero", "--reason"}, {"site/hero", "--reason", "deleted", "extra"}} {
+		if err := run(append([]string{"retire"}, args...)); err == nil || err.Error() != usageText {
+			t.Errorf("retire %v: err=%v, want usage", args, err)
+		}
+	}
+	for _, args := range [][]string{
+		{"site/hero", "--reason", ""},
+		{"site/hero", "--reason", "   "},
+		{"site/hero", "--reason", strings.Repeat("x", 501)},
+		{"site/hero", "--reason", "page\ndeleted"},
+		{"site/[", "--reason", "deleted"},
+		{"bad-key", "--reason", "deleted"},
+		{"site/hero", "--reason", "deleted", "--as", "bad/variant"},
+		{"site/hero", "--reason", "deleted", "--as", ""},
+	} {
+		if err := retire(args); err == nil {
+			t.Errorf("retire %v: accepted invalid input", args)
+		}
+	}
+	for _, name := range []string{"VISION_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"} {
+		t.Setenv(name, "")
+	}
+	if err := retire([]string{"site/hero", "--reason", "deleted"}); err == nil || !strings.Contains(err.Error(), "VISION_SESSION_ID") || !strings.Contains(err.Error(), "CLAUDE_CODE_SESSION_ID") {
+		t.Fatalf("missing session error=%v", err)
+	}
+}
+
+func TestRetire(t *testing.T) {
+	original := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = original })
+	for _, asJSON := range []bool{false, true} {
+		t.Run(fmt.Sprintf("json=%v", asJSON), func(t *testing.T) {
+			t.Setenv("VISION_STATE_HOME", t.TempDir())
+			t.Setenv("VISION_SESSION_ID", "successor")
+			project, err := store.Identify(".")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.JoinThread(project.ID, "successor", "shared"); err != nil {
+				t.Fatal(err)
+			}
+			ts := time.Now().UTC()
+			for key := 1; key <= 2; key++ {
+				for _, variant := range []string{"mobile", "desktop"} {
+					snap := store.Snap{Key: fmt.Sprintf("site/hero-lab-%d", key), Variant: variant, Digest: fmt.Sprintf("sha256:%04x", key), Session: "predecessor", Thread: "shared", TS: ts.Add(-time.Minute)}
+					if err := store.AppendSnap(project.ID, snap, nil); err != nil {
+						t.Fatal(err)
+					}
+					if key == 1 {
+						if err := store.AppendNote(project.ID, store.Note{Key: snap.Key, Variant: snap.Variant, Digest: snap.Digest, Verdict: "flag", Note: "fix", TS: ts}); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+			}
+			handler := server.New().Handler()
+			var paths []string
+			var request server.RetireRequest
+			http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				paths = append(paths, r.URL.Path)
+				if r.URL.Path == "/api/retire" {
+					data, err := io.ReadAll(r.Body)
+					if err != nil {
+						return nil, err
+					}
+					if err := json.Unmarshal(data, &request); err != nil {
+						return nil, err
+					}
+					r.Body = io.NopCloser(bytes.NewReader(data))
+				}
+				rec := httptest.NewRecorder()
+				handler.ServeHTTP(rec, r)
+				return rec.Result(), nil
+			})
+			pattern, variant := "site/hero-lab-*", ""
+			if asJSON {
+				pattern, variant = "site/hero-lab-1", "mobile"
+			}
+			args := []string{"retire", pattern, "--reason", "  Pages deleted  "}
+			if asJSON {
+				args = append(args, "--as", variant, "--json")
+			}
+			out, err := commandOutput(t, func() error { return run(args) })
+			if err != nil || !slices.Equal(paths, []string{"/health", "/api/retire"}) {
+				t.Fatalf("retire: output=%q paths=%v err=%v", out, paths, err)
+			}
+			if request.Project != project.ID || request.Pattern != pattern || request.Variant != variant || request.Reason != "Pages deleted" || request.Session != "successor" || request.Thread != "shared" {
+				t.Fatalf("retire request=%+v", request)
+			}
+			if asJSON {
+				var response server.RetireResponse
+				if err := json.Unmarshal([]byte(out), &response); err != nil || response.SchemaVersion != 1 || response.Reason != "Pages deleted" || len(response.Retired) != 1 || response.Retired[0].Kind != "flag" || response.Retired[0].Key != pattern || response.Retired[0].Variant != variant {
+					t.Fatalf("retire JSON=%s err=%v", out, err)
+				}
+			} else {
+				if !strings.HasPrefix(out, "retired 2 flag(s) and 2 pending shot(s) on 2 key(s): Pages deleted\n") || strings.Count(out, "\n") != 5 {
+					t.Fatalf("retire text=%q", out)
+				}
+				for key := 1; key <= 2; key++ {
+					for _, v := range []string{"mobile", "desktop"} {
+						if !strings.Contains(out, fmt.Sprintf("\nsite/hero-lab-%d@%s\n", key, v)) {
+							t.Fatalf("retire omitted key/variant: %q", out)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestDiscardValidation(t *testing.T) {
 	t.Setenv("VISION_SESSION_ID", "")
 	t.Setenv("CLAUDE_CODE_SESSION_ID", "")

@@ -64,6 +64,8 @@ func run(args []string) error {
 		return add(args[1:])
 	case "discard":
 		return discard(args[1:])
+	case "retire":
+		return retire(args[1:])
 	case "session":
 		return session(args[1:])
 	case "notes":
@@ -81,7 +83,7 @@ func run(args []string) error {
 	}
 }
 
-const usageText = "usage: vision snap <key> [--as <variant> | --dim k=v...] [--selector <css>] [--meta k=v...] [--note <text>] [--json] | vision add <key> <file> [--as <variant>] [--meta k=v...] [--note <text>] [--json] | vision discard <key> [--as <variant>] [--json] | vision notes [--unread | --since <duration> | --open (requires --session) | --wait <duration>] [--flagged] [--session <id>] [--json] | vision on | off | vision status [--session <id>] [--json] | vision session join <thread> | vision session thread [--json] | vision --version"
+const usageText = "usage: vision snap <key> [--as <variant> | --dim k=v...] [--selector <css>] [--meta k=v...] [--note <text>] [--json] | vision add <key> <file> [--as <variant>] [--meta k=v...] [--note <text>] [--json] | vision discard <key> [--as <variant>] [--json] [--dim k=v... instead of --as] | vision retire <key|glob> [--as <variant>] --reason <text> [--json] [--dim k=v... instead of --as] | vision notes [--unread | --since <duration> | --open (requires --session) | --wait <duration>] [--flagged] [--session <id>] [--json] | vision on | off | vision status [--session <id>] [--json] | vision session join <thread> | vision session thread [--json] | vision --version"
 
 func usage() error {
 	return errors.New(usageText)
@@ -450,12 +452,31 @@ func discard(args []string) error {
 	}
 	fs := flag.NewFlagSet("discard", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
+	dims := keyValueFlag{}
+	fs.Var(dims, "dim", "visual dimension k=v")
 	variant := fs.String("as", "default", "variant")
 	asJSON := fs.Bool("json", false, "JSON output")
 	if err := fs.Parse(args[1:]); err != nil || fs.NArg() != 0 {
 		return usage()
 	}
-	if err := store.ParseVariant(*variant); err != nil {
+	asSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "as" {
+			asSet = true
+		}
+	})
+	if asSet && len(dims) != 0 {
+		return usage()
+	}
+	label := *variant
+	if len(dims) != 0 {
+		var err error
+		label, err = store.EncodeVariant(dims)
+		if err != nil {
+			return err
+		}
+		*variant = ""
+	} else if err := store.ParseVariant(*variant); err != nil {
 		return err
 	}
 	id := sessionID()
@@ -477,13 +498,99 @@ func discard(args []string) error {
 		SchemaVersion int      `json:"schemaVersion"`
 		Withdrawn     []string `json:"withdrawn"`
 	}
-	if err := post("/api/withdraw", server.WithdrawRequest{Project: project.ID, Key: key, Variant: *variant, Session: id, Thread: thread}, &result); err != nil {
+	if err := post("/api/withdraw", server.WithdrawRequest{Project: project.ID, Key: key, Variant: *variant, Dims: dims, Session: id, Thread: thread}, &result); err != nil {
 		return err
 	}
 	if *asJSON {
 		return printJSON(result)
 	}
-	fmt.Printf("withdrew %s@%s (%d shot(s))\n", key, *variant, len(result.Withdrawn))
+	fmt.Printf("withdrew %s@%s (%d shot(s))\n", key, label, len(result.Withdrawn))
+	return nil
+}
+
+func retire(args []string) error {
+	if len(args) == 0 {
+		return usage()
+	}
+	fs := flag.NewFlagSet("retire", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	dims := keyValueFlag{}
+	fs.Var(dims, "dim", "visual dimension k=v")
+	variant := fs.String("as", "", "variant")
+	reason := fs.String("reason", "", "reason for retiring the key")
+	asJSON := fs.Bool("json", false, "JSON output")
+	if err := fs.Parse(args[1:]); err != nil || fs.NArg() != 0 {
+		return usage()
+	}
+	reasonSet, asSet := false, false
+	var variantErr error
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "reason" {
+			reasonSet = true
+		}
+		if f.Name == "as" {
+			asSet = true
+			variantErr = store.ParseVariant(*variant)
+		}
+	})
+	if !reasonSet || (asSet && len(dims) != 0) {
+		return usage()
+	}
+	if variantErr != nil {
+		return variantErr
+	}
+	req := server.RetireRequest{Pattern: args[0], Variant: *variant, Reason: *reason}
+	if len(dims) != 0 {
+		req.Dims = dims
+	}
+	if err := req.ValidateTarget(); err != nil {
+		return err
+	}
+	req.Reason = strings.TrimSpace(req.Reason)
+	id := sessionID()
+	if id == "" {
+		return errors.New("no session id; set VISION_SESSION_ID, CLAUDE_CODE_SESSION_ID, or CODEX_THREAD_ID")
+	}
+	project, err := store.Identify(".")
+	if err != nil {
+		return err
+	}
+	thread, err := store.ThreadFor(project.ID, id)
+	if err != nil {
+		return err
+	}
+	if err := healthy(); err != nil {
+		return err
+	}
+	req.Project, req.Session, req.Thread = project.ID, id, thread
+	var result server.RetireResponse
+	if err := post("/api/retire", req, &result); err != nil {
+		return err
+	}
+	if *asJSON {
+		return printJSON(result)
+	}
+	flags, pending := 0, 0
+	keys := make(map[string]bool)
+	pairs := make(map[[2]string]bool)
+	var lines []string
+	for _, review := range result.Retired {
+		if review.Kind == "flag" {
+			flags++
+		} else {
+			pending++
+		}
+		keys[review.Key] = true
+		pair := [2]string{review.Key, review.Variant}
+		if !pairs[pair] {
+			lines = append(lines, review.Key+"@"+review.Variant)
+			pairs[pair] = true
+		}
+	}
+	fmt.Printf("retired %d flag(s) and %d pending shot(s) on %d key(s): %s\n", flags, pending, len(keys), result.Reason)
+	for _, line := range lines {
+		fmt.Println(line)
+	}
 	return nil
 }
 

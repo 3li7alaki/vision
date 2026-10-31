@@ -130,8 +130,7 @@ func JoinThread(project, session, thread string) (string, error) {
 // OpenFlags is processing state derived from the ledger, never from a read cursor. A
 // cursor delivers a flag once, but compaction or a timed-out agent can lose that context.
 // Like Kafka committing after processing rather than after reading, a flag is done when
-// the UI is fixed and re-snapped, not when it was printed. Only another snap of that same
-// key and variant on this thread closes it; the human then judges the new shot as usual.
+// the UI is fixed and re-snapped, or its key is retired, not when it was printed.
 func OpenFlags(project, thread string) ([]Note, error) {
 	snaps, err := Snaps(project)
 	if err != nil {
@@ -140,6 +139,16 @@ func OpenFlags(project, thread string) ([]Note, error) {
 	notes, err := Notes(project)
 	if err != nil {
 		return nil, err
+	}
+	withdrawals, err := Withdrawals(project)
+	if err != nil {
+		return nil, err
+	}
+	withdrawn := make(map[string]bool)
+	for _, w := range withdrawals {
+		if w.Thread == thread {
+			withdrawn[ReviewID(w.Key, w.Variant, w.Digest)] = true
+		}
 	}
 	digests := make(map[string]bool)
 	latestSnap := make(map[[2]string]time.Time)
@@ -156,7 +165,7 @@ func OpenFlags(project, thread string) ([]Note, error) {
 	latestFlag := make(map[[2]string]int)
 	for i, note := range notes {
 		pair := [2]string{note.Key, note.Variant}
-		if note.Verdict != "flag" || !digests[note.Digest] {
+		if note.Verdict != "flag" || !digests[note.Digest] || withdrawn[ReviewID(note.Key, note.Variant, note.Digest)] {
 			continue
 		}
 		if ts, ok := latestSnap[pair]; ok && ts.After(note.TS) {

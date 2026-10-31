@@ -72,6 +72,8 @@ It fixes the first, re-snaps, and the card closes.
 
 ```bash
 vision snap <key> [--as <variant>] [--note <text>]   take the picture
+vision discard <key> [--as <variant> | --dim k=v...] [--json]     withdraw pending shots
+vision retire <key|glob> [--as <variant> | --dim k=v...] --reason <text> [--json]
 vision notes [--unread | --since <duration> | --open] [--flagged] [--session <id>]
 vision status [--session <id>] [--json]            count pending reviews
 vision on | off                                  the daemon
@@ -93,6 +95,19 @@ to both.
 reading or advancing any cursor. It requires `--session` and cannot combine with `--unread`
 or `--since`. Re-snapping the same key and variant on that thread closes the flag, even with
 an unchanged digest; reading it does not.
+
+Use `vision retire 'site/hero-lab-*' --reason 'Pages deleted'` for keys whose page no longer
+exists. It closes open flags and pending shots on the current thread, across all variants
+unless `--as` selects one. The reason is recorded permanently. A later snap of the key opens
+normally. The gallery's empty project and thread views list the last two weeks of
+retirements, one row per call with its reason, so a closed flag never disappears unseen.
+
+`vision discard <key> --dim locale=x --dim vp=desktop` matches a subset of stored dimensions
+and requires exactly one pending variant on this thread.
+`vision retire <key|glob> --dim locale=x --reason 'Pages deleted'` covers every variant
+containing those dimensions on this thread.
+When discard or retire misses, its error lists up to 10 sorted open entries for that key
+or pattern on this thread, labelled `(pending)` or `(flag)`, then `and N more` if needed.
 
 ## Threads and handoffs
 

@@ -11,12 +11,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 	"vision/internal/diff"
 	"vision/internal/gallery"
@@ -58,11 +60,127 @@ type VerdictRequest struct {
 }
 
 type WithdrawRequest struct {
-	Project string `json:"project"`
+	Project string            `json:"project"`
+	Key     string            `json:"key"`
+	Variant string            `json:"variant"`
+	Dims    map[string]string `json:"dims,omitempty"`
+	Session string            `json:"session"`
+	Thread  string            `json:"thread"`
+}
+
+type RetireRequest struct {
+	Project string            `json:"project"`
+	Pattern string            `json:"pattern"`
+	Variant string            `json:"variant,omitempty"`
+	Dims    map[string]string `json:"dims,omitempty"`
+	Reason  string            `json:"reason"`
+	Session string            `json:"session"`
+	Thread  string            `json:"thread"`
+}
+
+func validateVariantFilter(variant string, dims map[string]string) error {
+	if dims != nil {
+		if variant != "" {
+			return errors.New("variant and dims are mutually exclusive")
+		}
+		_, err := store.EncodeVariant(dims)
+		return err
+	}
+	if variant != "" {
+		return store.ParseVariant(variant)
+	}
+	return nil
+}
+
+func matchesVariant(stored, variant string, dims map[string]string) bool {
+	if dims == nil {
+		return variant == "" || stored == variant
+	}
+	decoded := store.DecodeVariant(stored)
+	if decoded == nil {
+		return false
+	}
+	for key, value := range dims {
+		if decoded[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func filterTarget(key, variant string, dims map[string]string) string {
+	if dims != nil {
+		variant, _ = store.EncodeVariant(dims)
+	}
+	if variant != "" {
+		return key + "@" + variant
+	}
+	return key
+}
+
+func openHere(snaps []store.Snap, closed map[store.Review]bool, flags []store.Note, thread string, matchesKey func(string) bool) string {
+	entries := make(map[string]bool)
+	for _, snap := range snaps {
+		if snap.ThreadID() == thread && matchesKey(snap.Key) && !closed[snap.Review()] {
+			entries[snap.Key+"@"+snap.Variant+" (pending)"] = true
+		}
+	}
+	for _, flag := range flags {
+		if matchesKey(flag.Key) {
+			entries[flag.Key+"@"+flag.Variant+" (flag)"] = true
+		}
+	}
+	if len(entries) == 0 {
+		return ""
+	}
+	var sorted []string
+	for entry := range entries {
+		sorted = append(sorted, entry)
+	}
+	sort.Strings(sorted)
+	// Miss hints are bounded even when a pattern covers a large project.
+	const limit = 10
+	if len(sorted) > limit {
+		sorted = append(sorted[:limit], fmt.Sprintf("and %d more", len(sorted)-limit))
+	}
+	return "; open here: " + strings.Join(sorted, ", ")
+}
+
+// ValidateTarget shares the retirement text rules with the CLI before it contacts the daemon.
+func (req RetireRequest) ValidateTarget() error {
+	if _, err := path.Match(req.Pattern, ""); err != nil {
+		return err
+	}
+	if !strings.ContainsAny(req.Pattern, "*?[\\") {
+		if err := store.ParseKey(req.Pattern); err != nil {
+			return err
+		}
+	}
+	if err := validateVariantFilter(req.Variant, req.Dims); err != nil {
+		return err
+	}
+	if reason := strings.TrimSpace(req.Reason); reason == "" || len(reason) > 500 {
+		return errors.New("reason must be non-empty and at most 500 bytes")
+	}
+	for _, r := range req.Reason {
+		if unicode.IsControl(r) {
+			return errors.New("reason must not contain control characters")
+		}
+	}
+	return nil
+}
+
+type RetiredReview struct {
 	Key     string `json:"key"`
 	Variant string `json:"variant"`
-	Session string `json:"session"`
-	Thread  string `json:"thread"`
+	Digest  string `json:"digest"`
+	Kind    string `json:"kind"`
+}
+
+type RetireResponse struct {
+	SchemaVersion int             `json:"schemaVersion"`
+	Retired       []RetiredReview `json:"retired"`
+	Reason        string          `json:"reason"`
 }
 
 type Item struct {
@@ -118,9 +236,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /p/{project}/t/{thread}", s.gallery)
 	mux.HandleFunc("GET /health", s.health)
 	mux.HandleFunc("GET /api/queue", s.queue)
+	mux.HandleFunc("GET /api/retired", s.retired)
 	mux.HandleFunc("POST /api/snap", s.snap)
 	mux.HandleFunc("POST /api/verdict", s.verdict)
 	mux.HandleFunc("POST /api/withdraw", s.withdraw)
+	mux.HandleFunc("POST /api/retire", s.retire)
 	mux.HandleFunc("GET /media/{kind}/{project}/{digest}", s.media)
 	mux.HandleFunc("GET /media/icon/{project}", s.projectIcon)
 	mux.HandleFunc("GET /events", s.events)
@@ -366,8 +486,12 @@ func (s *Server) withdraw(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := store.ParseVariant(req.Variant); err != nil {
+	if err := validateVariantFilter(req.Variant, req.Dims); err != nil {
 		problem(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Dims == nil && req.Variant == "" {
+		problem(w, http.StatusBadRequest, store.ParseVariant(req.Variant))
 		return
 	}
 	if req.Thread == "" {
@@ -387,17 +511,39 @@ func (s *Server) withdraw(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var pending []store.Snap
+	variants := make(map[string]bool)
 	seen := make(map[string]bool)
 	for _, snap := range snaps {
-		if snap.Key == req.Key && snap.Variant == req.Variant && snap.ThreadID() == req.Thread && !closed[snap.Review()] && !seen[snap.Digest] {
+		if snap.Key != req.Key || snap.ThreadID() != req.Thread || closed[snap.Review()] || !matchesVariant(snap.Variant, req.Variant, req.Dims) {
+			continue
+		}
+		variants[snap.Variant] = true
+		id := store.ReviewID(snap.Key, snap.Variant, snap.Digest)
+		if !seen[id] {
 			pending = append(pending, snap)
-			seen[snap.Digest] = true
+			seen[id] = true
 		}
 	}
-	if len(pending) == 0 {
-		problem(w, http.StatusNotFound, fmt.Errorf("nothing pending for %s@%s on this thread", req.Key, req.Variant))
+	if len(variants) > 1 {
+		var sorted []string
+		for variant := range variants {
+			sorted = append(sorted, variant)
+		}
+		sort.Strings(sorted)
+		problem(w, http.StatusConflict, fmt.Errorf("%s matches several pending variants on this thread: %s; pass --as with one", req.Key, strings.Join(sorted, ", ")))
 		return
 	}
+	if len(pending) == 0 {
+		flags, err := store.OpenFlags(req.Project, req.Thread)
+		if err != nil {
+			problem(w, http.StatusInternalServerError, err)
+			return
+		}
+		tail := openHere(snaps, closed, flags, req.Thread, func(key string) bool { return key == req.Key })
+		problem(w, http.StatusNotFound, fmt.Errorf("nothing pending for %s on this thread%s", filterTarget(req.Key, req.Variant, req.Dims), tail))
+		return
+	}
+	req.Variant = pending[0].Variant
 	digests := make([]string, 0, len(pending))
 	for _, snap := range pending {
 		withdrawal := store.Withdrawal{SchemaVersion: store.SchemaVersion, TS: time.Now().UTC(), Key: req.Key, Variant: req.Variant, Digest: snap.Digest, Session: req.Session, Thread: req.Thread}
@@ -416,6 +562,118 @@ func (s *Server) withdraw(w http.ResponseWriter, r *http.Request) {
 		s.publish(Item{ProjectID: req.Project, Project: name, Thread: req.Thread, Key: req.Key, Variant: req.Variant, Digest: snap.Digest, Status: "withdrawn"})
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"schemaVersion": store.SchemaVersion, "withdrawn": digests})
+}
+
+func (s *Server) retire(w http.ResponseWriter, r *http.Request) {
+	var req RetireRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if !projectIDPattern.MatchString(req.Project) {
+		problem(w, http.StatusBadRequest, errors.New("invalid project id"))
+		return
+	}
+	if err := req.ValidateTarget(); err != nil {
+		problem(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Thread == "" {
+		problem(w, http.StatusBadRequest, errors.New("thread must not be empty"))
+		return
+	}
+	req.Reason = strings.TrimSpace(req.Reason)
+	s.ledger.Lock()
+	defer s.ledger.Unlock()
+	snaps, err := store.Snaps(req.Project)
+	if err != nil {
+		problem(w, http.StatusInternalServerError, err)
+		return
+	}
+	closed, err := store.Closed(req.Project, snaps)
+	if err != nil {
+		problem(w, http.StatusInternalServerError, err)
+		return
+	}
+	// Retirement closes every open flagged digest; OpenFlags exposes only the newest per pair.
+	notes, err := store.Notes(req.Project)
+	if err != nil {
+		problem(w, http.StatusInternalServerError, err)
+		return
+	}
+	withdrawals, err := store.Withdrawals(req.Project)
+	if err != nil {
+		problem(w, http.StatusInternalServerError, err)
+		return
+	}
+	matching := make(map[[2]string]store.Snap)
+	snapped := make(map[string]bool)
+	latestSnap := make(map[[2]string]time.Time)
+	seen := make(map[string]bool)
+	for _, withdrawal := range withdrawals {
+		if withdrawal.Thread == req.Thread {
+			seen[store.ReviewID(withdrawal.Key, withdrawal.Variant, withdrawal.Digest)] = true
+		}
+	}
+	var retired []RetiredReview
+	for _, snap := range snaps {
+		if snap.ThreadID() != req.Thread || !matchesVariant(snap.Variant, req.Variant, req.Dims) {
+			continue
+		}
+		if match, _ := path.Match(req.Pattern, snap.Key); !match {
+			continue
+		}
+		id := store.ReviewID(snap.Key, snap.Variant, snap.Digest)
+		snapped[id] = true
+		pair := [2]string{snap.Key, snap.Variant}
+		matching[pair] = snap
+		if ts, ok := latestSnap[pair]; !ok || snap.TS.After(ts) {
+			latestSnap[pair] = snap.TS
+		}
+		if !closed[snap.Review()] && !seen[id] {
+			retired = append(retired, RetiredReview{Key: snap.Key, Variant: snap.Variant, Digest: snap.Digest, Kind: "pending"})
+			seen[id] = true
+		}
+	}
+	for _, flag := range notes {
+		// A newer snap already closed flags raised before it, matching OpenFlags.
+		if ts, ok := latestSnap[[2]string{flag.Key, flag.Variant}]; ok && ts.After(flag.TS) {
+			continue
+		}
+		id := store.ReviewID(flag.Key, flag.Variant, flag.Digest)
+		if flag.Verdict == "flag" && snapped[id] && !seen[id] {
+			retired = append(retired, RetiredReview{Key: flag.Key, Variant: flag.Variant, Digest: flag.Digest, Kind: "flag"})
+			seen[id] = true
+		}
+	}
+	if len(retired) == 0 {
+		flags, err := store.OpenFlags(req.Project, req.Thread)
+		if err != nil {
+			problem(w, http.StatusInternalServerError, err)
+			return
+		}
+		tail := openHere(snaps, closed, flags, req.Thread, func(key string) bool {
+			match, _ := path.Match(req.Pattern, key)
+			return match
+		})
+		problem(w, http.StatusNotFound, fmt.Errorf("nothing open for %s on this thread%s", filterTarget(req.Pattern, req.Variant, req.Dims), tail))
+		return
+	}
+	for _, review := range retired {
+		withdrawal := store.Withdrawal{SchemaVersion: store.SchemaVersion, TS: time.Now().UTC(), Key: review.Key, Variant: review.Variant, Digest: review.Digest, Session: req.Session, Thread: req.Thread, Reason: req.Reason}
+		if err := store.AppendWithdrawal(req.Project, withdrawal); err != nil {
+			problem(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	_ = store.Prune(req.Project)
+	for _, review := range retired {
+		name := matching[[2]string{review.Key, review.Variant}].Project
+		if name == "" {
+			name = ProjectName(req.Project)
+		}
+		s.publish(Item{ProjectID: req.Project, Project: name, Thread: req.Thread, Key: review.Key, Variant: review.Variant, Digest: review.Digest, Status: "withdrawn"})
+	}
+	writeJSON(w, http.StatusCreated, RetireResponse{SchemaVersion: store.SchemaVersion, Retired: retired, Reason: req.Reason})
 }
 
 // ponytail: A loose box resolves by its center rather than overlap. Upgrade to
@@ -550,6 +808,75 @@ func (s *Server) queue(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, items)
+}
+
+// RetiredWindow bounds the list to what a reviewer could still be wondering about: two
+// weeks covers a sprint, and older retirements stay in withdrawn.jsonl for good.
+const RetiredWindow = 14 * 24 * time.Hour
+
+// RetiredItem is one shot an agent retired. The gallery lists these so that closing a
+// human's flag is always visible to that human, never a silent disappearance.
+type RetiredItem struct {
+	Project   string    `json:"project"`
+	ProjectID string    `json:"projectId"`
+	Thread    string    `json:"thread"`
+	Key       string    `json:"key"`
+	Variant   string    `json:"variant"`
+	Reason    string    `json:"reason"`
+	TS        time.Time `json:"ts"`
+}
+
+func (s *Server) retired(w http.ResponseWriter, _ *http.Request) {
+	items, err := Retired(time.Now())
+	if err != nil {
+		problem(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+// Retired returns withdrawals that carry a reason, newest first. A plain discard has no
+// reason and withdraws only the agent's own pending shot, so it stays out of this list.
+// A timestamp ahead of now (clock skew) is kept: hiding a retirement is the one failure
+// this list exists to prevent, and the gallery shows its age as "now".
+func Retired(now time.Time) ([]RetiredItem, error) {
+	ids, err := store.ProjectIDs()
+	if err != nil {
+		return nil, err
+	}
+	items := []RetiredItem{}
+	cutoff := now.Add(-RetiredWindow)
+	for _, id := range ids {
+		withdrawals, err := store.Withdrawals(id)
+		if err != nil {
+			return nil, err
+		}
+		var mine []store.Withdrawal
+		for _, w := range withdrawals {
+			if w.Reason != "" && !w.TS.Before(cutoff) {
+				mine = append(mine, w)
+			}
+		}
+		if len(mine) == 0 {
+			continue
+		}
+		snaps, err := store.Snaps(id)
+		if err != nil {
+			return nil, err
+		}
+		// Named the way Queue names a project, so the gallery's /p/<name> view matches.
+		name := id[:min(8, len(id))]
+		for _, snap := range snaps {
+			if snap.Project != "" {
+				name = snap.Project
+			}
+		}
+		for _, w := range mine {
+			items = append(items, RetiredItem{Project: name, ProjectID: id, Thread: w.Thread, Key: w.Key, Variant: w.Variant, Reason: w.Reason, TS: w.TS})
+		}
+	}
+	sort.SliceStable(items, func(i, j int) bool { return items[i].TS.After(items[j].TS) })
+	return items, nil
 }
 
 func Queue() ([]Item, error) {

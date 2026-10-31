@@ -599,6 +599,32 @@
   #emptyNext:hover { color: var(--text); }
   #emptyNext[hidden] { display: none; }
 
+  /* An agent retiring a key closes the human's own flags, so it is shown right where the
+     reviewer lands once the queue runs dry and would otherwise wonder where the flags went. */
+  #retired {
+    margin-top: 26px;
+    width: min(440px, calc(100vw - 32px));
+    text-align: left;
+  }
+  #retired[hidden] { display: none; }
+  #retired h2 {
+    margin: 0 0 10px;
+    font: 500 11px/1 var(--mono);
+    color: var(--faint);
+    text-align: center;
+  }
+  #retired .list {
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--bg-raised);
+    overflow: hidden;
+  }
+  #retired .row { padding: 11px 14px; display: grid; gap: 5px; }
+  #retired .row + .row { border-top: 1px solid var(--line); }
+  #retired .why { font: 400 13px/1.4 var(--sans); color: var(--text); overflow-wrap: anywhere; }
+  #retired .what { font: 500 11px/1.5 var(--mono); color: var(--muted); overflow-wrap: anywhere; }
+  #retired .more { padding: 10px 14px; border-top: 1px solid var(--line); font: 500 11px/1 var(--mono); color: var(--faint); }
+
   /* ---------- help ---------- */
 
   #help {
@@ -881,6 +907,7 @@
       <div class="big">Nothing waiting.</div>
       <div class="sub" id="emptySub"></div>
       <a class="sub" id="emptyNext" hidden></a>
+      <section id="retired" hidden aria-label="shots an agent retired"></section>
     </div>
   </div>
 
@@ -980,7 +1007,7 @@
     flowAll: $('#flowAll'), flowAllBox: $('#flowAllBox'),
     okKey: $('#okKey'), okLabel: $('#okLabel'), flagKey: $('#flagKey'), flagLabel: $('#flagLabel'),
     layer: $('#layer'), stat: $('#stat'), changes: $('#changes'), strip: $('#strip'),
-    empty: $('#empty'), emptySub: $('#emptySub'), emptyNext: $('#emptyNext'),
+    empty: $('#empty'), emptySub: $('#emptySub'), emptyNext: $('#emptyNext'), retired: $('#retired'),
     note: $('#note'), noteTag: $('#noteTag'), noteInput: $('#noteInput'),
     toast: $('#toast'), toastWhat: $('#toastWhat'), help: $('#help'), side: $('#side'),
     menu: $('#menu'), scrim: $('#scrim'), undo: $('#undo'), notesPill: $('#notesPill'),
@@ -998,6 +1025,7 @@
 
   let all = [];            // every pending item the server sent, in its order
   let queue = [];          // the slice of `all` this view shows; derived, never edited
+  let retired = [];        // shots agents retired lately, newest first, from /api/retired
   const taken = new Set(); // reviews judged here, hidden until the server stops sending them
   // One review is one key@variant at one digest. Identical pixels under two keys share a
   // digest but are two reviews, so judging one must never hide or annotate the other.
@@ -1074,13 +1102,30 @@
   /* ---------- data ---------- */
 
   async function load() {
-    if (mock) { all = await rasterize(mockQueue()); refilter(); render(); return mockVideo(); }
+    if (mock) { all = await rasterize(mockQueue()); retired = mockRetired(); refilter(); render(); return mockVideo(); }
     try {
       const r = await fetch('/api/queue');
-      all = (await r.json()) || [];
+      // An error answer is an object, not a list, and would throw in refilter.
+      all = r.ok ? (await r.json()) || [] : [];
     } catch { all = []; }
+    await loadRetired();
     refilter();
     render();
+  }
+
+  // Kept apart from the queue fetch so a failure here never costs the reviewer the queue.
+  async function loadRetired() {
+    try {
+      const r = await fetch('/api/retired');
+      retired = r.ok ? (await r.json()) || [] : [];
+    } catch { retired = []; }
+  }
+
+  // One retire call publishes a withdrawn event per shot, so refetch once the burst settles.
+  let retiredTimer = 0;
+  function refreshRetired() {
+    clearTimeout(retiredTimer);
+    retiredTimer = setTimeout(() => loadRetired().then(() => { if (!current()) render(); }), 300);
   }
 
   function stream() {
@@ -1094,8 +1139,10 @@
       // reviewing a picture nobody will act on is the waste this exists to remove.
       const replaced = q => q.projectId === item.projectId && q.thread === item.thread
         && q.key === item.key && q.variant === item.variant && q.digest !== item.digest;
-      if (item.status === 'withdrawn') all = all.filter(q => rid(q) !== rid(item));
-      else {
+      if (item.status === 'withdrawn') {
+        all = all.filter(q => rid(q) !== rid(item));
+        refreshRetired();
+      } else {
         all = all.filter(q => !replaced(q));
         // A burst is still landing. Append, never reorder under the reviewer's cursor.
         if (!all.some(q => rid(q) === rid(item))) all.push(item);
@@ -1242,6 +1289,48 @@
   }
   el.emptyNext.onclick = e => { e.preventDefault(); if (elsewhere) show(elsewhere.v); };
 
+  // One row per retire call: the server stamps each withdrawal as it appends it, so a call
+  // is the run of entries sharing project, thread and reason within a minute. Retirements
+  // carry no branch, so a branch view shows none rather than a guess. The reason is agent
+  // text and only ever reaches the page through textContent.
+  function paintRetired() {
+    const shown = view.branch ? [] : retired.filter(r =>
+      (!view.project || r.project === view.project) && (!view.thread || r.thread === view.thread));
+    const groups = [];
+    for (const r of shown) {
+      const g = groups[groups.length - 1];
+      if (g && g.projectId === r.projectId && g.thread === r.thread && g.reason === r.reason
+          && new Date(g.oldest) - new Date(r.ts) < 60000) {
+        g.items.push(r);
+        g.oldest = r.ts;
+      } else {
+        groups.push({ projectId: r.projectId, project: r.project, thread: r.thread, reason: r.reason, ts: r.ts, oldest: r.ts, items: [r] });
+      }
+    }
+    el.retired.hidden = !groups.length;
+    if (!groups.length) return el.retired.replaceChildren();
+    const make = (cls, text) => {
+      const d = document.createElement('div');
+      d.className = cls;
+      d.textContent = text;
+      return d;
+    };
+    const h = document.createElement('h2');
+    h.textContent = 'retired by an agent';
+    const list = make('list', '');
+    for (const g of groups.slice(0, 5)) {
+      const keys = [...new Set(g.items.map(i => i.key))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+      const named = keys.slice(0, 3).join(', ') + (keys.length > 3 ? ` +${keys.length - 3}` : '');
+      const n = g.items.length;
+      const row = make('row', '');
+      row.append(make('why', g.reason),
+        make('what', `${view.project ? '' : `${g.project} · `}${n} shot${n === 1 ? '' : 's'} · ${named} · ${ago(g.ts) || 'now'}`));
+      list.append(row);
+    }
+    if (groups.length > 5) list.append(make('more', `and ${groups.length - 5} more`));
+    el.retired.replaceChildren(h, list);
+  }
+
   function render() {
     const it = current();
     const has = Boolean(it);
@@ -1275,6 +1364,7 @@
         el.emptyNext.href = viewPath(elsewhere.v) + (mock ? location.search : '');
         el.emptyNext.replaceChildren(`${elsewhere.n} waiting in ${elsewhere.v.project} `, key);
       }
+      paintRetired();
       sidebar();
       return;
     }
@@ -2370,6 +2460,20 @@
   addEventListener('pagehide', flushVerdict);
 
   /* ---------- mock ---------- */
+
+  // On a thread the mock queue never uses, so /p/shop/t/9d8c7b6a-shop?mock shows the empty
+  // view with its retired list: one call over six deleted pages, one a day earlier.
+  function mockRetired() {
+    const at = ms => new Date(Date.now() - ms).toISOString();
+    const thread = '9d8c7b6a-shop';
+    const out = [];
+    for (let i = 6; i >= 1; i--) for (const variant of ['mobile-dark', 'desktop-dark'])
+      out.push({ project: 'shop', projectId: 'shop', thread, key: `site/hero-lab-${i}`, variant,
+        reason: 'Pages deleted: the lab variants lost to the v3 hero', ts: at(3 * 3600e3 + i * 200) });
+    out.push({ project: 'shop', projectId: 'shop', thread, key: 'promo/black-friday', variant: 'desktop-dark',
+      reason: 'Campaign ended, the route now redirects to /', ts: at(26 * 3600e3) });
+    return out;
+  }
 
   function mockQueue() {
     // The sizes real snaps come in, so the mock lays out the way the queue does: the vision
