@@ -42,15 +42,21 @@ func TestCaptureArgs(t *testing.T) {
 	for _, server := range []string{"", "http://127.0.0.1:9999"} {
 		t.Setenv("PINCHTAB_SERVER", server)
 		for _, selector := range []string{"", `footer [data-role="card"]`} {
-			want := []string{"capture", "--json", "--beyond-viewport", "-o", "shot.png", "--format", "png", "--filter", "all"}
-			if selector != "" {
-				want = append(want, "-s", selector)
-			}
-			if server != "" {
-				want = append([]string{"--server", server}, want...)
-			}
-			if got := captureArgs("shot.png", selector); !slices.Equal(got, want) {
-				t.Errorf("server=%q selector=%q: got %v, want %v", server, selector, got, want)
+			for _, whole := range []bool{false, true} {
+				want := []string{"capture", "--json"}
+				if whole {
+					want = append(want, "--beyond-viewport")
+				}
+				want = append(want, "-o", "shot.png", "--format", "png", "--filter", "all")
+				if selector != "" {
+					want = append(want, "-s", selector)
+				}
+				if server != "" {
+					want = append([]string{"--server", server}, want...)
+				}
+				if got := captureArgs("shot.png", selector, whole); !slices.Equal(got, want) {
+					t.Errorf("server=%q selector=%q whole=%v: got %v, want %v", server, selector, whole, got, want)
+				}
 			}
 		}
 	}
@@ -241,7 +247,10 @@ func fakePinchtab(t *testing.T, doc image.Image) string {
 		t.Fatal(err)
 	}
 	f.Close()
-	script := "#!/bin/sh\necho \"$@\" >> " + argsPath + "\nwhile [ $# -gt 0 ]; do [ \"$1\" = -o ] && cp " + docPath + " \"$2\"; shift; done\nprintf '%s\\n' \"$VISION_TEST_CAPTURE\"\n"
+	// A plain capture answers with $VISION_TEST_PLAIN when a test sets it, so a test can make
+	// the plain and whole-document responses differ the way pinchtab's do.
+	script := "#!/bin/sh\necho \"$@\" >> " + argsPath + "\ncase \"$*\" in *--beyond-viewport*) body=$VISION_TEST_CAPTURE;; *) body=${VISION_TEST_PLAIN:-$VISION_TEST_CAPTURE};; esac\n" +
+		"while [ $# -gt 0 ]; do [ \"$1\" = -o ] && cp " + docPath + " \"$2\"; shift; done\nprintf '%s\\n' \"$body\"\n"
 	if err := os.WriteFile(filepath.Join(dir, "pinchtab"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -319,12 +328,43 @@ func TestCaptureErrorWedgeGuidance(t *testing.T) {
 	}
 }
 
-// Take must ask for a whole-document render and cut the scrolled viewport out of it. A
-// plain capture in a browser window smaller than the emulated viewport came back with the
-// overhang unpainted white (pinchtab picks the window at random), and those shots were
-// approved as baselines before anyone noticed.
+// A plain capture that is exactly the viewport it reports is the shot, taken once and never
+// cut: pinchtab main composites the viewport, and its scroll offsets describe the page, not
+// rows of this image (cropping at scrollY 50 would refuse a 30x20 image).
+func TestTakeKeepsAnExactPlainCapture(t *testing.T) {
+	argsPath := fakePinchtab(t, positional(60, 40))
+	t.Setenv("VISION_TEST_CAPTURE", `{"url":"http://localhost:3000/cart","colorScheme":"light",
+	  "image":{"coordinateSpace":"viewport","devicePixelRatio":2,"viewport":{"w":30,"h":20,"scrollX":5,"scrollY":50}},
+	  "snapshot":{"nodes":[{"role":"button","name":"Withdraw","depth":3,"visible":true,"boundingBox":{"x":8,"y":5,"w":12,"h":4}}]}}`)
+	shot, err := Take(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	args, _ := os.ReadFile(argsPath)
+	if lines := strings.Split(strings.TrimSpace(string(args)), "\n"); len(lines) != 1 || strings.Contains(lines[0], "--beyond-viewport") {
+		t.Fatalf("want one plain capture, got: %s", args)
+	}
+	img, err := png.Decode(bytes.NewReader(shot.PNG))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := img.Bounds(); b.Dx() != 60 || b.Dy() != 40 {
+		t.Fatalf("shot is %v, want the 60x40 device-pixel viewport untouched", b)
+	}
+	if want := []store.Element{{Role: "button", Name: "Withdraw", Depth: 3, X: 8, Y: 5, W: 12, H: 4}}; !slices.Equal(shot.Elements, want) {
+		t.Fatalf("viewport-space boxes were shifted: %#v", shot.Elements)
+	}
+}
+
+// When the plain capture is the window surface instead (pinchtab 0.15.2: screen scale, any
+// window size), Take falls back to a whole-document render and cuts the scrolled viewport
+// out of it. A plain capture in a window smaller than the emulated viewport came back with
+// the overhang unpainted white, and those shots were approved as baselines before anyone
+// noticed.
 func TestTakeCutsTheViewportOutOfTheDocument(t *testing.T) {
 	argsPath := fakePinchtab(t, positional(40, 100))
+	t.Setenv("VISION_TEST_PLAIN", `{"url":"http://localhost:3000/cart","colorScheme":"light",
+	  "image":{"coordinateSpace":"viewport","devicePixelRatio":1,"viewport":{"w":30,"h":20,"scrollX":5,"scrollY":50}}}`)
 	t.Setenv("VISION_TEST_CAPTURE", `{"url":"http://localhost:3000/cart","colorScheme":"light",
 	  "image":{"coordinateSpace":"document","devicePixelRatio":1,"viewport":{"w":30,"h":20,"scrollX":5,"scrollY":50}},
 	  "snapshot":{"nodes":[{"role":"button","name":"Withdraw","depth":3,"visible":true,"boundingBox":{"x":8,"y":55,"w":12,"h":4}}]}}`)
@@ -333,8 +373,9 @@ func TestTakeCutsTheViewportOutOfTheDocument(t *testing.T) {
 		t.Fatal(err)
 	}
 	args, _ := os.ReadFile(argsPath)
-	if !strings.Contains(string(args), "capture --json --beyond-viewport") {
-		t.Fatalf("capture did not ask for a whole-document render: %s", args)
+	lines := strings.Split(strings.TrimSpace(string(args)), "\n")
+	if len(lines) != 2 || strings.Contains(lines[0], "--beyond-viewport") || !strings.Contains(lines[1], "capture --json --beyond-viewport") {
+		t.Fatalf("want a plain capture, then a whole-document render: %s", args)
 	}
 	if !strings.Contains(string(args), "--filter all") {
 		t.Fatalf("capture did not ask for the paired snapshot: %s", args)

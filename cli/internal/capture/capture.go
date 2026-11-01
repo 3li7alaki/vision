@@ -38,14 +38,52 @@ func pinchtab(args ...string) []string {
 	return args
 }
 
-func captureArgs(path, selector string) []string {
+func captureArgs(path, selector string, wholeDocument bool) []string {
 	// The paired snapshot comes from the same DOM epoch as the image; a separate snapshot
 	// call could describe a different moment.
-	args := []string{"capture", "--json", "--beyond-viewport", "-o", path, "--format", "png", "--filter", "all"}
+	args := []string{"capture", "--json"}
+	if wholeDocument {
+		args = append(args, "--beyond-viewport")
+	}
+	args = append(args, "-o", path, "--format", "png", "--filter", "all")
 	if selector != "" {
 		args = append(args, "-s", selector)
 	}
 	return pinchtab(args...)
+}
+
+// shoot runs one capture into path and returns pinchtab's JSON response.
+func shoot(ctx context.Context, path, selector string, wholeDocument bool) (map[string]any, error) {
+	out, err := exec.CommandContext(ctx, "pinchtab", captureArgs(path, selector, wholeDocument)...).CombinedOutput()
+	if err != nil {
+		return nil, captureError(err, out)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(out, &raw); err != nil {
+		return nil, fmt.Errorf("decode pinchtab response: %w", err)
+	}
+	return raw, nil
+}
+
+// exactViewport reports whether a plain capture is already the viewport it claims to be:
+// viewport coordinates, and pixels equal to its size times its device pixel ratio.
+//
+// pinchtab 0.15.2 answers a plain capture with the window's own surface, at the screen's
+// scale and whatever size the window happens to be (measured 2026-11-01: 2560x1400 for a
+// page reporting 1280x700 at dpr 1). pinchtab main since effbe113 composites a clip of the
+// viewport, so the image matches its metadata exactly. Checking the contract instead of a
+// version string keeps working on dev builds and switches over the day a release ships.
+func exactViewport(data []byte, captureImage map[string]any, dpr float64) bool {
+	if text(captureImage["coordinateSpace"]) != "viewport" {
+		return false
+	}
+	if dpr <= 0 {
+		dpr = 1
+	}
+	viewport := object(captureImage, "viewport")
+	cfg, err := png.DecodeConfig(bytes.NewReader(data))
+	return err == nil && cfg.Width == int(math.Round(number(viewport["w"])*dpr)) &&
+		cfg.Height == int(math.Round(number(viewport["h"])*dpr)) && cfg.Width > 0 && cfg.Height > 0
 }
 
 func Take(ctx context.Context, selector string) (Result, error) {
@@ -56,21 +94,18 @@ func Take(ctx context.Context, selector string) (Result, error) {
 	path := f.Name()
 	f.Close()
 	defer os.Remove(path)
-	// --beyond-viewport makes Chrome render the page itself instead of copying the window's
-	// compositor. PinchTab launches every browser at a random window size (1280x720 up to
-	// 2560x1440, internal/bridge/runtime/init.go in pinchtab 0.15.2) and opens new tabs at
-	// 1280x720, so an emulated 1440x700 viewport is wider than the real window and a plain
-	// capture comes back with the overhang unpainted white. Puppeteer captures this way by
-	// default (captureBeyondViewport) for the same reason. Whole-document images are cropped
-	// back to the viewport below; element images are already clipped by PinchTab.
-	cmd := exec.CommandContext(ctx, "pinchtab", captureArgs(path, selector)...)
-	out, err := cmd.CombinedOutput()
+	// A full shot tries a plain capture first, because a whole-document render
+	// (--beyond-viewport) re-lays the page out at full height and two real shots came back
+	// wrong that way while a plain capture of the same tab was right: marketplace checkout
+	// lost Tap's cross-origin card iframe and its sticky header landed mid-page
+	// (2026-10-17), and barada's Radix overlay scrolled inside a fixed container stitched
+	// page and overlay together at 360x700 --mobile (2026-10-21). A simple local fixture
+	// with the same parts did not reproduce either, so the trigger is in those pages.
+	// Element shots are clipped by PinchTab either way, so they keep the original arguments.
+	wholeDocument := selector != ""
+	raw, err := shoot(ctx, path, selector, wholeDocument)
 	if err != nil {
-		return Result{}, captureError(err, out)
-	}
-	var raw map[string]any
-	if err := json.Unmarshal(out, &raw); err != nil {
-		return Result{}, fmt.Errorf("decode pinchtab response: %w", err)
+		return Result{}, err
 	}
 	c := conditions(raw)
 	c.Selector = selector
@@ -83,6 +118,21 @@ func Take(ctx context.Context, selector string) (Result, error) {
 	pngData, err := os.ReadFile(path)
 	if err != nil {
 		return Result{}, err
+	}
+	if !wholeDocument && !exactViewport(pngData, object(raw, "image"), c.DPR) {
+		// The fallback for a pinchtab whose plain capture is the window surface. A
+		// whole-document render is Chrome painting the page itself, so an emulated viewport
+		// wider than the random window (1280x720 up to 2560x1440 in pinchtab 0.15.2) is not
+		// left unpainted white; it is cropped back to the viewport below. Puppeteer captures
+		// this way by default (captureBeyondViewport) for the same reason.
+		if raw, err = shoot(ctx, path, selector, true); err != nil {
+			return Result{}, err
+		}
+		c = conditions(raw)
+		c.Selector = selector
+		if pngData, err = os.ReadFile(path); err != nil {
+			return Result{}, err
+		}
 	}
 	if pngData, err = cropCapture(pngData, object(raw, "image"), c.DPR); err != nil {
 		return Result{}, err
@@ -132,9 +182,10 @@ func elements(raw map[string]any) []store.Element {
 }
 
 // PinchTab clips element shots itself, so viewport cropping would discard the element or
-// reject an image smaller than the viewport.
+// reject an image smaller than the viewport. An exact viewport capture already is the
+// viewport: cutting it at the scroll offset would cut the wrong rows, or refuse it.
 func cropCapture(data []byte, captureImage map[string]any, dpr float64) ([]byte, error) {
-	if text(captureImage["coordinateSpace"]) == "clip" {
+	if text(captureImage["coordinateSpace"]) == "clip" || exactViewport(data, captureImage, dpr) {
 		return data, nil
 	}
 	return cropToViewport(data, object(captureImage, "viewport"), dpr)
