@@ -2238,6 +2238,9 @@
     p.judged.forEach(({ item }) => {
       fetch('/api/verdict', {
         method: 'POST',
+        // A flush from pagehide or a hidden tab must outlive the page, or closing the tab
+        // inside the undo window silently drops the verdict. Bodies sit far under keepalive's 64KB cap.
+        keepalive: true,
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           project: item.projectId, key: item.key, variant: item.variant,
@@ -2367,8 +2370,10 @@
     if (e.key === 'b' && peeking) { peeking = false; paint(); }
   });
 
-  // Send anything still in flight before the tab dies.
+  // Send anything still in flight before the tab dies. Mobile Safari often skips pagehide
+  // when a tab is swiped away, so hidden is the last event that reliably fires (web.dev page lifecycle).
   addEventListener('pagehide', flushVerdict);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushVerdict(); });
 
   /* ---------- mock ---------- */
 
